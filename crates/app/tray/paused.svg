@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- Tray icon, paused: slate tile, two bars. Rules: docs/ICON-STYLE.md. -->
+  <path d="M26 0H64V14H92V28H128V102A26 26 0 0 1 102 128H26A26 26 0 0 1 0 102V26A26 26 0 0 1 26 0Z" fill="#5f6b7a"/>
+  <g transform="translate(62 68) skewX(-8) translate(-62 -68)" fill="none" stroke="#ffffff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M40 96H86A18 18 0 0 0 88 62A24 24 0 0 0 42 58A19 19 0 0 0 40 96Z"/>
+    <path d="M56 70V86M72 70V86" stroke-width="8"/>
+  </g>
+</svg>

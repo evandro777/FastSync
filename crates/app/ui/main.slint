@@ -1,0 +1,523 @@
+import { Button, CheckBox, ComboBox, LineEdit, Palette, ScrollView } from "std-widgets.slint";
+import { Family } from "family.slint";
+import { AboutCard, PrefRow } from "about.slint";
+import { MenuButton } from "controls.slint";
+
+// Strings built in Rust go through this global (never `format!` user-visible text in Rust).
+export global Tr {
+    public pure function tray-open() -> string { return @tr("Open FastSync"); }
+    public pure function tray-sync() -> string { return @tr("Sync now"); }
+    public pure function tray-pause() -> string { return @tr("Pause syncing"); }
+    public pure function tray-resume() -> string { return @tr("Resume syncing"); }
+    public pure function tray-quit() -> string { return @tr("Quit"); }
+    public pure function tray-idle() -> string { return @tr("Everything is up to date"); }
+    public pure function tray-syncing() -> string { return @tr("Syncing…"); }
+    public pure function tray-paused() -> string { return @tr("Paused"); }
+    public pure function tray-error() -> string { return @tr("Needs attention"); }
+    public pure function tray-none() -> string { return @tr("No accounts"); }
+    public pure function error-no-folder() -> string { return @tr("Choose a local folder, for example /home/you/Dropbox."); }
+    public pure function error-taken() -> string { return @tr("Another account already syncs that folder."); }
+    public pure function error-client() -> string { return @tr("Fill in both the client ID and the client secret, without spaces, or turn the option off."); }
+    public pure function error-backend() -> string { return @tr("Your rclone was built without support for this service (Debian and Ubuntu's rclone leaves some out). Install the official rclone from rclone.org, or use the Flatpak."); }
+    public pure function error-bad-folder() -> string { return @tr("Choose a different folder: this one holds your whole home folder or FastSync's own data."); }
+    public pure function tray-open-folder() -> string { return @tr("Open folder"); }
+    public pure function error-login(why: string) -> string { return @tr("Login failed: {}", why); }
+}
+
+// One linked account. `state`: 0 up to date, 1 syncing, 2 paused, 3 problem, 4 stopped by the delete guard.
+export struct AccountRow {
+    id: string,
+    provider: string,
+    folder: string,
+    state: int,
+    // The raw message of a problem (from rclone, the OS or the provider).
+    detail: string,
+    // For state 4: files that would be deleted, and files known.
+    deletes: int,
+    known: int,
+}
+
+// The shell of every dialog: an in-window overlay, not a second window (closing Main always hides it to the tray, and
+// ui-snapshot.sh can capture it). The dialog's content goes inside the card.
+component Dialog inherits Rectangle {
+    in property <length> card-width: Family.dialog-width;
+    callback dismiss();
+    background: Family.scrim;
+    init => { keys.focus(); }
+
+    // Swallows clicks so nothing behind the overlay is reachable; a click outside the card closes it.
+    TouchArea { clicked => { root.dismiss(); } }
+    keys := FocusScope {
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.dismiss();
+                return accept;
+            }
+            // Keeps Tab from moving focus to the widgets hidden behind the overlay.
+            if event.text == Key.Tab || event.text == Key.Backtab {
+                return accept;
+            }
+            return reject;
+        }
+    }
+    Rectangle {
+        width: min(root.card-width, parent.width - 32px);
+        // A dialog with a ScrollView shrinks to fit a small window instead of outgrowing it.
+        height: min(box.preferred-height, parent.height - 32px);
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: Palette.background;
+        border-radius: Family.radius;
+        border-width: 1px;
+        border-color: Palette.border;
+        TouchArea { }
+        box := VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+            @children
+        }
+    }
+}
+
+component SettingsDialog inherits Dialog {
+    // 0 follows the system, 1 light, 2 dark (settings.theme).
+    in-out property <int> color-scheme-index;
+    // 0 follows the system, 1 English, 2 Português (settings.language).
+    in-out property <int> language-index;
+    callback show-about();
+
+    Text { text: @tr("Preferences"); font-size: Family.page-title; font-weight: Family.page-weight; }
+    ScrollView {
+        // A ScrollView does not report its content's height, so the card would collapse to a sliver.
+        preferred-height: content.preferred-height;
+        content := VerticalLayout {
+            alignment: start;
+            spacing: 12px;
+            PrefRow {
+                label: @tr("Appearance");
+                ComboBox {
+                    width: Family.control-width;
+                    model: [@tr("System"), @tr("Light"), @tr("Dark")];
+                    current-index <=> root.color-scheme-index;
+                }
+            }
+            PrefRow {
+                label: @tr("Language");
+                // Language names stay in their own language, so they are not translated.
+                ComboBox {
+                    width: Family.control-width;
+                    model: [@tr("System"), "English", "Português (Brasil)"];
+                    current-index <=> root.language-index;
+                }
+            }
+        }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        Button { text: @tr("About"); clicked => { root.show-about(); } }
+        Rectangle { horizontal-stretch: 1; }
+        Button { text: @tr("Close"); primary: true; clicked => { root.dismiss(); } }
+    }
+}
+
+// Opened from the settings dialog; closing it goes back there.
+component About inherits Dialog {
+    in property <string> version;
+    callback open-website();
+
+    AboutCard {
+        icon: @image-url("../../../packaging/io.github.evandro777.FastSync.svg");
+        name: "FastSync";
+        version: root.version;
+        description: @tr("Two-way folder sync for Dropbox, Google Drive, OneDrive and MEGA. Light and fast.");
+        url: "github.com/evandro777/FastSync";
+        link-clicked(_) => { root.open-website(); }
+        close => { root.dismiss(); }
+    }
+}
+
+// Read-only wrapped text that can be selected with the mouse and copied. A wrapped `TextInput` inside a layout
+// reports the height of one line, so the height is estimated from the width it has (`avail`, given by the parent).
+component SelectableText inherits TextInput {
+    in property <length> avail;
+    read-only: true;
+    wrap: word-wrap;
+    min-width: 0px;
+    // ~0.58 em per character on average; a little generous so a line is never cut.
+    min-height: Math.ceil(self.text.character-count / (max(root.avail, 80px) / (self.font-size * 0.58))) * self.font-size * 1.4;
+}
+
+component AddDialog inherits Dialog {
+    // 0 Dropbox, 1 Google Drive, 2 OneDrive, 3 MEGA (accounts::PROVIDERS).
+    in-out property <int> kind;
+    in-out property <string> local;
+    in-out property <string> remote;
+    in-out property <string> email;
+    in-out property <string> password;
+    // Waiting for the browser login; `error` is a translated message from Rust.
+    in property <bool> busy;
+    in property <string> error;
+    // The user's own OAuth app (a private quota instead of rclone's shared one); empty = the shared one.
+    in-out property <bool> own-client;
+    in-out property <string> client-id;
+    in-out property <string> client-secret;
+    callback submit();
+    callback open-help();
+
+    Text { text: @tr("Add account"); font-size: Family.page-title; font-weight: Family.page-weight; }
+    // The fields scroll in a small window; a ScrollView does not report its content's height, hence preferred-height.
+    ScrollView {
+        // The slack: the layout under-reports its height by a few px once the own-client fields are shown.
+        preferred-height: fields.preferred-height + 28px;
+        fields := VerticalLayout {
+        alignment: start;
+        spacing: Family.gap-l;
+        PrefRow {
+            label: @tr("Service");
+            ComboBox {
+                width: Family.control-width;
+                enabled: !root.busy;
+                model: ["Dropbox", "Google Drive", "OneDrive", "MEGA"];
+                current-index <=> root.kind;
+            }
+        }
+        VerticalLayout {
+            spacing: Family.gap-s;
+            Text { text: @tr("Local folder"); color: Family.muted; font-size: Family.caption; }
+            LineEdit { text <=> root.local; enabled: !root.busy; }
+        }
+        VerticalLayout {
+            spacing: Family.gap-s;
+            Text { text: @tr("Folder in the cloud (empty for all of it)"); color: Family.muted; font-size: Family.caption; wrap: word-wrap; }
+            LineEdit { text <=> root.remote; enabled: !root.busy; placeholder-text: @tr("Everything"); }
+        }
+        // MEGA has no browser login: it takes the account's email and password.
+        if root.kind == 3: VerticalLayout {
+            spacing: Family.gap-l;
+            VerticalLayout {
+                spacing: Family.gap-s;
+                Text { text: @tr("Email"); color: Family.muted; font-size: Family.caption; }
+                LineEdit { text <=> root.email; enabled: !root.busy; input-type: InputType.text; }
+            }
+            VerticalLayout {
+                spacing: Family.gap-s;
+                Text { text: @tr("Password"); color: Family.muted; font-size: Family.caption; }
+                LineEdit { text <=> root.password; enabled: !root.busy; input-type: InputType.password; }
+            }
+        }
+        // Dropbox, Google Drive and OneDrive log in through OAuth, so they can use the user's own app.
+        if root.kind != 3: VerticalLayout {
+            spacing: Family.gap-l;
+            CheckBox { text: @tr("Use my own client ID (advanced)"); enabled: !root.busy; checked <=> root.own-client; }
+            if root.own-client: VerticalLayout {
+                spacing: Family.gap-l;
+                Text {
+                    text: @tr("Avoids the shared limits of the built-in one, which can stop syncing for a while.");
+                    color: Family.muted;
+                    font-size: Family.caption;
+                    wrap: word-wrap;
+                    min-width: 0px;
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    Button { text: @tr("How to get one"); clicked => { root.open-help(); } }
+                }
+                VerticalLayout {
+                    spacing: Family.gap-s;
+                    Text { text: @tr("Client ID"); color: Family.muted; font-size: Family.caption; }
+                    LineEdit { text <=> root.client-id; enabled: !root.busy; }
+                }
+                VerticalLayout {
+                    spacing: Family.gap-s;
+                    Text { text: @tr("Client secret"); color: Family.muted; font-size: Family.caption; }
+                    LineEdit { text <=> root.client-secret; enabled: !root.busy; input-type: InputType.password; }
+                }
+            }
+        }
+        }
+    }
+    if root.busy: Text {
+        text: root.kind == 3 ? @tr("Logging in…") : @tr("Finish the login in your browser…");
+        color: Family.info;
+        wrap: word-wrap;
+        min-width: 0px;
+    }
+    if root.error != "": SelectableText {
+        text: root.error;
+        color: Family.danger;
+        avail: min(root.card-width, root.width - 32px) - 32px;
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: end;
+        Button { text: @tr("Cancel"); clicked => { root.dismiss(); } }
+        Button { text: @tr("Log in"); primary: true; enabled: !root.busy; clicked => { root.submit(); } }
+    }
+}
+
+component IconButton inherits Button {
+    in property <image> glyph;
+    // Icon-only buttons need an accessible label: there is no text to read.
+    in property <string> label;
+    icon: root.glyph;
+    colorize-icon: true;
+    accessible-label: root.label;
+}
+
+component AccountCard inherits Rectangle {
+    in property <AccountRow> acct;
+    callback sync-now();
+    callback toggle-pause();
+    callback open-folder();
+    callback open-web();
+    callback remove();
+    background: Palette.alternate-background;
+    border-radius: Family.radius;
+    border-width: 1px;
+    border-color: Palette.border;
+    // Fixed height would clip a long problem message; the card is as tall as its text.
+    min-height: layout.preferred-height + 24px;
+
+    private property <color> tone: root.acct.state == 0 ? Family.success
+        : root.acct.state == 1 ? Family.info
+        : root.acct.state == 2 ? Family.muted
+        : root.acct.state == 3 ? Family.danger : Family.warning;
+
+    layout := HorizontalLayout {
+        padding: 12px;
+        spacing: Family.gap-l;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            min-width: 0px;
+            alignment: center;
+            spacing: Family.gap-s;
+            HorizontalLayout {
+                spacing: Family.gap-m;
+                Text { text: root.acct.provider; font-weight: Family.section-weight; vertical-alignment: center; }
+                Rectangle {
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: root.tone;
+                    y: (parent.height - self.height) / 2;
+                }
+                Text {
+                    text: root.acct.state == 0 ? @tr("Up to date")
+                        : root.acct.state == 1 ? @tr("Syncing…")
+                        : root.acct.state == 2 ? @tr("Paused")
+                        : root.acct.state == 3 ? @tr("Needs attention") : @tr("Stopped");
+                    color: root.tone;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+            }
+            Text { text: root.acct.folder; color: Family.muted; font-size: Family.caption; overflow: elide; }
+            // The raw message can be selected and copied (to search for it or to report it).
+            if root.acct.state == 3: SelectableText {
+                text: root.acct.detail;
+                color: Family.muted;
+                font-size: Family.caption;
+                // Width left of the text column: the card minus its padding, gap and the four buttons.
+                avail: root.width - 272px;
+            }
+            if root.acct.state == 4: Text {
+                text: @tr("{} of {} files would be deleted. Press Sync now to confirm.", root.acct.deletes, root.acct.known);
+                color: Family.muted;
+                font-size: Family.caption;
+                wrap: word-wrap;
+                min-width: 0px;
+            }
+        }
+        // The vertical layout keeps the buttons at their own height (32 px) instead of the card's.
+        VerticalLayout {
+            alignment: center;
+            HorizontalLayout {
+                spacing: Family.gap-m;
+                IconButton { glyph: @image-url("icons/refresh.svg"); label: @tr("Sync now"); clicked => { root.sync-now(); } }
+                // One width for both labels, so the buttons line up from card to card.
+                Button {
+                    width: 80px;
+                    text: root.acct.state == 2 ? @tr("Resume") : @tr("Pause");
+                    clicked => { root.toggle-pause(); }
+                }
+                IconButton { glyph: @image-url("icons/folder.svg"); label: @tr("Open folder"); clicked => { root.open-folder(); } }
+                IconButton { glyph: @image-url("icons/globe.svg"); label: @tr("Open in browser"); clicked => { root.open-web(); } }
+                IconButton { glyph: @image-url("icons/trash.svg"); label: @tr("Remove account"); clicked => { root.remove(); } }
+            }
+        }
+    }
+}
+
+export component Main inherits Window {
+    in property <string> version;
+    in-out property <bool> settings-open: false;
+    in-out property <bool> about-open: false;
+    in-out property <bool> add-open: false;
+    in property <[AccountRow]> accounts;
+    // rclone (the transport) is not installed or did not start.
+    in property <bool> rclone-missing: false;
+    in-out property <int> add-kind: 0;
+    in-out property <string> add-local;
+    in-out property <string> add-remote;
+    in-out property <string> add-email;
+    in-out property <string> add-password;
+    in-out property <bool> add-own-client: false;
+    in-out property <string> add-client-id;
+    in-out property <string> add-client-secret;
+    in property <bool> add-busy: false;
+    in property <string> add-error;
+    // 0 follows the system, 1 light, 2 dark (settings.theme).
+    in-out property <int> color-scheme-index: 0;
+    // 0 follows the system, 1 English, 2 Português (settings.language).
+    in-out property <int> language-index: 0;
+    callback open-website();
+    callback sync-now(string);
+    callback toggle-pause(string);
+    callback open-folder(string);
+    callback open-web(string);
+    callback remove-account(string);
+    callback add-kind-changed(int);
+    callback add-submit();
+    // Opens the guide to creating one's own OAuth client in the browser.
+    callback open-help();
+    callback add-cancel();
+    // So Rust can save the choice at once instead of only on a clean exit.
+    callback theme-changed(int);
+    callback language-changed(int);
+    title: "FastSync";
+
+    // Palette.color-scheme is the only palette property an app can set; the colours follow the system accent.
+    function apply-theme() {
+        Palette.color-scheme = root.color-scheme-index == 1 ? ColorScheme.light
+            : root.color-scheme-index == 2 ? ColorScheme.dark : ColorScheme.unknown;
+    }
+    init => {
+        root.apply-theme();
+        main-keys.focus();
+    }
+    changed color-scheme-index => {
+        root.apply-theme();
+        root.theme-changed(root.color-scheme-index);
+    }
+    changed language-index => { root.language-changed(root.language-index); }
+    changed add-kind => { root.add-kind-changed(root.add-kind); }
+
+    // Keeps keyboard focus inside the page, so the dialogs' Esc handling and Tab trap work after they close.
+    main-keys := FocusScope {
+        VerticalLayout {
+            padding: 12px;
+            spacing: Family.gap-l;
+            HorizontalLayout {
+                spacing: Family.gap-m;
+                Image {
+                    source: @image-url("../../../packaging/io.github.evandro777.FastSync.svg");
+                    width: 24px;
+                    height: 24px;
+                    y: (parent.height - self.height) / 2;
+                }
+                Text { text: "FastSync"; font-size: Family.title; font-weight: Family.section-weight; vertical-alignment: center; }
+                Rectangle { horizontal-stretch: 1; }
+                Button { text: @tr("Add account"); primary: true; clicked => { root.add-open = true; } }
+                // The burger: opens the preferences dialog (Appearance, Language, About).
+                MenuButton {
+                    label: @tr("Preferences");
+                    clicked => { root.settings-open = true; }
+                }
+            }
+            if root.rclone-missing: Rectangle {
+                background: Family.warning.with-alpha(0.16);
+                border-radius: Family.control-radius;
+                vertical-stretch: 0;
+                VerticalLayout {
+                    padding: 8px;
+                    Text {
+                        text: @tr("rclone was not found. FastSync needs it to talk to the cloud. Install it (rclone.org) and restart.");
+                        wrap: word-wrap;
+                        min-width: 0px;
+                        color: Family.warning;
+                    }
+                }
+            }
+            ScrollView {
+                VerticalLayout {
+                    alignment: start;
+                    spacing: Family.gap-l;
+                    for a in root.accounts: AccountCard {
+                        acct: a;
+                        sync-now => { root.sync-now(a.id); }
+                        toggle-pause => { root.toggle-pause(a.id); }
+                        open-folder => { root.open-folder(a.id); }
+                        open-web => { root.open-web(a.id); }
+                        remove => { root.remove-account(a.id); }
+                    }
+                    if root.accounts.length == 0: VerticalLayout {
+                        padding-top: 48px;
+                        spacing: Family.gap-l;
+                        alignment: start;
+                        Text {
+                            text: @tr("No accounts yet");
+                            font-size: Family.title;
+                            font-weight: Family.section-weight;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: @tr("Add an account and choose a folder: its files stay in sync both ways and available offline.");
+                            color: Family.muted;
+                            wrap: word-wrap;
+                            min-width: 0px;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Last children, outside the layout, so they draw on top.
+    if root.add-open: AddDialog {
+        width: root.width;
+        height: root.height;
+        kind <=> root.add-kind;
+        local <=> root.add-local;
+        remote <=> root.add-remote;
+        email <=> root.add-email;
+        password <=> root.add-password;
+        busy: root.add-busy;
+        error: root.add-error;
+        own-client <=> root.add-own-client;
+        client-id <=> root.add-client-id;
+        client-secret <=> root.add-client-secret;
+        open-help => { root.open-help(); }
+        submit => { root.add-submit(); }
+        dismiss => {
+            root.add-open = false;
+            root.add-cancel();
+            main-keys.focus();
+        }
+    }
+    if root.settings-open: SettingsDialog {
+        width: root.width;
+        height: root.height;
+        color-scheme-index <=> root.color-scheme-index;
+        language-index <=> root.language-index;
+        dismiss => {
+            root.settings-open = false;
+            main-keys.focus();
+        }
+        show-about => {
+            root.settings-open = false;
+            root.about-open = true;
+        }
+    }
+    // Closing About returns to Settings: re-creating the dialog gives its keys focus back, so Esc keeps working.
+    if root.about-open: About {
+        width: root.width;
+        height: root.height;
+        version: root.version;
+        dismiss => {
+            root.about-open = false;
+            root.settings-open = true;
+        }
+        open-website => { root.open-website(); }
+    }
+}

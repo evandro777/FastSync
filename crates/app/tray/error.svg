@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- Tray icon, needs attention: red-orange tile, an exclamation mark. Rules: docs/ICON-STYLE.md. -->
+  <path d="M26 0H64V14H92V28H128V102A26 26 0 0 1 102 128H26A26 26 0 0 1 0 102V26A26 26 0 0 1 26 0Z" fill="#d4572a"/>
+  <g transform="translate(62 68) skewX(-8) translate(-62 -68)" fill="none" stroke="#ffffff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M40 96H86A18 18 0 0 0 88 62A24 24 0 0 0 42 58A19 19 0 0 0 40 96Z"/>
+    <path d="M64 66V77" stroke-width="8"/>
+    <circle cx="64" cy="85" r="4" fill="#ffffff" stroke-width="2"/>
+  </g>
+</svg>

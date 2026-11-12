@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=FastSync
+Type=Application
+GenericName=Cloud Sync
+Comment=Two-way sync for Dropbox, Google Drive, OneDrive and MEGA
+Exec=fastsync
+Categories=Network;FileTransfer;
+Icon=io.github.evandro777.FastSync
+Terminal=false

@@ -1,0 +1,256 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Language: pt_BR\n"
+
+msgctxt "Tr"
+msgid "Open FastSync"
+msgstr "Abrir o FastSync"
+
+msgctxt "Tr"
+msgid "Sync now"
+msgstr "Sincronizar agora"
+
+msgctxt "Tr"
+msgid "Pause syncing"
+msgstr "Pausar a sincronização"
+
+msgctxt "Tr"
+msgid "Resume syncing"
+msgstr "Retomar a sincronização"
+
+msgctxt "Tr"
+msgid "Quit"
+msgstr "Sair"
+
+msgctxt "Tr"
+msgid "Everything is up to date"
+msgstr "Tudo está atualizado"
+
+msgctxt "Tr"
+msgid "Syncing…"
+msgstr "Sincronizando…"
+
+msgctxt "Tr"
+msgid "Paused"
+msgstr "Pausado"
+
+msgctxt "Tr"
+msgid "Needs attention"
+msgstr "Precisa de atenção"
+
+msgctxt "Tr"
+msgid "No accounts"
+msgstr "Nenhuma conta"
+
+msgctxt "Tr"
+msgid "Choose a local folder, for example /home/you/Dropbox."
+msgstr "Escolha uma pasta local, por exemplo /home/voce/Dropbox."
+
+msgctxt "Tr"
+msgid "Another account already syncs that folder."
+msgstr "Outra conta já sincroniza essa pasta."
+
+msgctxt "Tr"
+msgid "Choose a different folder: this one holds your whole home folder or FastSync's own data."
+msgstr "Escolha outra pasta: esta contém toda a sua pasta pessoal ou os dados do próprio FastSync."
+
+msgctxt "Tr"
+msgid "Fill in both the client ID and the client secret, without spaces, or turn the option off."
+msgstr "Preencha o ID e o segredo do cliente, sem espaços, ou desative a opção."
+
+msgctxt "Tr"
+msgid "Your rclone was built without support for this service (Debian and Ubuntu's rclone leaves some out). Install the official rclone from rclone.org, or use the Flatpak."
+msgstr "O seu rclone foi compilado sem suporte a este serviço (o rclone do Debian e do Ubuntu deixa alguns de fora). Instale o rclone oficial em rclone.org ou use o Flatpak."
+
+msgctxt "Tr"
+msgid "Open folder"
+msgstr "Abrir pasta"
+
+msgctxt "Tr"
+msgid "Login failed: {}"
+msgstr "Falha no login: {}"
+
+msgctxt "Main"
+msgid "Add account"
+msgstr "Adicionar conta"
+
+msgctxt "Main"
+msgid "Preferences"
+msgstr "Preferências"
+
+msgctxt "Main"
+msgid "rclone was not found. FastSync needs it to talk to the cloud. Install it (rclone.org) and restart."
+msgstr "O rclone não foi encontrado. O FastSync precisa dele para falar com a nuvem. Instale-o (rclone.org) e reinicie."
+
+msgctxt "Main"
+msgid "No accounts yet"
+msgstr "Nenhuma conta ainda"
+
+msgctxt "Main"
+msgid "Add an account and choose a folder: its files stay in sync both ways and available offline."
+msgstr "Adicione uma conta e escolha uma pasta: os arquivos ficam sincronizados nos dois sentidos e disponíveis offline."
+
+msgctxt "AccountCard"
+msgid "Up to date"
+msgstr "Atualizado"
+
+msgctxt "AccountCard"
+msgid "Syncing…"
+msgstr "Sincronizando…"
+
+msgctxt "AccountCard"
+msgid "Paused"
+msgstr "Pausado"
+
+msgctxt "AccountCard"
+msgid "Needs attention"
+msgstr "Precisa de atenção"
+
+msgctxt "AccountCard"
+msgid "Stopped"
+msgstr "Parado"
+
+msgctxt "AccountCard"
+msgid "{} of {} files would be deleted. Press Sync now to confirm."
+msgstr "{} de {} arquivos seriam apagados. Clique em Sincronizar agora para confirmar."
+
+msgctxt "AccountCard"
+msgid "Resume"
+msgstr "Retomar"
+
+msgctxt "AccountCard"
+msgid "Pause"
+msgstr "Pausar"
+
+msgctxt "AccountCard"
+msgid "Sync now"
+msgstr "Sincronizar agora"
+
+msgctxt "AccountCard"
+msgid "Open folder"
+msgstr "Abrir pasta"
+
+msgctxt "AccountCard"
+msgid "Open in browser"
+msgstr "Abrir no navegador"
+
+msgctxt "AccountCard"
+msgid "Remove account"
+msgstr "Remover conta"
+
+msgctxt "AddDialog"
+msgid "Add account"
+msgstr "Adicionar conta"
+
+msgctxt "AddDialog"
+msgid "Service"
+msgstr "Serviço"
+
+msgctxt "AddDialog"
+msgid "Local folder"
+msgstr "Pasta local"
+
+msgctxt "AddDialog"
+msgid "Folder in the cloud (empty for all of it)"
+msgstr "Pasta na nuvem (vazio para tudo)"
+
+msgctxt "AddDialog"
+msgid "Everything"
+msgstr "Tudo"
+
+msgctxt "AddDialog"
+msgid "Email"
+msgstr "E-mail"
+
+msgctxt "AddDialog"
+msgid "Password"
+msgstr "Senha"
+
+msgctxt "AddDialog"
+msgid "Logging in…"
+msgstr "Entrando…"
+
+msgctxt "AddDialog"
+msgid "Finish the login in your browser…"
+msgstr "Conclua o login no navegador…"
+
+msgctxt "AddDialog"
+msgid "Use my own client ID (advanced)"
+msgstr "Usar meu próprio ID de cliente (avançado)"
+
+msgctxt "AddDialog"
+msgid "Avoids the shared limits of the built-in one, which can stop syncing for a while."
+msgstr "Evita os limites compartilhados do ID embutido, que podem interromper a sincronização por um tempo."
+
+msgctxt "AddDialog"
+msgid "Client ID"
+msgstr "ID do cliente"
+
+msgctxt "AddDialog"
+msgid "Client secret"
+msgstr "Segredo do cliente"
+
+msgctxt "AddDialog"
+msgid "How to get one"
+msgstr "Como obter um"
+
+msgctxt "AddDialog"
+msgid "Cancel"
+msgstr "Cancelar"
+
+msgctxt "AddDialog"
+msgid "Log in"
+msgstr "Entrar"
+
+msgctxt "SettingsDialog"
+msgid "Preferences"
+msgstr "Preferências"
+
+msgctxt "SettingsDialog"
+msgid "Appearance"
+msgstr "Aparência"
+
+msgctxt "SettingsDialog"
+msgid "System"
+msgstr "Sistema"
+
+msgctxt "SettingsDialog"
+msgid "Light"
+msgstr "Claro"
+
+msgctxt "SettingsDialog"
+msgid "Dark"
+msgstr "Escuro"
+
+msgctxt "SettingsDialog"
+msgid "Language"
+msgstr "Idioma"
+
+msgctxt "SettingsDialog"
+msgid "About"
+msgstr "Sobre"
+
+msgctxt "SettingsDialog"
+msgid "Close"
+msgstr "Fechar"
+
+msgctxt "About"
+msgid "Two-way folder sync for Dropbox, Google Drive, OneDrive and MEGA. Light and fast."
+msgstr "Sincronização de pastas nos dois sentidos para Dropbox, Google Drive, OneDrive e MEGA. Leve e rápido."
+
+msgctxt "AboutCard"
+msgid "Version {}"
+msgstr "Versão {}"
+
+msgctxt "AboutCard"
+msgid "Author: {}"
+msgstr "Autor: {}"
+
+msgctxt "AboutCard"
+msgid "License: {}"
+msgstr "Licença: {}"
+
+msgctxt "AboutCard"
+msgid "Close"
+msgstr "Fechar"

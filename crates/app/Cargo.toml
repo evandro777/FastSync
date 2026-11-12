@@ -1,0 +1,19 @@
+[package]
+name = "fastsync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Light and fast Linux app built in Rust with Slint."
+
+[dependencies]
+fastsync-core = { path = "../core" }
+ksni = { version = "0.3.7", default-features = false, features = ["async-io", "blocking"] }
+slint = { version = "1.18", default-features = false, features = ["std", "backend-winit", "renderer-software", "software-renderer-systemfonts", "compat-1-2", "unstable-winit-030"] }
+
+[build-dependencies]
+slint-build = "1.18"
+# Already in the tree through slint-build; decodes the tray PNGs into pixmaps at build time.
+png = "0.18"
