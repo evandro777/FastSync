@@ -7,9 +7,10 @@ Google has also said rclone's shared Drive client ID will stop working during 20
 
 The fix is a **client ID of your own**: a small "app" you register for free with the service. It has its own
 quota, so nobody else's traffic counts against you. You do this once per service, then paste two values into
-FastSync's **Add account** dialog.
+FastSync's **Add account** dialog. For an account you already have, use the pencil button on its card, tick
+"Use my own client ID", fill both fields and press **Next**: the browser opens to sign in again.
 
-- Cost: free (OneDrive's Azure portal may ask for a card to verify your identity; it is not charged).
+- Cost: free (OneDrive's Azure sign-up asks for an address and a card to verify your identity; it is not charged unless you upgrade to a paid plan). OneDrive is optional: without your own ID FastSync uses rclone's shared one.
 - Time: about 10 minutes.
 - Safe: the values only let *your* app ask *your* accounts for access. FastSync keeps them in its own `rclone.conf` (permissions `0600`) and never sends them anywhere except to the service you log in to.
 
@@ -39,10 +40,14 @@ documentation.
 7. Open **Audience**, **+ Add users**, add your own Google account as a test user, **Save**.
 8. Go to **Overview**, **Create OAuth client**, application type **Desktop app**, **Create**.
 9. Copy the **Client ID** and **Client secret**.
-10. **Publish the app** (External only): **Audience**, **Publish app**, confirm. This matters: an app left in  *Testing* makes your login **expire after 7 days**, so FastSync would ask you to log in again every week.  - If the button is greyed out, Google asks for a home page and a privacy policy link even for a personal app:    **Branding**, fill in *Application home page* and *Application privacy policy link* (a free GitHub Pages    page is fine), add its domain under *Authorized domains*, **Save**, and try again.
-11. In FastSync, paste the two values and log in. Google shows a scary **"Google hasn't verified this app"**  screen. That is expected for your own personal app: **Advanced**, **Go to ... (unsafe)**, then allow.
+10. **Publish the app** (External only). This matters: an app left in *Testing* makes your login **expire after 7 days**, so FastSync would ask you to log in again every week.
+    1. **Branding**: fill in *App name*, *Application home page*, *Application privacy policy link* and, under *Authorized domains*, the domain of those links, then **Save**. Google requires them even for a personal app. FastSync's own pages work: `https://github.com/evandro777/FastSync` and `https://github.com/evandro777/FastSync/blob/master/PRIVACY.md`, with the domain `github.com`.
+    2. Do **not** add a *logo*: it forces Google's verification process.
+    3. Do **not** click *Verify branding* or *Go to verification center*: Google refuses a `github.com` page ("not registered to you") and you do not need it.
+    4. **Audience**, **Publish app**, confirm. The status must read **In production**. A yellow "Your app requires verification" banner stays; ignore it. Do not press *Back to testing*.
+11. In FastSync, paste the two values and log in. Google shows a scary **"Google hasn't verified this app"** screen. That is expected for your own personal app: **Advanced**, **Go to ... (unsafe)**, then allow.
 
-Verification by Google is only needed for apps with more than 100 users; for yourself you can skip it.
+Verification by Google is only needed to remove that warning and to go past 100 users; for yourself you can skip it.
 
 If creating the consent screen fails with *"changes to one of the field of the resource is not supported"*, use
 Google's Python quickstart page and press **Enable the Drive API**: it creates a project, a client ID and a
@@ -58,25 +63,27 @@ secret for you.
 4. Name the app. The name must be unique across Dropbox (for example `FastSync-yourname`). **Create app**.
 5. **Permissions** tab: enable `account_info.read`, `files.metadata.write`, `files.content.write`, `files.content.read` and `sharing.write` (the two `*.read` metadata/sharing boxes get ticked by themselves). Click **Submit**.
 6. **Settings** tab, *OAuth 2, Redirect URIs*: type `http://localhost:53682/` and click **Add**. (Type it; the address must match exactly.)
-7. On the same tab copy the **App key** (this is the *Client ID*) and **App secret** (the *Client secret*).
+7. On the same tab, look for "Credentials", copy the **App key** (this is the *Client ID*) and **App secret** (the *Client secret*).
 8. In FastSync, paste them and log in.
 
-A Dropbox app starts in *Development* status, limited to 500 users, which is plenty for yourself.
+A Dropbox app starts in *Development* status, and on the **Settings** tab *Development users* reads **Only you**: only the Dropbox account that created the app can log in. Any other account fails with "This app has reached its user limit". To use a second account, click **Enable additional users** on that tab (up to 500 users, plenty for yourself); no production review is needed.
 
 ---
 
 ## OneDrive
 
-1. Open the [Azure portal](https://portal.azure.com/) and sign in with a Microsoft account. First time: Azure asks you to create a free account and may ask for a phone number and a card for identity verification.
+1. Open the [Azure portal](https://portal.azure.com/) and sign in with a Microsoft account. First time: Azure asks you to create a free account and may ask for a phone number and a card for identity verification (use a temporary one). This step also creates the *directory* (tenant) that owns your app. Without one, registering fails with "The ability to create applications outside of a directory has been deprecated": finish the [free Azure sign-up](https://azure.microsoft.com/free) first (you do not have to use any paid service), then reload the portal.
 2. Search for **App registrations**, **New registration**.
-3. Name: anything. Supported account types: **Accounts in any organizational directory (Any Azure AD directory - Multitenant) and personal Microsoft accounts**. Redirect URI: platform **Web**, value `http://localhost:53682/` (type it, do not paste it). **Register**.
+    1. Direct link: <https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade>
+3. Name: anything. Supported account types: **Any Entra ID Tenant + Personal Microsoft accounts** (older portals call it *Accounts in any organizational directory (Any Azure AD directory - Multitenant) and personal Microsoft accounts*). Redirect URI: platform **Web**, value `http://localhost:53682/` (type it, do not paste it). **Register**.
 4. Copy the **Application (client) ID** shown under the app name: this is the *Client ID*.
-5. **Certificates & secrets**, **New client secret**, any description, expiry **24 months**, **Add**. Copy the secret's **Value** now (not the *Secret ID*): Azure shows it only once. This is the *Client secret*.
+5. On the app's *Overview* click **Add a certificate or secret** (right side, under *Client credentials*; also in the left menu, **Manage**, **Certificates & secrets**). **New client secret**, any description, the longest expiry offered (24 months), **Add**. Copy the secret's **Value** now (not the *Secret ID*): Azure shows it only once. This is the *Client secret*.
 6. **API permissions**, **Add a permission**, **Microsoft Graph**, **Delegated permissions**. Select `Files.Read`, `Files.ReadWrite`, `Files.Read.All`, `Files.ReadWrite.All`, `offline_access`, `User.Read` and `Sites.Read.All`, then **Add permissions**.
 7. In FastSync, paste the two values and log in.
 
 Notes:
 
+- The orange banner "End users cannot grant consent to newly registered multitenant apps without verified publishers" can be ignored for a personal Microsoft account: it only matters for work or school accounts that need an administrator's approval.
 - **The secret expires** after the period you chose. Then logins and token refreshes fail: create a new secret in the same place and re-add the account.
 - **OneDrive for work or school** may refuse the steps above (a common error is "publisher not verified"), or your organisation may restrict apps. Create the app with your work account and pick **Accounts in this organizational directory only (Single tenant)** instead; FastSync does not set the tenant-specific login addresses for you yet, so work/school accounts may still need your IT department or the rclone documentation.
 

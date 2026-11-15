@@ -19,6 +19,22 @@ edit and delete files in the Drive folder you chose. That access is used only to
 computer. The data stays between your computer and Google; it is not transferred to the developer or to any third
 party, and is not used for advertising or to train any model.
 
+## Other services
+
+- **Dropbox:** FastSync asks for `account_info.read`, `files.metadata.write`, `files.content.read`,
+  `files.content.write` and `sharing.write` (to create a share link when you ask for one).
+- **OneDrive:** it asks for read and write access to your files (`Files.ReadWrite.All`), your basic profile
+  (`User.Read`) and `offline_access`, so it can keep syncing without asking you to log in again.
+- **MEGA:** you give FastSync your email and password. The password is stored obscured (not encrypted) in the same
+  `rclone.conf`.
+- The same rules apply: the data goes only between your computer and the service, never to the developer.
+
+## Notifications and links
+
+FastSync shows desktop notifications (for example when two copies of a file were kept) and, when you choose "Copy
+share link" in your file manager, asks the service for a public link to that one file and shows it in a window, where a button copies it. Nothing is
+shared unless you ask for it.
+
 ## Removing access
 
 Remove the account in FastSync, or revoke it in your Google account under *Manage third-party access* (Dropbox:

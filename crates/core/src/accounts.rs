@@ -1,6 +1,6 @@
 //! The linked accounts, in `accounts.toml` next to the settings. The OAuth tokens live in rclone's own config file
 //! (`rclone.conf`, 0600, ours alone), never in here.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -18,9 +18,11 @@ pub struct Account {
     pub kind: String,
     /// The local folder.
     pub local: String,
-    /// The folder inside the cloud ("" = its root).
-    pub remote_path: String,
     pub paused: bool,
+    /// Folders (relative to the synced folder, `/` separated) the user unchecked: neither side is synced for them.
+    pub excluded: Vec<String>,
+    /// One-way: the folder mirrors the cloud, which is never changed (local edits go to the trash).
+    pub download_only: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -52,10 +54,13 @@ pub fn load() -> Vec<Account> {
 
 pub fn save(accounts: &[Account]) {
     let Some(dir) = data_dir() else { return };
-    let text = toml::to_string_pretty(&Store {
+    // Never write an empty file over the account list because serialising failed.
+    let Ok(text) = toml::to_string_pretty(&Store {
         accounts: accounts.to_vec(),
-    })
-    .unwrap_or_default();
+    }) else {
+        eprintln!("cannot save accounts: serialisation failed");
+        return;
+    };
     if let Err(e) = create_private_dir(&dir).and_then(|()| write_atomic(&dir.join("accounts.toml"), text)) {
         eprintln!("cannot save accounts: {e}");
     }
@@ -83,15 +88,63 @@ pub fn default_local(kind: &str) -> String {
     format!("{home}/{}", provider_name(kind).replace(' ', ""))
 }
 
+/// The account whose local folder holds `path`, and the path's place inside the cloud (the same, below the root).
+/// None for a path outside every account, the folder itself, `.fastsync` (our trash/tmp) or an unchecked folder.
+/// Compares path components, so `/h/Drop` does not hold `/h/Dropbox2/x`.
+pub fn locate<'a>(accounts: &'a [Account], path: &Path) -> Option<(&'a Account, String)> {
+    accounts.iter().find_map(|a| {
+        let rel = path.strip_prefix(&a.local).ok()?;
+        let rel = rel.to_str()?;
+        let hidden = rel == ".fastsync" || rel.starts_with(".fastsync/");
+        let excluded = a
+            .excluded
+            .iter()
+            .any(|e| rel == e || rel.strip_prefix(e.as_str()).is_some_and(|r| r.starts_with('/')));
+        if rel.is_empty() || hidden || excluded || rel.split('/').any(|c| c == "..") {
+            return None;
+        }
+        Some((a, rel.to_owned()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn locate_finds_the_account_and_the_cloud_path() {
+        let acct = |id: &str, local: &str, excluded: &[&str]| Account {
+            id: id.into(),
+            local: local.into(),
+            excluded: excluded.iter().map(|s| s.to_string()).collect(),
+            ..Account::default()
+        };
+        let all = [acct("a", "/h/Drop", &[]), acct("b", "/h/Dropbox2", &["Skip"])];
+        let find = |p: &str| locate(&all, Path::new(p)).map(|(a, r)| (a.id.clone(), r));
+        assert_eq!(find("/h/Drop/x/y.txt"), Some(("a".into(), "x/y.txt".into())));
+        assert_eq!(find("/h/Dropbox2/y.txt"), Some(("b".into(), "y.txt".into())));
+        assert_eq!(find("/h/Dropbox2/Skip/y.txt"), None);
+        assert_eq!(
+            find("/h/Dropbox2/Skipper/y.txt").map(|x| x.1),
+            Some("Skipper/y.txt".into())
+        );
+        assert_eq!(find("/h/Drop/.fastsync/trash/y"), None);
+        assert_eq!(find("/h/Drop"), None);
+        assert_eq!(find("/h/Drop/../etc/passwd"), None);
+        assert_eq!(find("/h/Other/y"), None);
+    }
+
+    #[test]
     fn old_and_partial_files_load() {
         let s: Store = toml::from_str("[[accounts]]\nid = \"a1\"\nkind = \"drive\"").unwrap();
         assert_eq!(s.accounts[0].kind, "drive");
-        assert!(!s.accounts[0].paused && s.accounts[0].remote_path.is_empty());
+        assert!(!s.accounts[0].paused);
+        assert!(s.accounts[0].excluded.is_empty());
+        let s: Store = toml::from_str("[[accounts]]\nid = \"a1\"\nexcluded = [\"Photos\", \"a/b\"]").unwrap();
+        assert_eq!(s.accounts[0].excluded, ["Photos", "a/b"]);
+        assert!(!s.accounts[0].download_only);
+        let s: Store = toml::from_str("[[accounts]]\nid = \"a1\"\ndownload_only = true").unwrap();
+        assert!(s.accounts[0].download_only);
     }
 
     #[test]

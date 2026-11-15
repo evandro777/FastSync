@@ -1,7 +1,7 @@
-import { Button, CheckBox, ComboBox, LineEdit, Palette, ScrollView } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, Palette, ScrollView, SpinBox, Spinner } from "std-widgets.slint";
 import { Family } from "family.slint";
 import { AboutCard, PrefRow } from "about.slint";
-import { MenuButton } from "controls.slint";
+import { AlertIcon, DangerButton, FilterBar, Icon, IconButton, MenuButton, NeutralBadge, ProgressBar } from "controls.slint";
 
 // Strings built in Rust go through this global (never `format!` user-visible text in Rust).
 export global Tr {
@@ -15,6 +15,13 @@ export global Tr {
     public pure function tray-paused() -> string { return @tr("Paused"); }
     public pure function tray-error() -> string { return @tr("Needs attention"); }
     public pure function tray-none() -> string { return @tr("No accounts"); }
+    public pure function tray-stopped() -> string { return @tr("Deletions waiting for your confirmation"); }
+    public pure function notify-stopped-title() -> string { return @tr("FastSync stopped a sync"); }
+    public pure function notify-stopped(deletes: int, known: int, provider: string) -> string { return @tr("{} of {} files in {} would be deleted. Nothing was deleted yet: open FastSync to review.", deletes, known, provider); }
+    public pure function notify-conflict-title() -> string { return @tr("A file changed on both sides"); }
+    public pure function notify-conflict(provider: string, path: string) -> string { return @tr("{} changed here and in {}. Both copies were kept: the local one is now named “(conflict …)”.", path, provider); }
+    public pure function notify-conflicts(n: int, provider: string, first: string) -> string { return @tr("{} files changed here and in {}, starting with {}. Both copies of each were kept: the local ones are now named “(conflict …)”.", n, provider, first); }
+    public pure function notify-show-file() -> string { return @tr("Show file"); }
     public pure function error-no-folder() -> string { return @tr("Choose a local folder, for example /home/you/Dropbox."); }
     public pure function error-taken() -> string { return @tr("Another account already syncs that folder."); }
     public pure function error-client() -> string { return @tr("Fill in both the client ID and the client secret, without spaces, or turn the option off."); }
@@ -22,6 +29,31 @@ export global Tr {
     public pure function error-bad-folder() -> string { return @tr("Choose a different folder: this one holds your whole home folder or FastSync's own data."); }
     public pure function tray-open-folder() -> string { return @tr("Open folder"); }
     public pure function error-login(why: string) -> string { return @tr("Login failed: {}", why); }
+    public pure function error-nested() -> string { return @tr("Choose a folder that is neither inside nor around this account's current folder."); }
+    public pure function error-folders(why: string) -> string { return @tr("Could not list the folders: {}", why); }
+    public pure function error-share-outside() -> string { return @tr("This file is not in a synced folder of FastSync, so it has no cloud copy to share."); }
+    public pure function error-share-unsynced() -> string { return @tr("This file is not in the cloud yet. Wait for the sync to finish and try again."); }
+    public pure function error-share(why: string) -> string { return @tr("Could not create the link: {}", why); }
+    // The activity log (kinds, "N ago" and the check summary; counts are adjectives so no plural form is needed).
+    public pure function log-kind(kind: int) -> string {
+        return kind == 0 ? @tr("Sent")
+            : kind == 1 ? @tr("Received")
+            : kind == 2 ? @tr("Removed here (in the trash)")
+            : kind == 3 ? @tr("Removed in the cloud")
+            : kind == 4 ? @tr("Conflict: both copies kept")
+            : kind == 5 ? @tr("Problem")
+            : kind == 6 ? @tr("Stopped: deletions waiting for confirmation")
+            : kind == 8 ? @tr("Moved") : @tr("Check");
+    }
+    public pure function log-moved-from(old: string) -> string { return @tr("Moved from {}", old); }
+    public pure function ago-now() -> string { return @tr("just now"); }
+    public pure function ago-min(n: int) -> string { return @tr("{} min ago", n); }
+    public pure function ago-hour(n: int) -> string { return @tr("{} h ago", n); }
+    public pure function ago-day(n: int) -> string { return @tr("{} d ago", n); }
+    public pure function log-last-ok(when: string) -> string { return @tr("Last file synced: {}", when); }
+    public pure function log-last-bad(when: string) -> string { return @tr("Last problem: {}", when); }
+    public pure function log-scan-full(changed: int, failed: int, secs: string) -> string { return @tr("Full check: {} changed, {} failed, {} s", changed, failed, secs); }
+    public pure function log-scan-paths(changed: int, failed: int, secs: string) -> string { return @tr("Quick check: {} changed, {} failed, {} s", changed, failed, secs); }
 }
 
 // One linked account. `state`: 0 up to date, 1 syncing, 2 paused, 3 problem, 4 stopped by the delete guard.
@@ -35,12 +67,43 @@ export struct AccountRow {
     // For state 4: files that would be deleted, and files known.
     deletes: int,
     known: int,
+    download-only: bool,
+    // For state 1 once a run has a plan: `transfer` 0 none, 1 upload, 2 download, 3 removal; `file` is the name
+    // being handled, `done` of `total` files are finished and `speed` reads like "2.4 MB/s" ("" = unknown).
+    transfer: int,
+    file: string,
+    done: int,
+    total: int,
+    speed: string,
+    // Cloud usage as size texts ("" = the service gave no limit: no meter), the whole percent, and the level:
+    // 0 normal, 1 from 80 % (amber), 2 from 95 % (red).
+    quota-used: string,
+    quota-total: string,
+    quota-percent: int,
+    quota-level: int,
+}
+
+// One cloud folder in the picker. The list is flat: `depth` indents it, the children of an expanded row follow it.
+// `enabled` is false under an unchecked folder (it is not synced either way).
+export struct FolderRow {
+    path: string,
+    name: string,
+    depth: int,
+    checked: bool,
+    enabled: bool,
+    expanded: bool,
+    loading: bool,
+    // Known to contain folders (probed in the background): only then does the row get an arrow.
+    has-children: bool,
 }
 
 // The shell of every dialog: an in-window overlay, not a second window (closing Main always hides it to the tray, and
 // ui-snapshot.sh can capture it). The dialog's content goes inside the card.
 component Dialog inherits Rectangle {
     in property <length> card-width: Family.dialog-width;
+    // Width a wrapped text has inside the card (its padding and a scroll bar taken off): what `HintText` and
+    // `SelectableText` estimate their height from.
+    out property <length> text-avail: min(root.card-width, root.width - 32px) - 32px - 16px;
     callback dismiss();
     background: Family.scrim;
     init => { keys.focus(); }
@@ -79,12 +142,59 @@ component Dialog inherits Rectangle {
     }
 }
 
+// Read-only wrapped text that can be selected with the mouse and copied. A wrapped `TextInput` inside a layout
+// reports the height of one line, so the height is estimated from the width it has (`avail`, given by the parent).
+component SelectableText inherits TextInput {
+    in property <length> avail;
+    // Line breaks in the text (one path per line): each can add a line the character estimate cannot see.
+    in property <int> lines: 0;
+    read-only: true;
+    wrap: word-wrap;
+    min-width: 0px;
+    selection-background-color: Palette.selection-background;
+    selection-foreground-color: Palette.selection-foreground;
+    // ~0.58 em per character on average; a little generous so a line is never cut.
+    min-height: (Math.ceil(self.text.character-count / (max(root.avail, 80px) / (self.font-size * 0.58))) + root.lines) * self.font-size * 1.4;
+}
+
+// A small muted wrapped note. Slint reports a wrapped `Text` as ONE line high whatever its width, so a layout (and a
+// ScrollView's scrollable height) built from it comes out short by the extra lines and the last field cannot be
+// reached. Every wrapped Text inside a dialog uses this instead (never a bare `Text { wrap: word-wrap }`), with
+// `avail: root.text-avail`; never patch a ScrollView with a hand-tuned "slack" in px.
+component HintText inherits Text {
+    in property <length> avail;
+    color: Family.muted;
+    font-size: Family.caption;
+    wrap: word-wrap;
+    min-width: 0px;
+    // Same estimate as SelectableText (~0.58 em per character, a little generous).
+    min-height: Math.ceil(self.text.character-count / (max(root.avail, 80px) / (self.font-size * 0.58))) * self.font-size * 1.4;
+}
+
 component SettingsDialog inherits Dialog {
     // 0 follows the system, 1 light, 2 dark (settings.theme).
     in-out property <int> color-scheme-index;
     // 0 follows the system, 1 English, 2 Português (settings.language).
     in-out property <int> language-index;
+    // Status badge on the account folders in the file manager (settings.file_emblems).
+    in-out property <bool> file-emblems;
+    // "3 files, 1.2 MB" or "Empty", worked out in Main; `trash-files` only decides whether there is anything to empty.
+    in property <string> trash-summary;
+    in property <int> trash-files;
+    in property <bool> trash-busy;
+    in property <string> trash-error;
+    // Shell command that raises the inotify watch limit; empty unless a runner ran out of watches.
+    in property <string> watch-fix;
+    // Days after which trashed items are deleted for good (settings.trash_days); 0 keeps them forever.
+    in-out property <int> trash-days;
+    // Minutes between the full local checks for missed edits: while the folder is watched, and when it cannot be.
+    in-out property <int> walk-minutes;
+    in-out property <int> walk-fallback-minutes;
     callback show-about();
+    callback scan-trash();
+    callback ask-empty-trash();
+    // Every opening (also the return from About or the confirmation) counts again.
+    init => { root.scan-trash(); }
 
     Text { text: @tr("Preferences"); font-size: Family.page-title; font-weight: Family.page-weight; }
     ScrollView {
@@ -93,6 +203,8 @@ component SettingsDialog inherits Dialog {
         content := VerticalLayout {
             alignment: start;
             spacing: 12px;
+            // Room for the scroll bar, which would otherwise be drawn over the controls.
+            padding-right: Family.gap-s;
             PrefRow {
                 label: @tr("Appearance");
                 ComboBox {
@@ -109,6 +221,85 @@ component SettingsDialog inherits Dialog {
                     model: [@tr("System"), "English", "Português (Brasil)"];
                     current-index <=> root.language-index;
                 }
+            }
+            // A row and its hint are one group (4 px apart); the groups are 12 px apart, so a hint is never
+            // equally far from the row above and the row below.
+            VerticalLayout {
+                spacing: Family.gap-s;
+                PrefRow {
+                    label: @tr("File manager emblems");
+                    CheckBox { checked <=> root.file-emblems; }
+                }
+                HintText {
+                    text: @tr("Shows the sync status on the folder's icon in the file manager.");
+                    avail: root.text-avail;
+                }
+            }
+            VerticalLayout {
+                spacing: Family.gap-s;
+                PrefRow {
+                    label: @tr("Trash");
+                    Text {
+                        text: root.trash-summary;
+                        color: Family.muted;
+                        vertical-alignment: center;
+                        horizontal-alignment: right;
+                        horizontal-stretch: 1;
+                    }
+                    Button {
+                        text: @tr("Empty…");
+                        enabled: root.trash-files > 0 && !root.trash-busy;
+                        clicked => { root.ask-empty-trash(); }
+                    }
+                }
+                if root.trash-error != "": HintText {
+                    text: root.trash-error;
+                    color: Family.warning;
+                    avail: root.text-avail;
+                }
+            }
+            VerticalLayout {
+                spacing: Family.gap-s;
+                PrefRow {
+                    label: @tr("Keep trash for (days)");
+                    SpinBox { width: Family.control-width; minimum: 0; maximum: 3650; value <=> root.trash-days; }
+                }
+                HintText {
+                    text: @tr("Items are deleted for good once they are this old. 0 keeps them forever.");
+                    avail: root.text-avail;
+                }
+            }
+            VerticalLayout {
+                spacing: Family.gap-s;
+                PrefRow {
+                    label: @tr("Full check (min)");
+                    SpinBox { width: Family.control-width; minimum: 1; maximum: 60; value <=> root.walk-minutes; }
+                }
+                HintText {
+                    text: @tr("Edits in your folders are seen at once; this full check catches any that were missed. On very large folders a longer time saves disk work and battery.");
+                    avail: root.text-avail;
+                }
+            }
+            VerticalLayout {
+                spacing: Family.gap-s;
+                PrefRow {
+                    label: @tr("Fallback check (min)");
+                    SpinBox { width: Family.control-width; minimum: 1; maximum: 60; value <=> root.walk-fallback-minutes; }
+                }
+                HintText {
+                    text: @tr("Used when the system cannot watch your folders for changes. Edits there are only noticed by this check.");
+                    avail: root.text-avail;
+                }
+            }
+            if root.watch-fix != "": HintText {
+                text: @tr("FastSync cannot watch all your folders for changes (the system limit is reached), so some edits are only noticed by a periodic check. To raise the limit, run this and restart FastSync:");
+                color: Family.warning;
+                avail: root.text-avail;
+            }
+            if root.watch-fix != "": SelectableText {
+                text: root.watch-fix;
+                font-size: Family.caption;
+                avail: root.text-avail;
             }
         }
     }
@@ -136,45 +327,141 @@ component About inherits Dialog {
     }
 }
 
-// Read-only wrapped text that can be selected with the mouse and copied. A wrapped `TextInput` inside a layout
-// reports the height of one line, so the height is estimated from the width it has (`avail`, given by the parent).
-component SelectableText inherits TextInput {
-    in property <length> avail;
-    read-only: true;
-    wrap: word-wrap;
-    min-width: 0px;
-    // ~0.58 em per character on average; a little generous so a line is never cut.
-    min-height: Math.ceil(self.text.character-count / (max(root.avail, 80px) / (self.font-size * 0.58))) * self.font-size * 1.4;
+// Asks before an account is removed: it forgets the login and the sync state, which is not undone by adding it again.
+component RemoveDialog inherits Dialog {
+    in property <string> name;
+    in property <string> folder;
+    callback confirm();
+
+    Text { text: @tr("Remove account"); font-size: Family.page-title; font-weight: Family.page-weight; }
+    VerticalLayout {
+        spacing: Family.gap-s;
+        Text { text: root.name; font-weight: Family.section-weight; overflow: elide; }
+        Text { text: root.folder; color: Family.muted; font-size: Family.caption; overflow: elide; }
+    }
+    SelectableText {
+        text: @tr("FastSync stops syncing this account and forgets its login. The files on this computer and in the cloud are not deleted.");
+        avail: root.text-avail;
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: end;
+        Button { text: @tr("Cancel"); clicked => { root.dismiss(); } }
+        DangerButton { text: @tr("Remove"); clicked => { root.confirm(); } }
+    }
+}
+
+// Opened from Settings: the trash is removed for good, so it asks first.
+component EmptyTrashDialog inherits Dialog {
+    in property <string> summary;
+    callback confirm();
+
+    Text { text: @tr("Empty trash"); font-size: Family.page-title; font-weight: Family.page-weight; }
+    Text { text: root.summary; font-weight: Family.section-weight; overflow: elide; }
+    SelectableText {
+        text: @tr("Permanently delete the files FastSync moved to the .fastsync/trash folders of your accounts? This cannot be undone.");
+        avail: root.text-avail;
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: end;
+        Button { text: @tr("Cancel"); clicked => { root.dismiss(); } }
+        DangerButton { text: @tr("Delete"); clicked => { root.confirm(); } }
+    }
+}
+
+// Opened by the file manager's "Copy share link" action (`fastsync --share <file>`).
+component ShareDialog inherits Dialog {
+    in property <string> name;
+    in property <string> link;
+    in property <bool> busy;
+    in property <string> error;
+    in-out property <bool> copied: false;
+    // A second request can replace the link while the dialog is open.
+    changed link => { root.copied = false; }
+
+    Text { text: @tr("Share link"); font-size: Family.page-title; font-weight: Family.page-weight; }
+    Text { text: root.name; color: Family.muted; overflow: elide; }
+    if root.busy: HorizontalLayout {
+        spacing: Family.gap-m;
+        Spinner { width: 16px; height: 16px; indeterminate: true; y: (parent.height - self.height) / 2; }
+        Text { text: @tr("Creating the link…"); color: Family.muted; horizontal-stretch: 1; }
+    }
+    if root.error != "": HintText {
+        text: root.error;
+        color: Family.warning;
+        avail: root.text-avail;
+    }
+    // Box and button share one `if` so the button can reach the box.
+    if root.link != "": HorizontalLayout {
+        spacing: 8px;
+        link-box := LineEdit {
+            text: root.link;
+            read-only: true;
+        }
+        Button {
+            text: root.copied ? @tr("Copied") : @tr("Copy link");
+            primary: true;
+            clicked => {
+                link-box.select-all();
+                link-box.copy();
+                root.copied = true;
+            }
+        }
+    }
+    HorizontalLayout {
+        Rectangle { horizontal-stretch: 1; }
+        Button { text: @tr("Close"); clicked => { root.dismiss(); } }
+    }
 }
 
 component AddDialog inherits Dialog {
     // 0 Dropbox, 1 Google Drive, 2 OneDrive, 3 MEGA (accounts::PROVIDERS).
     in-out property <int> kind;
     in-out property <string> local;
-    in-out property <string> remote;
+    in-out property <bool> download-only;
     in-out property <string> email;
     in-out property <string> password;
-    // Waiting for the browser login; `error` is a translated message from Rust.
+    // The id of the account being edited; empty when adding. Editing keeps the service and its login.
+    in property <string> edit-id;
+    // Waiting for the browser login (or, when editing, for the folder list); `error` is a translated message from Rust.
     in property <bool> busy;
+    // Editing: the login is being renewed (`busy` is set too, which locks the fields).
+    in property <bool> auth-busy;
     in property <string> error;
     // The user's own OAuth app (a private quota instead of rclone's shared one); empty = the shared one.
     in-out property <bool> own-client;
     in-out property <string> client-id;
     in-out property <string> client-secret;
+    // Editing: Save signs in again in the browser, for an account whose login points at the wrong cloud account.
+    in-out property <bool> relogin;
     callback submit();
     callback open-help();
 
-    Text { text: @tr("Add account"); font-size: Family.page-title; font-weight: Family.page-weight; }
+    Text {
+        text: root.edit-id == "" ? @tr("Add account") : @tr("Edit account");
+        font-size: Family.page-title;
+        font-weight: Family.page-weight;
+    }
     // The fields scroll in a small window; a ScrollView does not report its content's height, hence preferred-height.
+    // The wrapped notes are `HintText`, whose height is estimated, so the layout's height is the real one.
     ScrollView {
-        // The slack: the layout under-reports its height by a few px once the own-client fields are shown.
-        preferred-height: fields.preferred-height + 28px;
+        preferred-height: fields.preferred-height;
+        content-height: fields.preferred-height;
         fields := VerticalLayout {
         alignment: start;
-        spacing: Family.gap-l;
+        spacing: Family.gap-m;
+        padding-right: Family.gap-s;
         PrefRow {
             label: @tr("Service");
-            ComboBox {
+            // The service of an existing account cannot change: plain text, not a greyed-out box.
+            if root.edit-id != "": Text {
+                text: ["Dropbox", "Google Drive", "OneDrive", "MEGA"][root.kind];
+                vertical-alignment: center;
+                horizontal-alignment: right;
+                width: Family.control-width;
+            }
+            if root.edit-id == "": ComboBox {
                 width: Family.control-width;
                 enabled: !root.busy;
                 model: ["Dropbox", "Google Drive", "OneDrive", "MEGA"];
@@ -186,105 +473,504 @@ component AddDialog inherits Dialog {
             Text { text: @tr("Local folder"); color: Family.muted; font-size: Family.caption; }
             LineEdit { text <=> root.local; enabled: !root.busy; }
         }
+        // Its own group: glued to the field above it, the checkbox read as part of the folder input.
         VerticalLayout {
             spacing: Family.gap-s;
-            Text { text: @tr("Folder in the cloud (empty for all of it)"); color: Family.muted; font-size: Family.caption; wrap: word-wrap; }
-            LineEdit { text <=> root.remote; enabled: !root.busy; placeholder-text: @tr("Everything"); }
+            CheckBox {
+                text: @tr("Download only (mirror the cloud)");
+                enabled: !root.busy;
+                checked <=> root.download-only;
+            }
+            if root.download-only: HintText {
+                text: @tr("Nothing is uploaded or deleted in the cloud. Files changed or added in this folder are moved to its .fastsync/trash folder.");
+                avail: root.text-avail;
+            }
         }
         // MEGA has no browser login: it takes the account's email and password.
         if root.kind == 3: VerticalLayout {
             spacing: Family.gap-l;
-            VerticalLayout {
-                spacing: Family.gap-s;
-                Text { text: @tr("Email"); color: Family.muted; font-size: Family.caption; }
-                LineEdit { text <=> root.email; enabled: !root.busy; input-type: InputType.text; }
+            if root.edit-id != "": HintText {
+                text: @tr("Type the password only to update the login. Use the same account as before.");
+                avail: root.text-avail;
             }
-            VerticalLayout {
-                spacing: Family.gap-s;
-                Text { text: @tr("Password"); color: Family.muted; font-size: Family.caption; }
-                LineEdit { text <=> root.password; enabled: !root.busy; input-type: InputType.password; }
+            HorizontalLayout {
+                spacing: Family.gap-l;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: Family.gap-s;
+                    Text { text: @tr("Email"); color: Family.muted; font-size: Family.caption; }
+                    LineEdit { text <=> root.email; enabled: !root.busy; input-type: InputType.text; }
+                }
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: Family.gap-s;
+                    Text { text: @tr("Password"); color: Family.muted; font-size: Family.caption; }
+                    LineEdit { text <=> root.password; enabled: !root.busy; input-type: InputType.password; }
+                }
             }
         }
         // Dropbox, Google Drive and OneDrive log in through OAuth, so they can use the user's own app.
         if root.kind != 3: VerticalLayout {
-            spacing: Family.gap-l;
-            CheckBox { text: @tr("Use my own client ID (advanced)"); enabled: !root.busy; checked <=> root.own-client; }
+            spacing: Family.gap-m;
+            if root.edit-id != "" && !root.relogin: HintText {
+                text: @tr("If Save opens the browser, sign in with the same account as before.");
+                avail: root.text-avail;
+            }
+            if root.edit-id != "" && root.kind != 3: CheckBox {
+                text: @tr("Sign in again (to switch the account)");
+                enabled: !root.busy;
+                checked <=> root.relogin;
+            }
+            HorizontalLayout {
+                spacing: Family.gap-m;
+                CheckBox {
+                    text: @tr("Use my own client ID (advanced)");
+                    enabled: !root.busy;
+                    checked <=> root.own-client;
+                    horizontal-stretch: 1;
+                }
+                if root.own-client: Button { text: @tr("How to get one"); clicked => { root.open-help(); } }
+            }
             if root.own-client: VerticalLayout {
-                spacing: Family.gap-l;
-                Text {
+                spacing: Family.gap-m;
+                HintText {
                     text: @tr("Avoids the shared limits of the built-in one, which can stop syncing for a while.");
-                    color: Family.muted;
-                    font-size: Family.caption;
-                    wrap: word-wrap;
-                    min-width: 0px;
+                    avail: root.text-avail;
                 }
                 HorizontalLayout {
-                    alignment: start;
-                    Button { text: @tr("How to get one"); clicked => { root.open-help(); } }
-                }
-                VerticalLayout {
-                    spacing: Family.gap-s;
-                    Text { text: @tr("Client ID"); color: Family.muted; font-size: Family.caption; }
-                    LineEdit { text <=> root.client-id; enabled: !root.busy; }
-                }
-                VerticalLayout {
-                    spacing: Family.gap-s;
-                    Text { text: @tr("Client secret"); color: Family.muted; font-size: Family.caption; }
-                    LineEdit { text <=> root.client-secret; enabled: !root.busy; input-type: InputType.password; }
+                    spacing: Family.gap-l;
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: Family.gap-s;
+                        Text { text: @tr("Client ID"); color: Family.muted; font-size: Family.caption; }
+                        LineEdit { text <=> root.client-id; enabled: !root.busy; }
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: Family.gap-s;
+                        Text { text: @tr("Client secret"); color: Family.muted; font-size: Family.caption; }
+                        LineEdit { text <=> root.client-secret; enabled: !root.busy; input-type: InputType.password; }
+                    }
                 }
             }
         }
         }
     }
-    if root.busy: Text {
-        text: root.kind == 3 ? @tr("Logging in…") : @tr("Finish the login in your browser…");
-        color: Family.info;
-        wrap: word-wrap;
-        min-width: 0px;
+    if root.busy: HorizontalLayout {
+        spacing: Family.gap-m;
+        Spinner { width: 16px; height: 16px; indeterminate: true; y: (parent.height - self.height) / 2; }
+        Text {
+            text: root.auth-busy || root.edit-id == ""
+                ? (root.kind == 3 ? @tr("Logging in…") : @tr("Finish the login in your browser…"))
+                : @tr("Loading folders…");
+            color: Family.muted;
+            wrap: word-wrap;
+            min-width: 0px;
+            horizontal-stretch: 1;
+        }
     }
     if root.error != "": SelectableText {
         text: root.error;
         color: Family.danger;
-        avail: min(root.card-width, root.width - 32px) - 32px;
+        avail: root.text-avail;
     }
     HorizontalLayout {
         spacing: 8px;
         alignment: end;
         Button { text: @tr("Cancel"); clicked => { root.dismiss(); } }
-        Button { text: @tr("Log in"); primary: true; enabled: !root.busy; clicked => { root.submit(); } }
+        Button {
+            text: root.edit-id == "" ? @tr("Log in") : @tr("Next");
+            primary: true;
+            enabled: !root.busy;
+            clicked => { root.submit(); }
+        }
     }
 }
 
-component IconButton inherits Button {
-    in property <image> glyph;
-    // Icon-only buttons need an accessible label: there is no text to read.
-    in property <string> label;
-    icon: root.glyph;
-    colorize-icon: true;
-    accessible-label: root.label;
+// Step two of Add and Edit: which cloud folders to sync. Folders load one level at a time, when expanded.
+component FoldersDialog inherits Dialog {
+    in property <[FolderRow]> rows;
+    // Applying the choice (stopping the old sync, saving, starting the new one).
+    in property <bool> busy;
+    in property <string> error;
+    callback toggle(int);
+    callback expand(int);
+    callback save();
+
+    Text { text: @tr("Folders to sync"); font-size: Family.page-title; font-weight: Family.page-weight; }
+    HintText {
+        text: @tr("Unchecked folders are not synced. Their copy on this computer moves to the .fastsync/trash folder; the cloud copy stays.");
+        avail: root.text-avail;
+    }
+    ScrollView {
+        // A ScrollView does not report its content's height, so the card would collapse to a sliver.
+        preferred-height: max(list.preferred-height, 40px);
+        list := VerticalLayout {
+            alignment: start;
+            for r[i] in root.rows: Rectangle {
+              height: Family.control-height;
+              border-radius: Family.control-radius;
+              // The whole row toggles; the arrow slot and the checkbox are on top and keep their own clicks.
+              background: row-touch.has-hover && r.enabled && !root.busy ? Palette.foreground.with-alpha(0.06) : transparent;
+              row-touch := TouchArea {
+                  enabled: r.enabled && !root.busy;
+                  clicked => { root.toggle(i); }
+              }
+              HorizontalLayout {
+                padding-left: r.depth * 20px;
+                spacing: Family.gap-s;
+                // The arrow is a fixed 24 px slot, so names line up whether or not a row has one.
+                Rectangle {
+                    width: 24px;
+                    // Not a Spinner: a small green ring next to a checkbox reads as a radio button.
+                    if r.has-children && r.loading: Text {
+                        text: "…";
+                        color: Family.muted;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    if r.has-children && !r.loading: Icon {
+                        source: r.expanded ? @image-url("icons/chevron-down.svg") : @image-url("icons/chevron-right.svg");
+                        width: 14px;
+                        height: 14px;
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                    }
+                    TouchArea {
+                        // Stays enabled while loading (clicks are swallowed), or a double click would fall through
+                        // to the row and uncheck the folder.
+                        enabled: r.has-children && !root.busy;
+                        accessible-role: button;
+                        accessible-label: r.expanded ? @tr("Collapse") : @tr("Expand");
+                        clicked => {
+                            if !r.loading {
+                                root.expand(i);
+                            }
+                        }
+                    }
+                }
+                CheckBox {
+                    checked: r.checked;
+                    enabled: r.enabled && !root.busy;
+                    accessible-label: r.name;
+                    toggled => { root.toggle(i); }
+                }
+                // The name is its own Text so a long one is elided instead of overflowing the card.
+                Text {
+                    text: r.name;
+                    color: r.enabled ? Palette.foreground : Family.muted;
+                    overflow: elide;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    min-width: 0px;
+                }
+              }
+            }
+            if root.rows.length == 0: HintText {
+                text: @tr("No folders here: everything in the cloud will be synced.");
+                avail: root.text-avail;
+            }
+        }
+    }
+    if root.busy: HorizontalLayout {
+        spacing: Family.gap-m;
+        Spinner { width: 16px; height: 16px; indeterminate: true; y: (parent.height - self.height) / 2; }
+        Text { text: @tr("Saving…"); color: Family.muted; horizontal-stretch: 1; }
+    }
+    if root.error != "": SelectableText {
+        text: root.error;
+        color: Family.danger;
+        avail: root.text-avail;
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: end;
+        Button { text: @tr("Cancel"); enabled: !root.busy; clicked => { root.dismiss(); } }
+        Button { text: @tr("Save"); primary: true; enabled: !root.busy; clicked => { root.save(); } }
+    }
+}
+
+// One line of an account's activity. `kind`: 0 sent, 1 received, 2 removed here, 3 removed in the cloud, 4 conflict,
+// 5 problem, 6 stopped by the delete guard, 7 check summary. `meta` is "label · size", built in Rust; `when` is the time.
+export struct LogRow {
+    kind: int,
+    title: string,
+    meta: string,
+    // "just now", "3 h ago": its own right-aligned column.
+    when: string,
+    // The raw message of a problem; "" when there is none.
+    detail: string,
+    // The path inside the synced folder of a conflict (it gets a "Show file" button); "" for every other row.
+    path: string,
+}
+
+// What happened for one account, newest first. Filter 0 all, 1 files moved, 2 problems.
+component LogDialog inherits Dialog {
+    in property <string> name;
+    in property <[LogRow]> rows;
+    in property <bool> busy;
+    // "Last success: 5 min ago" and "Last problem: 2 h ago" (empty = never); the raw text of that problem.
+    in property <string> last-ok;
+    in property <string> last-bad;
+    in property <string> last-bad-msg;
+    // The visible rows as plain text, for a bug report.
+    in property <string> copy-text;
+    in-out property <int> filter: 0;
+    in-out property <bool> copied: false;
+    callback refresh();
+    // Rust keeps the full list and hands back the rows of the chosen tab.
+    callback filter-changed(int);
+    callback show-file(string);
+    changed copy-text => { root.copied = false; }
+
+    HorizontalLayout {
+        spacing: Family.gap-l;
+        Text { text: @tr("Activity"); font-size: Family.page-title; font-weight: Family.page-weight; }
+        Text { text: root.name; color: Family.muted; overflow: elide; horizontal-alignment: right; vertical-alignment: center; horizontal-stretch: 1; }
+    }
+    // The two questions asked first: did it work lately, and what went wrong last.
+    VerticalLayout {
+        spacing: Family.gap-s;
+        HorizontalLayout {
+            spacing: Family.gap-m;
+            Rectangle { width: 8px; height: 8px; border-radius: 4px; background: root.last-ok != "" ? Family.success : Family.muted; y: (parent.height - self.height) / 2; }
+            Text { text: root.last-ok != "" ? root.last-ok : @tr("No file synced yet"); horizontal-stretch: 1; overflow: elide; }
+        }
+        // The full text is in the Problems tab; a click on the summary goes there.
+        if root.last-bad != "": HorizontalLayout {
+            spacing: Family.gap-m;
+            Rectangle { width: 8px; height: 8px; border-radius: 4px; background: Family.danger; y: (parent.height - self.height) / 2; }
+            Text { text: root.last-bad; horizontal-stretch: 1; overflow: elide; }
+        }
+        if root.last-bad-msg != "": Text {
+            text: root.last-bad-msg;
+            color: Family.muted;
+            font-size: Family.caption;
+            overflow: elide;
+            // Newlines in the message would add lines; two are all the summary gets.
+            height: Family.caption * 2.7;
+            wrap: word-wrap;
+            min-width: 0px;
+            touch := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.filter = 2; root.filter-changed(2); }
+            }
+        }
+    }
+    // A filter of one list, so a segmented control, not page tabs.
+    HorizontalLayout {
+        alignment: start;
+        FilterBar {
+            labels: [@tr("All"), @tr("Files"), @tr("Problems")];
+            selected <=> root.filter;
+            picked => { root.filter-changed(root.filter); }
+        }
+    }
+    ScrollView {
+        // A ScrollView does not report its content's height, so the card would collapse to a sliver.
+        preferred-height: max(min(list.preferred-height, 320px), 60px);
+        list := VerticalLayout {
+            alignment: start;
+            spacing: Family.gap-m;
+            for r[i] in root.rows: VerticalLayout {
+                spacing: Family.gap-m;
+                // A hairline between rows: a row with a detail line is otherwise hard to tell from the next one.
+                if i > 0: Rectangle { height: 1px; background: Palette.foreground.with-alpha(0.08); }
+                HorizontalLayout {
+                    spacing: Family.gap-m;
+                    // A fixed slot so titles line up: an arrow for what was sent or received, a dot for everything else.
+                    Rectangle {
+                        width: 12px;
+                        if r.kind <= 1: Path {
+                            width: 10px;
+                            height: 10px;
+                            x: 1px;
+                            y: 3px;
+                            viewbox-width: 10;
+                            viewbox-height: 10;
+                            // Up (sent) or down (received): a shaft and a head.
+                            commands: r.kind == 0 ? "M 5 9 L 5 1 M 1.5 4.5 L 5 1 L 8.5 4.5" : "M 5 1 L 5 9 M 1.5 5.5 L 5 9 L 8.5 5.5";
+                            stroke: Family.info;
+                            stroke-width: 1.6px;
+                            stroke-line-cap: round;
+                            stroke-line-join: round;
+                        }
+                        if r.kind > 1: Rectangle {
+                            width: 8px;
+                            height: 8px;
+                            x: 2px;
+                            y: 6px;
+                            border-radius: 4px;
+                            background: r.kind == 5 ? Family.danger : r.kind == 6 ? Family.warning : r.kind == 7 ? Family.muted : Family.info;
+                        }
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        min-width: 0px;
+                        Text { text: r.title; overflow: elide; }
+                        // 80 px for the time column, and 40 more where the "Show file" button sits beside the text.
+                        if r.meta != "": HintText { text: r.meta; avail: root.text-avail - (r.path != "" ? 120px : 80px); }
+                        if r.kind == 7: HorizontalLayout {
+                            Rectangle { horizontal-stretch: 1; }
+                            Text { text: r.when; color: Family.muted; font-size: Family.caption; }
+                        }
+                        if r.detail != "": SelectableText {
+                            text: r.detail;
+                            color: r.kind == 5 ? Family.danger : Family.muted;
+                            font-size: Family.caption;
+                            avail: root.text-avail - (r.path != "" ? 120px : 80px);
+                        }
+                    }
+                    // Before the time, so the times keep one right edge on every row.
+                    if r.path != "": IconButton {
+                        glyph: @image-url("icons/folder.svg");
+                        label: @tr("Show file");
+                        clicked => { root.show-file(r.path); }
+                    }
+                    // Its own column, so the times line up down the list. A check summary has a long title and no
+                    // caption: its time goes on the caption line, at the same right edge, so the title is not elided.
+                    if r.kind != 7: Text {
+                        text: r.when;
+                        color: Family.muted;
+                        font-size: Family.caption;
+                        horizontal-alignment: right;
+                        vertical-alignment: top;
+                    }
+                }
+            }
+            if root.rows.length == 0 && !root.busy: HintText {
+                text: root.filter == 2 ? @tr("No problems recorded. Entries older than 30 days are removed automatically.")
+                    : @tr("Nothing has happened yet. Files sent, received or removed show up here. Entries older than 30 days are removed automatically.");
+                avail: root.text-avail;
+            }
+        }
+    }
+    // Invisible: only here so "Copy log" has a text to select and copy.
+    Rectangle {
+        height: 0px;
+        clip: true;
+        copy-src := TextInput { text: root.copy-text; read-only: true; }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        Button {
+            text: root.copied ? @tr("Copied") : @tr("Copy log");
+            enabled: root.rows.length > 0;
+            clicked => {
+                copy-src.select-all();
+                copy-src.copy();
+                root.copied = true;
+            }
+        }
+        Rectangle { horizontal-stretch: 1; }
+        Button { text: @tr("Refresh"); clicked => { root.refresh(); } }
+        Button { text: @tr("Close"); primary: true; clicked => { root.dismiss(); } }
+    }
+}
+
+// How full the cloud is: a short bar, the percentage and the sizes. Short and neutral on purpose: the full-width blue
+// bar under a syncing card means transfer progress, and this must never be read as that. `level` 0 normal, 1 from 80 %
+// (amber), 2 from 95 % (red); the words come from the caller so they stay in its translation context.
+component QuotaMeter inherits HorizontalLayout {
+    in property <int> percent;
+    in property <int> level;
+    in property <string> percent-text;
+    in property <string> sizes;
+    in property <string> note;
+    private property <color> tone: root.level == 2 ? Family.danger : root.level == 1 ? Family.warning : Family.muted;
+    spacing: Family.gap-m;
+    accessible-role: progress-indicator;
+    accessible-label: root.percent-text + " " + root.sizes;
+    accessible-value: root.percent;
+    Rectangle {
+        width: 96px;
+        height: 4px;
+        y: (parent.height - self.height) / 2;
+        border-radius: 2px;
+        background: Palette.foreground.with-alpha(0.1);
+        Rectangle {
+            x: 0px;
+            // A sliver when there is any use at all, so a nearly empty cloud does not look unmeasured.
+            width: root.percent > 0 ? max(parent.width * clamp(root.percent / 100, 0, 1), 2px) : 0px;
+            border-radius: 2px;
+            background: root.level == 0 ? Palette.foreground.with-alpha(0.45) : root.tone;
+        }
+    }
+    Text {
+        text: root.percent-text;
+        color: root.tone;
+        font-size: Family.caption;
+        font-weight: Family.section-weight;
+        vertical-alignment: center;
+    }
+    Text {
+        text: root.sizes;
+        color: Family.muted;
+        font-size: Family.caption;
+        overflow: elide;
+        vertical-alignment: center;
+        min-width: 0px;
+    }
+    if root.level > 0: Text {
+        text: root.note;
+        color: root.tone;
+        font-size: Family.caption;
+        vertical-alignment: center;
+    }
+    // Keeps the note next to the sizes instead of at the card's far edge.
+    Rectangle { horizontal-stretch: 1; }
 }
 
 component AccountCard inherits Rectangle {
     in property <AccountRow> acct;
     callback sync-now();
     callback toggle-pause();
+    callback accept-deletes();
+    callback restore-files();
     callback open-folder();
     callback open-web();
+    callback edit();
     callback remove();
+    callback open-log();
     background: Palette.alternate-background;
     border-radius: Family.radius;
     border-width: 1px;
-    border-color: Palette.border;
+    // Palette.border is a heavy grey on a light page and faint on a dark one; this is the same quiet edge in both.
+    border-color: Palette.foreground.with-alpha(0.14);
     // Fixed height would clip a long problem message; the card is as tall as its text.
-    min-height: layout.preferred-height + 24px;
+    min-height: layout.preferred-height;
 
     private property <color> tone: root.acct.state == 0 ? Family.success
         : root.acct.state == 1 ? Family.info
         : root.acct.state == 2 ? Family.muted
         : root.acct.state == 3 ? Family.danger : Family.warning;
+    // A card that needs the user (problem, stopped) gets a bar on its left edge and a warning icon: not colour alone.
+    private property <bool> attention: root.acct.state >= 3;
 
-    layout := HorizontalLayout {
+    if root.attention: Rectangle {
+        x: 0px;
+        width: Family.selected-bar;
+        // Inset by the corner radius so it does not stick out past the rounded corners.
+        y: Family.radius;
+        height: parent.height - 2 * Family.radius;
+        background: root.tone;
+    }
+
+    // First child, so the card's content is drawn over it; a right click on the card opens the same menu.
+    menu-area := ContextMenuArea {
+        Menu {
+            MenuItem { title: @tr("Sync now"); activated => { root.sync-now(); } }
+            MenuItem { title: @tr("Open in browser"); activated => { root.open-web(); } }
+            MenuItem { title: @tr("Edit account"); activated => { root.edit(); } }
+            MenuSeparator { }
+            MenuItem { title: @tr("Remove account"); activated => { root.remove(); } }
+        }
+    }
+
+    layout := VerticalLayout {
         padding: 12px;
+        spacing: Family.gap-s;
+        HorizontalLayout {
         spacing: Family.gap-l;
         VerticalLayout {
             horizontal-stretch: 1;
@@ -294,7 +980,8 @@ component AccountCard inherits Rectangle {
             HorizontalLayout {
                 spacing: Family.gap-m;
                 Text { text: root.acct.provider; font-weight: Family.section-weight; vertical-alignment: center; }
-                Rectangle {
+                if root.attention: AlertIcon { tone: root.tone; y: (parent.height - self.height) / 2; }
+                if !root.attention: Rectangle {
                     width: 8px;
                     height: 8px;
                     border-radius: 4px;
@@ -308,42 +995,104 @@ component AccountCard inherits Rectangle {
                         : root.acct.state == 3 ? @tr("Needs attention") : @tr("Stopped");
                     color: root.tone;
                     vertical-alignment: center;
-                    horizontal-stretch: 1;
                 }
+                // A mode, not a status: neutral. On the name line so a long path cannot elide it away.
+                if root.acct.download-only: NeutralBadge { text: @tr("Download only"); }
+                Rectangle { horizontal-stretch: 1; }
             }
             Text { text: root.acct.folder; color: Family.muted; font-size: Family.caption; overflow: elide; }
-            // The raw message can be selected and copied (to search for it or to report it).
-            if root.acct.state == 3: SelectableText {
-                text: root.acct.detail;
-                color: Family.muted;
-                font-size: Family.caption;
-                // Width left of the text column: the card minus its padding, gap and the four buttons.
-                avail: root.width - 272px;
-            }
-            if root.acct.state == 4: Text {
-                text: @tr("{} of {} files would be deleted. Press Sync now to confirm.", root.acct.deletes, root.acct.known);
-                color: Family.muted;
-                font-size: Family.caption;
-                wrap: word-wrap;
-                min-width: 0px;
+            if root.acct.quota-total != "": QuotaMeter {
+                percent: root.acct.quota-percent;
+                level: root.acct.quota-level;
+                percent-text: @tr("{}%", root.acct.quota-percent);
+                sizes: @tr("{} of {}", root.acct.quota-used, root.acct.quota-total);
+                note: root.acct.quota-percent >= 100 ? @tr("Full") : @tr("Almost full");
             }
         }
         // The vertical layout keeps the buttons at their own height (32 px) instead of the card's.
         VerticalLayout {
             alignment: center;
             HorizontalLayout {
-                spacing: Family.gap-m;
-                IconButton { glyph: @image-url("icons/refresh.svg"); label: @tr("Sync now"); clicked => { root.sync-now(); } }
-                // One width for both labels, so the buttons line up from card to card.
-                Button {
-                    width: 80px;
-                    text: root.acct.state == 2 ? @tr("Resume") : @tr("Pause");
+                spacing: Family.gap-s;
+                IconButton {
+                    glyph: root.acct.state == 2 ? @image-url("icons/play.svg") : @image-url("icons/pause.svg");
+                    label: root.acct.state == 2 ? @tr("Resume") : @tr("Pause");
                     clicked => { root.toggle-pause(); }
                 }
                 IconButton { glyph: @image-url("icons/folder.svg"); label: @tr("Open folder"); clicked => { root.open-folder(); } }
-                IconButton { glyph: @image-url("icons/globe.svg"); label: @tr("Open in browser"); clicked => { root.open-web(); } }
-                IconButton { glyph: @image-url("icons/trash.svg"); label: @tr("Remove account"); clicked => { root.remove(); } }
+                IconButton { glyph: @image-url("icons/history.svg"); label: @tr("Activity"); clicked => { root.open-log(); } }
+                // The rarer actions; Remove is last, after a separator, away from Edit.
+                more := IconButton {
+                    glyph: @image-url("icons/more.svg");
+                    label: @tr("More");
+                    clicked => { menu-area.show({ x: self.absolute-position.x - menu-area.absolute-position.x, y: self.absolute-position.y - menu-area.absolute-position.y + self.height }); }
+                }
             }
+        }
+        }
+        // What is moving right now. Hidden until the run has a plan (a scan has nothing to name yet).
+        if root.acct.state == 1 && root.acct.total > 0: VerticalLayout {
+            spacing: Family.gap-s;
+            HorizontalLayout {
+                spacing: Family.gap-m;
+                Text {
+                    text: root.acct.transfer == 1 ? @tr("Uploading {}", root.acct.file)
+                        : root.acct.transfer == 2 ? @tr("Downloading {}", root.acct.file)
+                        : @tr("Removing {}", root.acct.file);
+                    color: Family.muted;
+                    font-size: Family.caption;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    min-width: 0px;
+                }
+                if root.acct.speed != "": Text { text: root.acct.speed; color: Family.muted; font-size: Family.caption; }
+                Text {
+                    text: @tr("{} of {}", min(root.acct.done + 1, root.acct.total), root.acct.total);
+                    color: Family.muted;
+                    font-size: Family.caption;
+                }
+            }
+            ProgressBar { progress: root.acct.done / root.acct.total; }
+        }
+        // A run that has not planned anything yet is listing the cloud and walking the folder. Saying so tells a slow
+        // listing (a big or throttled cloud) apart from a sync that never started.
+        if root.acct.state == 1 && root.acct.total == 0: Text {
+            text: @tr("Checking for changes…");
+            color: Family.muted;
+            font-size: Family.caption;
+        }
+        // Under the row, so a long message gets the whole card width. The raw message can be selected and copied.
+        if root.acct.state == 3: SelectableText {
+            text: root.acct.detail;
+            color: Family.muted;
+            font-size: Family.caption;
+            avail: root.width - 24px;
+        }
+        if root.acct.state == 4: HintText {
+            text: @tr("{} of {} files would be deleted. Nothing syncs until you choose.", root.acct.deletes, root.acct.known);
+            avail: root.width - 24px;
+        }
+        // The first paths it would delete, so a bad rule or an unmounted drive is recognised at a glance.
+        if root.acct.state == 4 && root.acct.detail != "": SelectableText {
+            text: root.acct.detail;
+            lines: min(root.acct.deletes, 5) - 1;
+            color: Family.muted;
+            font-size: Family.caption;
+            avail: root.width - 24px;
+        }
+        // 5 = engine::SAMPLE, the number of paths in `detail`.
+        if root.acct.state == 4 && root.acct.deletes > 5: Text {
+            text: @tr("…and {} more", root.acct.deletes - 5);
+            color: Family.muted;
+            font-size: Family.caption;
+        }
+        // The only way out of a stopped run. Restore (the safe answer) is the primary button; a mirror cannot put
+        // files back in the cloud, so it only offers the delete.
+        if root.acct.state == 4: HorizontalLayout {
+            alignment: end;
+            spacing: Family.gap-s;
+            DangerButton { text: @tr("Delete them"); clicked => { root.accept-deletes(); } }
+            if !root.acct.download-only: Button { text: @tr("Restore"); primary: true; clicked => { root.restore-files(); } }
         }
     }
 }
@@ -352,30 +1101,83 @@ export component Main inherits Window {
     in property <string> version;
     in-out property <bool> settings-open: false;
     in-out property <bool> about-open: false;
+    // The trash of all accounts (Settings): files, a size text like "3.4 GB", a count or an emptying in progress.
+    in property <int> trash-files: 0;
+    in property <string> trash-size;
+    in property <bool> trash-busy: false;
+    in property <string> trash-error;
+    in property <string> watch-fix;
+    in-out property <bool> trash-confirm-open: false;
+    callback scan-trash();
+    callback empty-trash();
+    property <string> trash-summary: root.trash-busy ? @tr("Calculating…")
+        : root.trash-files == 0 ? @tr("Empty")
+        : root.trash-files == 1 ? @tr("1 file, {}", root.trash-size)
+        : @tr("{} files, {}", root.trash-files, root.trash-size);
     in-out property <bool> add-open: false;
     in property <[AccountRow]> accounts;
     // rclone (the transport) is not installed or did not start.
     in property <bool> rclone-missing: false;
     in-out property <int> add-kind: 0;
     in-out property <string> add-local;
-    in-out property <string> add-remote;
+    in-out property <bool> add-download-only;
+    // The account being edited (empty when adding).
+    in-out property <string> add-edit-id;
     in-out property <string> add-email;
     in-out property <string> add-password;
     in-out property <bool> add-own-client: false;
+    in-out property <bool> add-relogin: false;
     in-out property <string> add-client-id;
     in-out property <string> add-client-secret;
     in property <bool> add-busy: false;
+    in property <bool> add-auth-busy: false;
     in property <string> add-error;
+    // The folder picker (second step of Add and Edit).
+    in-out property <bool> folders-open: false;
+    in property <[FolderRow]> folders;
+    in property <bool> folders-busy: false;
+    in property <string> folders-error;
+    // The account the user asked to remove, until they confirm.
+    in-out property <bool> remove-open: false;
+    in-out property <string> remove-id;
+    in-out property <string> remove-name;
+    in-out property <string> remove-folder;
+    // The share link dialog (file manager action).
+    in-out property <bool> share-open: false;
+    in property <string> share-name;
+    in property <string> share-link;
+    in property <bool> share-busy: false;
+    in property <string> share-error;
+    // The activity dialog of one account.
+    in-out property <bool> log-open: false;
+    in property <string> log-name;
+    in property <[LogRow]> log-rows;
+    in property <bool> log-busy: false;
+    in property <string> log-last-ok;
+    in property <string> log-last-bad;
+    in property <string> log-last-bad-msg;
+    in property <string> log-copy-text;
+    in-out property <int> log-filter: 0;
+    callback open-log(string);
+    callback log-refresh();
+    callback log-filter-changed(int);
+    callback log-show-file(string);
     // 0 follows the system, 1 light, 2 dark (settings.theme).
     in-out property <int> color-scheme-index: 0;
     // 0 follows the system, 1 English, 2 Português (settings.language).
     in-out property <int> language-index: 0;
     callback open-website();
     callback sync-now(string);
+    callback accept-deletes(string);
+    callback restore-files(string);
     callback toggle-pause(string);
     callback open-folder(string);
     callback open-web(string);
     callback remove-account(string);
+    callback edit-account(string);
+    callback folders-toggle(int);
+    callback folders-expand(int);
+    callback folders-save();
     callback add-kind-changed(int);
     callback add-submit();
     // Opens the guide to creating one's own OAuth client in the browser.
@@ -384,6 +1186,14 @@ export component Main inherits Window {
     // So Rust can save the choice at once instead of only on a clean exit.
     callback theme-changed(int);
     callback language-changed(int);
+    callback file-emblems-changed(bool);
+    callback trash-days-changed(int);
+    in-out property <int> trash-days: 90;
+    callback walk-minutes-changed(int);
+    callback walk-fallback-minutes-changed(int);
+    in-out property <int> walk-minutes: 5;
+    in-out property <int> walk-fallback-minutes: 2;
+    in-out property <bool> file-emblems: true;
     title: "FastSync";
 
     // Palette.color-scheme is the only palette property an app can set; the colours follow the system accent.
@@ -400,6 +1210,10 @@ export component Main inherits Window {
         root.theme-changed(root.color-scheme-index);
     }
     changed language-index => { root.language-changed(root.language-index); }
+    changed file-emblems => { root.file-emblems-changed(root.file-emblems); }
+    changed trash-days => { root.trash-days-changed(root.trash-days); }
+    changed walk-minutes => { root.walk-minutes-changed(root.walk-minutes); }
+    changed walk-fallback-minutes => { root.walk-fallback-minutes-changed(root.walk-fallback-minutes); }
     changed add-kind => { root.add-kind-changed(root.add-kind); }
 
     // Keeps keyboard focus inside the page, so the dialogs' Esc handling and Tab trap work after they close.
@@ -409,6 +1223,8 @@ export component Main inherits Window {
             spacing: Family.gap-l;
             HorizontalLayout {
                 spacing: Family.gap-m;
+                // Keeps the header's height when the Add button is hidden (no accounts).
+                min-height: Family.control-height;
                 Image {
                     source: @image-url("../../../packaging/io.github.evandro777.FastSync.svg");
                     width: 24px;
@@ -417,24 +1233,34 @@ export component Main inherits Window {
                 }
                 Text { text: "FastSync"; font-size: Family.title; font-weight: Family.section-weight; vertical-alignment: center; }
                 Rectangle { horizontal-stretch: 1; }
-                Button { text: @tr("Add account"); primary: true; clicked => { root.add-open = true; } }
+                // With no account the empty state below carries the one Add button.
+                if root.accounts.length > 0: Button { text: @tr("Add account"); clicked => { root.add-open = true; } }
                 // The burger: opens the preferences dialog (Appearance, Language, About).
                 MenuButton {
                     label: @tr("Preferences");
                     clicked => { root.settings-open = true; }
                 }
             }
-            if root.rclone-missing: Rectangle {
-                background: Family.warning.with-alpha(0.16);
-                border-radius: Family.control-radius;
+            // The same right gutter as the cards below it (they leave room for the scroll bar).
+            if root.rclone-missing: HorizontalLayout {
+                padding-right: Family.gap-m;
                 vertical-stretch: 0;
-                VerticalLayout {
-                    padding: 8px;
-                    Text {
-                        text: @tr("rclone was not found. FastSync needs it to talk to the cloud. Install it (rclone.org) and restart.");
-                        wrap: word-wrap;
-                        min-width: 0px;
-                        color: Family.warning;
+                Rectangle {
+                    background: Family.warning.with-alpha(0.16);
+                    border-radius: Family.radius;
+                    HorizontalLayout {
+                        padding: 12px;
+                        spacing: Family.gap-m;
+                        VerticalLayout { alignment: start; padding-top: 2px; AlertIcon { } }
+                        // HintText: a bare wrapped Text reports one line, which cut the last line in pt_BR.
+                        HintText {
+                            text: @tr("rclone was not found or is too old (1.76 or newer). FastSync needs it to talk to the cloud. Install it (rclone.org) and restart.");
+                            horizontal-stretch: 1;
+                            font-size: Family.body;
+                            color: Family.warning;
+                            // Window width less the page padding (24), the right gutter (8), the banner padding (24), the icon and its gap (24).
+                            avail: root.width - 80px;
+                        }
                     }
                 }
             }
@@ -442,30 +1268,58 @@ export component Main inherits Window {
                 VerticalLayout {
                     alignment: start;
                     spacing: Family.gap-l;
+                    // Room for the scroll bar, which would otherwise be drawn over the cards' buttons.
+                    padding-right: Family.gap-m;
                     for a in root.accounts: AccountCard {
                         acct: a;
                         sync-now => { root.sync-now(a.id); }
+                        accept-deletes => { root.accept-deletes(a.id); }
+                        restore-files => { root.restore-files(a.id); }
                         toggle-pause => { root.toggle-pause(a.id); }
                         open-folder => { root.open-folder(a.id); }
                         open-web => { root.open-web(a.id); }
-                        remove => { root.remove-account(a.id); }
+                        edit => { root.edit-account(a.id); }
+                        open-log => { root.open-log(a.id); }
+                        remove => {
+                            root.remove-id = a.id;
+                            root.remove-name = a.provider;
+                            root.remove-folder = a.folder;
+                            root.remove-open = true;
+                        }
                     }
                     if root.accounts.length == 0: VerticalLayout {
                         padding-top: 48px;
                         spacing: Family.gap-l;
                         alignment: start;
+                        HorizontalLayout {
+                            alignment: center;
+                            Image {
+                                source: @image-url("../../../packaging/io.github.evandro777.FastSync.svg");
+                                width: 48px;
+                                height: 48px;
+                            }
+                        }
                         Text {
                             text: @tr("No accounts yet");
                             font-size: Family.title;
                             font-weight: Family.section-weight;
                             horizontal-alignment: center;
                         }
-                        Text {
-                            text: @tr("Add an account and choose a folder: its files stay in sync both ways and available offline.");
-                            color: Family.muted;
-                            wrap: word-wrap;
-                            min-width: 0px;
-                            horizontal-alignment: center;
+                        // Capped: a line the full width of the window is hard to read.
+                        HorizontalLayout {
+                            alignment: center;
+                            Text {
+                                text: @tr("Add an account and choose a folder: its files stay in sync both ways and available offline.");
+                                color: Family.muted;
+                                wrap: word-wrap;
+                                max-width: 380px;
+                                min-width: 0px;
+                                horizontal-alignment: center;
+                            }
+                        }
+                        HorizontalLayout {
+                            alignment: center;
+                            Button { text: @tr("Add account"); primary: true; clicked => { root.add-open = true; } }
                         }
                     }
                 }
@@ -477,14 +1331,18 @@ export component Main inherits Window {
     if root.add-open: AddDialog {
         width: root.width;
         height: root.height;
+        card-width: 480px;
         kind <=> root.add-kind;
         local <=> root.add-local;
-        remote <=> root.add-remote;
+        download-only <=> root.add-download-only;
         email <=> root.add-email;
         password <=> root.add-password;
+        edit-id: root.add-edit-id;
         busy: root.add-busy;
+        auth-busy: root.add-auth-busy;
         error: root.add-error;
         own-client <=> root.add-own-client;
+        relogin <=> root.add-relogin;
         client-id <=> root.add-client-id;
         client-secret <=> root.add-client-secret;
         open-help => { root.open-help(); }
@@ -495,11 +1353,92 @@ export component Main inherits Window {
             main-keys.focus();
         }
     }
+    if root.log-open: LogDialog {
+        width: root.width;
+        height: root.height;
+        card-width: 480px;
+        name: root.log-name;
+        rows: root.log-rows;
+        busy: root.log-busy;
+        last-ok: root.log-last-ok;
+        last-bad: root.log-last-bad;
+        last-bad-msg: root.log-last-bad-msg;
+        copy-text: root.log-copy-text;
+        filter <=> root.log-filter;
+        refresh => { root.log-refresh(); }
+        filter-changed(f) => { root.log-filter-changed(f); }
+        show-file(p) => { root.log-show-file(p); }
+        dismiss => {
+            root.log-open = false;
+            main-keys.focus();
+        }
+    }
+    // Above the add dialog: it opens when that one has validated the connection.
+    if root.folders-open: FoldersDialog {
+        width: root.width;
+        height: root.height;
+        card-width: 440px;
+        rows: root.folders;
+        busy: root.folders-busy;
+        error: root.folders-error;
+        toggle(i) => { root.folders-toggle(i); }
+        expand(i) => { root.folders-expand(i); }
+        save => { root.folders-save(); }
+        // Not while saving: the worker is replacing the account's runner and must not be raced.
+        dismiss => {
+            if !root.folders-busy {
+                root.folders-open = false;
+                main-keys.focus();
+            }
+        }
+    }
+    if root.remove-open: RemoveDialog {
+        width: root.width;
+        height: root.height;
+        name: root.remove-name;
+        folder: root.remove-folder;
+        confirm => {
+            root.remove-open = false;
+            root.remove-account(root.remove-id);
+            main-keys.focus();
+        }
+        dismiss => {
+            root.remove-open = false;
+            main-keys.focus();
+        }
+    }
+    if root.share-open: ShareDialog {
+        width: root.width;
+        height: root.height;
+        card-width: 440px;
+        name: root.share-name;
+        link: root.share-link;
+        busy: root.share-busy;
+        error: root.share-error;
+        dismiss => {
+            root.share-open = false;
+            main-keys.focus();
+        }
+    }
     if root.settings-open: SettingsDialog {
         width: root.width;
         height: root.height;
         color-scheme-index <=> root.color-scheme-index;
         language-index <=> root.language-index;
+        file-emblems <=> root.file-emblems;
+        trash-summary: root.trash-summary;
+        trash-files: root.trash-files;
+        trash-busy: root.trash-busy;
+        trash-error: root.trash-error;
+        watch-fix: root.watch-fix;
+        trash-days <=> root.trash-days;
+        walk-minutes <=> root.walk-minutes;
+        walk-fallback-minutes <=> root.walk-fallback-minutes;
+        scan-trash => { root.scan-trash(); }
+        ask-empty-trash => {
+            root.settings-open = false;
+            root.trash-confirm-open = true;
+        }
         dismiss => {
             root.settings-open = false;
             main-keys.focus();
@@ -507,6 +1446,22 @@ export component Main inherits Window {
         show-about => {
             root.settings-open = false;
             root.about-open = true;
+        }
+    }
+    // Both buttons return to Settings. Delete starts the emptying first (it sets `trash-busy`, so Settings'
+    // recount waits for it instead of racing it).
+    if root.trash-confirm-open: EmptyTrashDialog {
+        width: root.width;
+        height: root.height;
+        summary: root.trash-summary;
+        dismiss => {
+            root.trash-confirm-open = false;
+            root.settings-open = true;
+        }
+        confirm => {
+            root.empty-trash();
+            root.trash-confirm-open = false;
+            root.settings-open = true;
         }
     }
     // Closing About returns to Settings: re-creating the dialog gives its keys focus back, so Esc keeps working.

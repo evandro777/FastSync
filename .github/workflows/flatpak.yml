@@ -59,7 +59,15 @@ jobs:
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import
           echo "FLATPAK_GPG_KEY=$(base64 -d flatpak/signing-key.b64 | gpg --show-keys --with-colons | awk -F: '/^fpr/ {print $10; exit}')" >> "$GITHUB_ENV"
 
+      # Secrets are empty on PRs from forks: the build then falls back to rclone's shared client ID.
       - name: Build
+        env:
+          FASTSYNC_GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          FASTSYNC_GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          FASTSYNC_DROPBOX_CLIENT_ID: ${{ secrets.DROPBOX_CLIENT_ID }}
+          FASTSYNC_DROPBOX_CLIENT_SECRET: ${{ secrets.DROPBOX_CLIENT_SECRET }}
+          FASTSYNC_ONEDRIVE_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
+          FASTSYNC_ONEDRIVE_CLIENT_SECRET: ${{ secrets.ONEDRIVE_CLIENT_SECRET }}
         run: flatpak/build.sh --bundle
 
       - name: Name the bundle

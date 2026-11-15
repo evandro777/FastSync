@@ -44,14 +44,11 @@ pub trait RemoteChanges: Send {
     }
 }
 
-/// `kind` is the rclone backend type. `folder` is the synced folder inside the cloud ("" = the root).
-pub fn for_kind(kind: &str, token: Token, folder: &str) -> Option<Box<dyn RemoteChanges>> {
+/// `kind` is the rclone backend type. Every feed covers the whole cloud: the synced tree is the cloud's root.
+pub fn for_kind(kind: &str, token: Token) -> Option<Box<dyn RemoteChanges>> {
     let http = Http::new(token);
     match kind {
-        "dropbox" => Some(Box::new(Dropbox {
-            http,
-            folder: folder.trim_matches('/').to_string(),
-        })),
+        "dropbox" => Some(Box::new(Dropbox { http })),
         "drive" => Some(Box::new(Drive { http })),
         "onedrive" => Some(Box::new(OneDrive { http })),
         _ => None,
@@ -99,7 +96,8 @@ fn finish(r: std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>)
     let mut resp = r.map_err(|e| e.to_string())?;
     let status = resp.status().as_u16();
     let text = resp.body_mut().read_to_string().map_err(|e| e.to_string())?;
-    Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
+    // Dropbox answers a 400 in plain text: keep it as a string so `fail` can show why.
+    Ok((status, serde_json::from_str(&text).unwrap_or(Value::String(text))))
 }
 
 fn s(v: &Value) -> String {
@@ -113,6 +111,7 @@ fn fail<T>(what: &str, status: u16, body: &Value) -> Result<T> {
         &body["error_summary"],
         &body["error"]["message"],
         &body["error"]["errors"][0]["reason"],
+        body,
     ]
     .iter()
     .map(|v| s(v))
@@ -129,22 +128,16 @@ fn fail<T>(what: &str, status: u16, body: &Value) -> Result<T> {
 
 struct Dropbox {
     http: Http,
-    folder: String,
 }
 
-impl Dropbox {
-    fn root(&self) -> String {
-        if self.folder.is_empty() {
-            String::new()
-        } else {
-            format!("/{}", self.folder)
-        }
-    }
+/// Dropbox's 409 `reset` (expired), or a 400 for a cursor another app issued (after a re-login with another client ID).
+fn dropbox_reset(st: u16, v: &Value) -> bool {
+    (st == 409 && s(&v["error_summary"]).starts_with("reset")) || (st == 400 && s(v).contains("Invalid \"cursor\""))
 }
 
 impl RemoteChanges for Dropbox {
     fn start(&mut self) -> Result<String> {
-        let body = json!({"path": self.root(), "recursive": true, "include_deleted": true});
+        let body = json!({"path": "", "recursive": true, "include_deleted": true});
         let (st, v) = self.http.post(
             "https://api.dropboxapi.com/2/files/list_folder/get_latest_cursor",
             &body,
@@ -163,13 +156,16 @@ impl RemoteChanges for Dropbox {
             &json!({"cursor": cursor, "timeout": 30}),
             false,
         )?;
-        if st == 409 && s(&v["error_summary"]).starts_with("reset") {
+        if dropbox_reset(st, &v) {
             return Ok(Poll::Reset);
         }
         if st != 200 {
             return fail("dropbox longpoll", st, &v);
         }
+        // Dropbox may ask for a pause before the next long poll; the poller thread has nothing else to do.
+        let pause = backoff(&v);
         if !v["changes"].as_bool().unwrap_or(false) {
+            std::thread::sleep(pause);
             return Ok(Poll::Changes(Vec::new(), cursor.to_string()));
         }
         let (mut cursor, mut out) = (cursor.to_string(), Vec::new());
@@ -179,15 +175,16 @@ impl RemoteChanges for Dropbox {
                 &json!({"cursor": cursor}),
                 true,
             )?;
-            if st == 409 && s(&v["error_summary"]).starts_with("reset") {
+            if dropbox_reset(st, &v) {
                 return Ok(Poll::Reset);
             }
             if st != 200 {
                 return fail("dropbox changes", st, &v);
             }
-            out.extend(dropbox_entries(&v, &self.root()));
+            out.extend(dropbox_entries(&v));
             cursor = s(&v["cursor"]);
             if !v["has_more"].as_bool().unwrap_or(false) {
+                std::thread::sleep(pause);
                 return Ok(Poll::Changes(out, cursor));
             }
         }
@@ -198,20 +195,23 @@ impl RemoteChanges for Dropbox {
     }
 }
 
-/// Entries of a `list_folder/continue` answer, with paths relative to the synced folder `root` ("" or "/Docs").
-pub fn dropbox_entries(v: &Value, root: &str) -> Vec<Change> {
-    let strip = |p: &str| -> Option<String> {
-        let head = p.get(..root.len())?;
-        let rest = p.get(root.len()..)?;
-        (head.eq_ignore_ascii_case(root) && (rest.starts_with('/') || (rest.is_empty() && root.is_empty())))
-            .then(|| rest.trim_start_matches('/').to_string())
-    };
+/// The `backoff` (seconds) of a long-poll answer: Dropbox requires waiting that long before polling again. Capped, so
+/// a odd value cannot park the feed for hours.
+fn backoff(v: &Value) -> Duration {
+    Duration::from_secs(v["backoff"].as_u64().unwrap_or(0).min(300))
+}
+
+/// Entries of a `list_folder/continue` answer, with paths relative to the root of the Dropbox.
+pub fn dropbox_entries(v: &Value) -> Vec<Change> {
     v["entries"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|e| {
-            let path = strip(e["path_display"].as_str()?).filter(|p| !p.is_empty())?;
+            let path = e["path_display"].as_str()?.trim_start_matches('/').to_string();
+            if path.is_empty() {
+                return None;
+            }
             let tag = e[".tag"].as_str()?;
             Some(Change {
                 id: s(&e["id"]),
@@ -311,6 +311,21 @@ struct OneDrive {
 
 const GRAPH: &str = "https://graph.microsoft.com/v1.0/me/drive";
 
+/// The OneDrive web page of an item (`webUrl`), for "View on web". The only call here that is not a change feed.
+pub fn onedrive_web_url(token: Token, id: &str) -> Result<String> {
+    let (st, v) = Http::new(token).get(&format!("{GRAPH}/items/{id}?$select=webUrl"))?;
+    if st != 200 {
+        return fail("onedrive item", st, &v);
+    }
+    Ok(s(&v["webUrl"])).and_then(|u| {
+        if u.is_empty() {
+            Err("onedrive item: no webUrl".into())
+        } else {
+            Ok(u)
+        }
+    })
+}
+
 impl RemoteChanges for OneDrive {
     fn start(&mut self) -> Result<String> {
         // `token=latest` answers with the link for "from now" without sending the whole tree.
@@ -383,7 +398,12 @@ pub fn impact(
     root: Option<&str>,
     path_of_id: impl Fn(&str) -> Option<String>,
 ) -> Impact {
-    let mut out = Impact::default();
+    // A folder renamed in the cloud arrives as its deletions, the new name possibly in a later batch: only a full
+    // scan sees both sides at once and can pair them as a move. shortcut: a small burst still goes by path.
+    let mut out = Impact {
+        full_scan: changes.iter().filter(|c| c.removed).count() >= 5,
+        ..Default::default()
+    };
     for c in changes {
         if let Some(p) = &c.path {
             // A new or moved Dropbox folder: what is inside it is not listed, so look at everything.
@@ -401,8 +421,19 @@ pub fn impact(
         };
         // A deleted folder arrives without its folder facet (Drive `removed`, OneDrive `deleted`), so a known folder
         // id counts whatever the entry says it is.
-        if dirs.contains_key(&c.id) {
-            out.full_scan = true;
+        if let Some(known) = dirs.get(&c.id) {
+            // OneDrive/Drive also report a folder whenever something inside it changed (new size, mtime): same name
+            // under the same parent is only that echo, not a move, rename or delete.
+            let here = parent.map(|d| {
+                if d.is_empty() {
+                    c.name.clone()
+                } else {
+                    format!("{d}/{}", c.name)
+                }
+            });
+            if c.removed || here.as_deref() != Some(known.as_str()) {
+                out.full_scan = true;
+            }
             continue;
         }
         if c.is_dir {
@@ -429,34 +460,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dropbox_paths_are_made_relative_and_other_folders_are_ignored() {
+    fn dropbox_reset_covers_expired_and_foreign_cursors() {
+        let foreign = Value::String(
+            "Error in call to API function \"files/list_folder/continue\": Invalid \"cursor\" parameter: this cursor is for a different app.".into(),
+        );
+        assert!(dropbox_reset(400, &foreign));
+        assert!(dropbox_reset(409, &json!({"error_summary": "reset/..."})));
+        assert!(!dropbox_reset(400, &Value::String("Error in call: bad request".into())));
+        assert!(!dropbox_reset(401, &foreign));
+    }
+
+    #[test]
+    fn dropbox_backoff_is_read_and_capped() {
+        assert_eq!(backoff(&json!({"changes": true, "backoff": 12})).as_secs(), 12);
+        assert_eq!(backoff(&json!({"changes": false})).as_secs(), 0);
+        assert_eq!(backoff(&json!({"backoff": 86_400})).as_secs(), 300);
+    }
+
+    #[test]
+    fn dropbox_paths_are_made_relative_to_the_root() {
         let v = json!({"entries": [
             {".tag": "file", "id": "id:1", "name": "a.txt", "path_display": "/Docs/Work/a.txt"},
             {".tag": "deleted", "name": "b.txt", "path_display": "/Docs/b.txt"},
             {".tag": "folder", "id": "id:2", "name": "New", "path_display": "/docs/New"},
-            {".tag": "file", "id": "id:3", "name": "x", "path_display": "/Docsmore/x"},
-            {".tag": "file", "id": "id:4", "name": "y", "path_display": "/Other/y"}]});
-        let c = dropbox_entries(&v, "/Docs");
-        let got: Vec<_> = c
+            {".tag": "file", "name": "z", "path_display": "/z"},
+            {".tag": "folder", "name": "", "path_display": ""}]});
+        let got: Vec<_> = dropbox_entries(&v)
             .iter()
-            .map(|c| (c.path.as_deref().unwrap(), c.removed, c.is_dir))
+            .map(|c| (c.path.clone().unwrap(), c.removed, c.is_dir))
             .collect();
         assert_eq!(
             got,
             [
-                ("Work/a.txt", false, false),
-                ("b.txt", true, false),
-                ("New", false, true)
+                ("Docs/Work/a.txt".to_string(), false, false),
+                ("Docs/b.txt".to_string(), true, false),
+                ("docs/New".to_string(), false, true),
+                ("z".to_string(), false, false)
             ]
-        );
-        assert_eq!(
-            dropbox_entries(
-                &json!({"entries": [{".tag": "file", "name": "z", "path_display": "/z"}]}),
-                ""
-            )[0]
-            .path
-            .as_deref(),
-            Some("z")
         );
     }
 
@@ -554,6 +594,18 @@ mod tests {
             ..ch("D", "", "")
         };
         assert!(impact(&[gone_dir], &dirs, Some("R"), known).full_scan);
+        // A known folder reported again with the same name and parent (its content changed): no scan.
+        let touched = Change {
+            is_dir: true,
+            ..ch("D", "docs", "R")
+        };
+        assert!(!impact(&[touched], &dirs, Some("R"), known).full_scan);
+        // Renamed: scan.
+        let renamed = Change {
+            is_dir: true,
+            ..ch("D", "papers", "R")
+        };
+        assert!(impact(&[renamed], &dirs, Some("R"), known).full_scan);
     }
 
     #[test]

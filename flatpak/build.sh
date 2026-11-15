@@ -24,6 +24,13 @@ for arg in "$@"; do
   esac
 done
 
+# flatpak-builder's sandbox does not inherit the environment: hand the build-time client IDs over in a file that
+# the manifest sources (gitignored; empty when unset, so the build falls back to rclone's shared ID).
+: > embedded.env
+for v in FASTSYNC_{GOOGLE,DROPBOX,ONEDRIVE}_CLIENT_{ID,SECRET}; do
+  [ -z "${!v:-}" ] || printf "%s='%s'\n" "$v" "${!v}" >> embedded.env
+done
+
 echo ">> vendoring crates (needs network once)"
 (cd .. && cargo vendor --locked flatpak/vendor >/dev/null)
 

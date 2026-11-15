@@ -2,13 +2,14 @@
 //! The same file is in every Fast app (FastHello holds the master): change it there and copy it to the others.
 //! The module knows no command names; each app decides its own ("show" in the plain-window apps).
 use std::{
-    io::{BufRead, BufReader, ErrorKind, Read, Write},
+    io::{ErrorKind, Read, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-const MAX_COMMAND: u64 = 64;
+// Room for a path (PATH_MAX) after a command word.
+const MAX_COMMAND: u64 = 4200;
 
 /// `<crate name>.sock` in the runtime directory. None without `XDG_RUNTIME_DIR`: a shared directory such as `/tmp`
 /// would let other users block the socket or send commands to it.
@@ -76,12 +77,32 @@ fn listen_at(path: &Path, on_command: impl Fn(String) + Send + 'static) -> std::
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             // One slow or silent client must not block the others (a hung `--toggle` is useless);
-            // commands are a few bytes, so cap the length too.
+            // commands are short (a word, maybe a path), so cap the length and the total time too: a timeout per
+            // read alone lets a client that drips one byte at a time hold this thread for minutes.
+            let mut stream = stream;
             let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-            let mut line = String::new();
+            let end = Instant::now() + Duration::from_secs(1);
+            let (mut buf, mut chunk) = (Vec::new(), [0u8; 512]);
+            let complete = loop {
+                if buf.len() as u64 >= MAX_COMMAND || Instant::now() >= end {
+                    break false;
+                }
+                match stream.read(&mut chunk) {
+                    Ok(0) => break true,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.contains(&b'\n') {
+                            break true;
+                        }
+                    }
+                    Err(_) => break false,
+                }
+            };
+            let line = String::from_utf8(buf).unwrap_or_default();
+            let command = line.lines().next().unwrap_or("").trim();
             // A start's liveness probe connects and sends nothing: an empty command, dropped here.
-            if BufReader::new(stream.take(MAX_COMMAND)).read_line(&mut line).is_ok() && !line.trim().is_empty() {
-                on_command(line.trim().to_string());
+            if complete && !command.is_empty() {
+                on_command(command.to_string());
             }
         }
     });

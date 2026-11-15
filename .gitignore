@@ -10,6 +10,7 @@ __pycache__/
 /FastSync-*.flatpak
 /squashfs-root/
 /flatpak/vendor/
+/flatpak/embedded.env
 /flatpak/repo/
 /flatpak/build-dir/
 /flatpak/.flatpak-builder/

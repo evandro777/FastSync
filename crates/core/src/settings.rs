@@ -20,7 +20,20 @@ pub struct Settings {
     pub theme: String,
     pub width: u32,
     pub height: u32,
+    /// Status badge on each account's local folder in the file manager.
+    pub file_emblems: bool,
+    /// Items older than this many days are deleted from each account's `.fastsync/trash`; 0 keeps them forever.
+    pub trash_days: u32,
+    /// Minutes between the full local checks for missed edits while inotify watches the folder.
+    pub walk_minutes: u32,
+    /// The same check's interval when the folder cannot be watched (no watch left, or inotify failed).
+    pub walk_fallback_minutes: u32,
 }
+
+/// The Settings spin box allows up to this; a hand-edited larger value is clamped on load.
+pub const MAX_TRASH_DAYS: u32 = 3650;
+/// Bounds of both check intervals, in minutes (0 would mean a check on every timer tick).
+pub const MAX_WALK_MINUTES: u32 = 60;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -28,7 +41,11 @@ impl Default for Settings {
             language: String::new(),
             theme: String::new(),
             width: 600,
-            height: 450,
+            height: 520,
+            file_emblems: true,
+            trash_days: 90,
+            walk_minutes: 5,
+            walk_fallback_minutes: 2,
         }
     }
 }
@@ -64,6 +81,9 @@ impl Settings {
         }
         self.width = self.width.clamp(MIN_SIZE.0, MAX_SIZE);
         self.height = self.height.clamp(MIN_SIZE.1, MAX_SIZE);
+        self.trash_days = self.trash_days.min(MAX_TRASH_DAYS);
+        self.walk_minutes = self.walk_minutes.clamp(1, MAX_WALK_MINUTES);
+        self.walk_fallback_minutes = self.walk_fallback_minutes.clamp(1, MAX_WALK_MINUTES);
     }
 
     /// Atomic write so a crash can never leave a half-written file. Failures are reported on stderr;
@@ -91,6 +111,26 @@ mod tests {
     fn old_files_still_load() {
         let parsed: Settings = toml::from_str("width = 700").unwrap();
         assert_eq!((parsed.width, parsed.language.as_str()), (700, ""));
+        assert!(parsed.file_emblems);
+        assert!(!toml::from_str::<Settings>("file_emblems = false").unwrap().file_emblems);
+        assert_eq!(parsed.trash_days, 90, "a file from before the option keeps the default");
+        assert_eq!(toml::from_str::<Settings>("trash_days = 0").unwrap().trash_days, 0);
+    }
+
+    #[test]
+    fn a_huge_trash_age_is_clamped() {
+        let mut s = toml::from_str::<Settings>("trash_days = 4000000000").unwrap();
+        s.normalize();
+        assert_eq!(s.trash_days, MAX_TRASH_DAYS);
+    }
+
+    #[test]
+    fn the_check_intervals_default_and_are_clamped() {
+        let parsed: Settings = toml::from_str("width = 700").unwrap();
+        assert_eq!((parsed.walk_minutes, parsed.walk_fallback_minutes), (5, 2));
+        let mut s = toml::from_str::<Settings>("walk_minutes = 0\nwalk_fallback_minutes = 999").unwrap();
+        s.normalize();
+        assert_eq!((s.walk_minutes, s.walk_fallback_minutes), (1, MAX_WALK_MINUTES));
     }
 
     #[test]
@@ -112,9 +152,16 @@ mod tests {
             theme: "dark".into(),
             width: 700,
             height: 500,
+            file_emblems: false,
+            trash_days: 30,
+            walk_minutes: 15,
+            walk_fallback_minutes: 1,
         };
         s.save_to(&dir).unwrap();
         let loaded = Settings::load_from(&dir);
+        assert!(!loaded.file_emblems);
+        assert_eq!(loaded.trash_days, 30);
+        assert_eq!((loaded.walk_minutes, loaded.walk_fallback_minutes), (15, 1));
         assert_eq!(
             (
                 loaded.language.as_str(),

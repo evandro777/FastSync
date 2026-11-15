@@ -75,9 +75,9 @@ appimage/build.sh             # needs appimagetool on PATH; writes FastSync-<ver
 
 Next to it:
 
-- `accounts.toml`: the linked accounts (`id`, `kind` = the rclone backend, `local`, `remote_path`, `paused`).
+- `accounts.toml`: the linked accounts (`id`, `kind` = the rclone backend, `local`, `paused`, `excluded` = the unchecked folders of selective sync, relative to the synced folder).
 - `rclone.conf` (0600): FastSync's own rclone config with the OAuth tokens (MEGA: email and the obscured, not encrypted, password). Your own `~/.config/rclone/rclone.conf` is never read or written.
-- `accounts/<id>/state.db`: the sync state of one account (SQLite): per file how both sides looked after the last sync, the delta cursor and the remote folder ids. Deleting it is safe: the next run compares both sides from scratch, and a file that differs on both sides becomes a conflict copy, never a deletion.
+- `accounts/<id>/state.db`: the sync state of one account (SQLite): per file how both sides looked after the last sync, the delta cursor and the remote folder ids. Deleting it is safe: the next run compares both sides from scratch, and a file that differs on both sides becomes a conflict copy, never a deletion. Files with the same size and modified time are only recorded, and so are files whose size and checksum match (not on MEGA, which has no checksum: a different modified time there is a conflict copy even for identical content).
 - Inside each synced folder, `.fastsync/` holds temp downloads and `trash/<time>/` (files removed in the cloud). It is never synced; empty it whenever you like.
 
 Providers: Dropbox, Google Drive and OneDrive use their delta APIs (the access token is read from the rclone config and refreshed through rclone); everything else is listed in full every 5 minutes. rclone's shared OAuth client ids are rate-limited (and Google's will be retired in 2026), so Add account has "Use my own client ID": the `client_id` and `client_secret` go into `rclone.conf` through the login parameters. The user guide is [`docs/OWN-CLIENT-ID.md`](docs/OWN-CLIENT-ID.md); the dialog's button opens its GitHub URL (`HELP_URL` in `main.rs`), so the file must stay at that path on `master`.

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- File manager emblem, paused: round badge in the tray colours. Rules: docs/ICON-STYLE.md. -->
+  <circle cx="8" cy="8" r="7.25" fill="#5f6b7a" stroke="#ffffff" stroke-width="1.5"/>
+  <path d="M6.2 5.2V10.8M9.8 5.2V10.8" fill="none" stroke="#ffffff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

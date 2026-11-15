@@ -44,6 +44,38 @@ msgid "No accounts"
 msgstr "Nenhuma conta"
 
 msgctxt "Tr"
+msgid "Deletions waiting for your confirmation"
+msgstr "Exclusões aguardando sua confirmação"
+
+msgctxt "Tr"
+msgid "FastSync stopped a sync"
+msgstr "O FastSync parou uma sincronização"
+
+msgctxt "Tr"
+msgid "{} of {} files in {} would be deleted. Nothing was deleted yet: open FastSync to review."
+msgstr "{} de {} arquivos em {} seriam apagados. Nada foi apagado ainda: abra o FastSync para revisar."
+
+msgctxt "Tr"
+msgid "Show file"
+msgstr "Mostrar arquivo"
+
+msgctxt "LogDialog"
+msgid "Show file"
+msgstr "Mostrar arquivo"
+
+msgctxt "Tr"
+msgid "A file changed on both sides"
+msgstr "Um arquivo mudou nos dois lados"
+
+msgctxt "Tr"
+msgid "{} changed here and in {}. Both copies were kept: the local one is now named “(conflict …)”."
+msgstr "{} mudou aqui e em {}. As duas cópias foram mantidas: a local agora se chama “(conflict …)”."
+
+msgctxt "Tr"
+msgid "{} files changed here and in {}, starting with {}. Both copies of each were kept: the local ones are now named “(conflict …)”."
+msgstr "{} arquivos mudaram aqui e em {}, começando por {}. As duas cópias de cada um foram mantidas: as locais agora se chamam “(conflict …)”."
+
+msgctxt "Tr"
 msgid "Choose a local folder, for example /home/you/Dropbox."
 msgstr "Escolha uma pasta local, por exemplo /home/voce/Dropbox."
 
@@ -71,6 +103,166 @@ msgctxt "Tr"
 msgid "Login failed: {}"
 msgstr "Falha no login: {}"
 
+msgctxt "Tr"
+msgid "Choose a folder that is neither inside nor around this account's current folder."
+msgstr "Escolha uma pasta que não esteja dentro nem em volta da pasta atual desta conta."
+
+msgctxt "Tr"
+msgid "Could not list the folders: {}"
+msgstr "Não foi possível listar as pastas: {}"
+
+msgctxt "Tr"
+msgid "This file is not in a synced folder of FastSync, so it has no cloud copy to share."
+msgstr "Este arquivo não está em uma pasta sincronizada do FastSync, então não tem cópia na nuvem para compartilhar."
+
+msgctxt "Tr"
+msgid "This file is not in the cloud yet. Wait for the sync to finish and try again."
+msgstr "Este arquivo ainda não está na nuvem. Espere a sincronização terminar e tente de novo."
+
+msgctxt "Tr"
+msgid "Could not create the link: {}"
+msgstr "Não foi possível criar o link: {}"
+
+msgctxt "AccountCard"
+msgid "Activity"
+msgstr "Atividade"
+
+msgctxt "LogDialog"
+msgid "Activity"
+msgstr "Atividade"
+
+msgctxt "LogDialog"
+msgid "No file synced yet"
+msgstr "Nenhum arquivo sincronizado ainda"
+
+msgctxt "LogDialog"
+msgid "All"
+msgstr "Tudo"
+
+msgctxt "LogDialog"
+msgid "Files"
+msgstr "Arquivos"
+
+msgctxt "LogDialog"
+msgid "Problems"
+msgstr "Problemas"
+
+msgctxt "LogDialog"
+msgid "No problems recorded. Entries older than 30 days are removed automatically."
+msgstr "Nenhum problema registrado. Entradas com mais de 30 dias são removidas automaticamente."
+
+msgctxt "LogDialog"
+msgid "Nothing has happened yet. Files sent, received or removed show up here. Entries older than 30 days are removed automatically."
+msgstr "Nada aconteceu ainda. Os arquivos enviados, recebidos ou removidos aparecem aqui. Entradas com mais de 30 dias são removidas automaticamente."
+
+msgctxt "LogDialog"
+msgid "Copy log"
+msgstr "Copiar registro"
+
+msgctxt "LogDialog"
+msgid "Copied"
+msgstr "Copiado"
+
+msgctxt "LogDialog"
+msgid "Refresh"
+msgstr "Atualizar"
+
+msgctxt "LogDialog"
+msgid "Close"
+msgstr "Fechar"
+
+msgctxt "Tr"
+msgid "Sent"
+msgstr "Enviado"
+
+msgctxt "Tr"
+msgid "Received"
+msgstr "Recebido"
+
+msgctxt "Tr"
+msgid "Removed here (in the trash)"
+msgstr "Removido aqui (na lixeira)"
+
+msgctxt "Tr"
+msgid "Removed in the cloud"
+msgstr "Removido na nuvem"
+
+msgctxt "Tr"
+msgid "Conflict: both copies kept"
+msgstr "Conflito: as duas cópias foram mantidas"
+
+msgctxt "Tr"
+msgid "Problem"
+msgstr "Problema"
+
+msgctxt "Tr"
+msgid "Stopped: deletions waiting for confirmation"
+msgstr "Parado: exclusões aguardando confirmação"
+
+msgctxt "Tr"
+msgid "Check"
+msgstr "Verificação"
+
+msgctxt "Tr"
+msgid "just now"
+msgstr "agora mesmo"
+
+msgctxt "Tr"
+msgid "{} min ago"
+msgstr "há {} min"
+
+msgctxt "Tr"
+msgid "{} h ago"
+msgstr "há {} h"
+
+msgctxt "Tr"
+msgid "{} d ago"
+msgstr "há {} d"
+
+msgctxt "Tr"
+msgid "Moved"
+msgstr "Movido"
+
+msgctxt "Tr"
+msgid "Moved from {}"
+msgstr "Movido de {}"
+
+msgctxt "Tr"
+msgid "Last file synced: {}"
+msgstr "Último arquivo sincronizado: {}"
+
+msgctxt "Tr"
+msgid "Last problem: {}"
+msgstr "Último problema: {}"
+
+msgctxt "Tr"
+msgid "Full check: {} changed, {} failed, {} s"
+msgstr "Verificação completa: {} alterados, {} com falha, {} s"
+
+msgctxt "Tr"
+msgid "Quick check: {} changed, {} failed, {} s"
+msgstr "Verificação rápida: {} alterados, {} com falha, {} s"
+
+msgctxt "ShareDialog"
+msgid "Share link"
+msgstr "Link de compartilhamento"
+
+msgctxt "ShareDialog"
+msgid "Creating the link…"
+msgstr "Criando o link…"
+
+msgctxt "ShareDialog"
+msgid "Copy link"
+msgstr "Copiar link"
+
+msgctxt "ShareDialog"
+msgid "Copied"
+msgstr "Copiado"
+
+msgctxt "ShareDialog"
+msgid "Close"
+msgstr "Fechar"
+
 msgctxt "Main"
 msgid "Add account"
 msgstr "Adicionar conta"
@@ -80,8 +272,8 @@ msgid "Preferences"
 msgstr "Preferências"
 
 msgctxt "Main"
-msgid "rclone was not found. FastSync needs it to talk to the cloud. Install it (rclone.org) and restart."
-msgstr "O rclone não foi encontrado. O FastSync precisa dele para falar com a nuvem. Instale-o (rclone.org) e reinicie."
+msgid "rclone was not found or is too old (1.76 or newer). FastSync needs it to talk to the cloud. Install it (rclone.org) and restart."
+msgstr "O rclone não foi encontrado ou é antigo demais (1.76 ou mais novo). O FastSync precisa dele para falar com a nuvem. Instale-o (rclone.org) e reinicie."
 
 msgctxt "Main"
 msgid "No accounts yet"
@@ -104,6 +296,42 @@ msgid "Paused"
 msgstr "Pausado"
 
 msgctxt "AccountCard"
+msgid "Download only"
+msgstr "Somente download"
+
+msgctxt "AccountCard"
+msgid "{}%"
+msgstr "{}%"
+
+msgctxt "AccountCard"
+msgid "Almost full"
+msgstr "Quase cheia"
+
+msgctxt "AccountCard"
+msgid "Full"
+msgstr "Cheia"
+
+msgctxt "AccountCard"
+msgid "Uploading {}"
+msgstr "Enviando {}"
+
+msgctxt "AccountCard"
+msgid "Downloading {}"
+msgstr "Baixando {}"
+
+msgctxt "AccountCard"
+msgid "Removing {}"
+msgstr "Removendo {}"
+
+msgctxt "AccountCard"
+msgid "Checking for changes…"
+msgstr "Verificando alterações…"
+
+msgctxt "AccountCard"
+msgid "{} of {}"
+msgstr "{} de {}"
+
+msgctxt "AccountCard"
 msgid "Needs attention"
 msgstr "Precisa de atenção"
 
@@ -112,8 +340,20 @@ msgid "Stopped"
 msgstr "Parado"
 
 msgctxt "AccountCard"
-msgid "{} of {} files would be deleted. Press Sync now to confirm."
-msgstr "{} de {} arquivos seriam apagados. Clique em Sincronizar agora para confirmar."
+msgid "{} of {} files would be deleted. Nothing syncs until you choose."
+msgstr "{} de {} arquivos seriam apagados. Nada sincroniza até você escolher."
+
+msgctxt "AccountCard"
+msgid "Delete them"
+msgstr "Apagar"
+
+msgctxt "AccountCard"
+msgid "Restore"
+msgstr "Restaurar"
+
+msgctxt "AccountCard"
+msgid "…and {} more"
+msgstr "…e mais {}"
 
 msgctxt "AccountCard"
 msgid "Resume"
@@ -139,6 +379,62 @@ msgctxt "AccountCard"
 msgid "Remove account"
 msgstr "Remover conta"
 
+msgctxt "RemoveDialog"
+msgid "Remove account"
+msgstr "Remover conta"
+
+msgctxt "RemoveDialog"
+msgid "FastSync stops syncing this account and forgets its login. The files on this computer and in the cloud are not deleted."
+msgstr "O FastSync para de sincronizar esta conta e esquece o login. Os arquivos neste computador e na nuvem não são apagados."
+
+msgctxt "RemoveDialog"
+msgid "Cancel"
+msgstr "Cancelar"
+
+msgctxt "RemoveDialog"
+msgid "Remove"
+msgstr "Remover"
+
+msgctxt "AccountCard"
+msgid "Edit account"
+msgstr "Editar conta"
+
+msgctxt "AccountCard"
+msgid "More"
+msgstr "Mais"
+
+msgctxt "FoldersDialog"
+msgid "Folders to sync"
+msgstr "Pastas a sincronizar"
+
+msgctxt "FoldersDialog"
+msgid "Unchecked folders are not synced. Their copy on this computer moves to the .fastsync/trash folder; the cloud copy stays."
+msgstr "Pastas desmarcadas não são sincronizadas. A cópia neste computador vai para a pasta .fastsync/trash; a cópia na nuvem continua lá."
+
+msgctxt "FoldersDialog"
+msgid "Collapse"
+msgstr "Recolher"
+
+msgctxt "FoldersDialog"
+msgid "Expand"
+msgstr "Expandir"
+
+msgctxt "FoldersDialog"
+msgid "No folders here: everything in the cloud will be synced."
+msgstr "Nenhuma pasta aqui: tudo na nuvem será sincronizado."
+
+msgctxt "FoldersDialog"
+msgid "Saving…"
+msgstr "Salvando…"
+
+msgctxt "FoldersDialog"
+msgid "Cancel"
+msgstr "Cancelar"
+
+msgctxt "FoldersDialog"
+msgid "Save"
+msgstr "Salvar"
+
 msgctxt "AddDialog"
 msgid "Add account"
 msgstr "Adicionar conta"
@@ -152,12 +448,24 @@ msgid "Local folder"
 msgstr "Pasta local"
 
 msgctxt "AddDialog"
-msgid "Folder in the cloud (empty for all of it)"
-msgstr "Pasta na nuvem (vazio para tudo)"
+msgid "Edit account"
+msgstr "Editar conta"
 
 msgctxt "AddDialog"
-msgid "Everything"
-msgstr "Tudo"
+msgid "Download only (mirror the cloud)"
+msgstr "Somente download (espelhar a nuvem)"
+
+msgctxt "AddDialog"
+msgid "Nothing is uploaded or deleted in the cloud. Files changed or added in this folder are moved to its .fastsync/trash folder."
+msgstr "Nada é enviado nem apagado na nuvem. Arquivos alterados ou adicionados nesta pasta são movidos para a pasta .fastsync/trash dela."
+
+msgctxt "AddDialog"
+msgid "Loading folders…"
+msgstr "Carregando pastas…"
+
+msgctxt "AddDialog"
+msgid "Next"
+msgstr "Avançar"
 
 msgctxt "AddDialog"
 msgid "Email"
@@ -174,6 +482,10 @@ msgstr "Entrando…"
 msgctxt "AddDialog"
 msgid "Finish the login in your browser…"
 msgstr "Conclua o login no navegador…"
+
+msgctxt "AddDialog"
+msgid "Sign in again (to switch the account)"
+msgstr "Entrar de novo (para trocar de conta)"
 
 msgctxt "AddDialog"
 msgid "Use my own client ID (advanced)"
@@ -203,6 +515,14 @@ msgctxt "AddDialog"
 msgid "Log in"
 msgstr "Entrar"
 
+msgctxt "AddDialog"
+msgid "Type the password only to update the login. Use the same account as before."
+msgstr "Digite a senha só para atualizar o login. Use a mesma conta de antes."
+
+msgctxt "AddDialog"
+msgid "If Save opens the browser, sign in with the same account as before."
+msgstr "Se Salvar abrir o navegador, entre com a mesma conta de antes."
+
 msgctxt "SettingsDialog"
 msgid "Preferences"
 msgstr "Preferências"
@@ -226,6 +546,82 @@ msgstr "Escuro"
 msgctxt "SettingsDialog"
 msgid "Language"
 msgstr "Idioma"
+
+msgctxt "SettingsDialog"
+msgid "File manager emblems"
+msgstr "Emblemas no gerenciador de arquivos"
+
+msgctxt "SettingsDialog"
+msgid "Shows the sync status on the folder's icon in the file manager."
+msgstr "Mostra o estado da sincronização no ícone da pasta no gerenciador de arquivos."
+
+msgctxt "SettingsDialog"
+msgid "Trash"
+msgstr "Lixeira"
+
+msgctxt "SettingsDialog"
+msgid "Empty…"
+msgstr "Esvaziar…"
+
+msgctxt "SettingsDialog"
+msgid "Keep trash for (days)"
+msgstr "Guardar lixeira (dias)"
+
+msgctxt "SettingsDialog"
+msgid "Items are deleted for good once they are this old. 0 keeps them forever."
+msgstr "Os itens são apagados de vez quando atingem esta idade. 0 os mantém para sempre."
+
+msgctxt "SettingsDialog"
+msgid "Full check (min)"
+msgstr "Verificação (min)"
+
+msgctxt "SettingsDialog"
+msgid "Edits in your folders are seen at once; this full check catches any that were missed. On very large folders a longer time saves disk work and battery."
+msgstr "As edições nas suas pastas são vistas na hora; esta verificação completa pega as que passaram despercebidas. Em pastas muito grandes, um tempo maior poupa disco e bateria."
+
+msgctxt "SettingsDialog"
+msgid "Fallback check (min)"
+msgstr "Verif. reserva (min)"
+
+msgctxt "SettingsDialog"
+msgid "Used when the system cannot watch your folders for changes. Edits there are only noticed by this check."
+msgstr "Usado quando o sistema não consegue monitorar suas pastas. Lá, as edições só são notadas por esta verificação."
+
+msgctxt "SettingsDialog"
+msgid "FastSync cannot watch all your folders for changes (the system limit is reached), so some edits are only noticed by a periodic check. To raise the limit, run this and restart FastSync:"
+msgstr "O FastSync não consegue monitorar todas as suas pastas (o limite do sistema foi atingido), então algumas alterações só são notadas por uma verificação periódica. Para aumentar o limite, execute isto e reinicie o FastSync:"
+
+msgctxt "Main"
+msgid "Calculating…"
+msgstr "Calculando…"
+
+msgctxt "Main"
+msgid "Empty"
+msgstr "Vazia"
+
+msgctxt "Main"
+msgid "1 file, {}"
+msgstr "1 arquivo, {}"
+
+msgctxt "Main"
+msgid "{} files, {}"
+msgstr "{} arquivos, {}"
+
+msgctxt "EmptyTrashDialog"
+msgid "Empty trash"
+msgstr "Esvaziar a lixeira"
+
+msgctxt "EmptyTrashDialog"
+msgid "Permanently delete the files FastSync moved to the .fastsync/trash folders of your accounts? This cannot be undone."
+msgstr "Apagar permanentemente os arquivos que o FastSync moveu para as pastas .fastsync/trash das suas contas? Isso não pode ser desfeito."
+
+msgctxt "EmptyTrashDialog"
+msgid "Cancel"
+msgstr "Cancelar"
+
+msgctxt "EmptyTrashDialog"
+msgid "Delete"
+msgstr "Apagar"
 
 msgctxt "SettingsDialog"
 msgid "About"

@@ -1,32 +1,71 @@
-// Family kit v7: the small controls every Fast app draws the same way (see docs/UI-STYLE.md).
+// Family kit v12: the small controls every Fast app draws the same way (see docs/UI-STYLE.md).
 // Copied verbatim into every app, like family.slint. No strings live here: the caller passes every label, so the gettext
 // contexts do not change.
 import { Palette } from "std-widgets.slint";
 import { Family } from "family.slint";
 
 // A page tab: bold title with a 2 px accent underline when active. Page tabs are underlined, filters are segmented.
+// `count` shows a small number after the title (how many entries the page holds), `dot` a marker for "this page has
+// something set"; neither moves the other tabs, because the width includes them.
 export component TabItem inherits Rectangle {
     in property <string> title;
     in property <bool> active;
+    in property <int> count: 0;
+    in property <bool> dot: false;
     callback clicked();
     accessible-role: tab;
     accessible-label: root.title;
     accessible-item-selected: root.active;
     accessible-action-default => { root.clicked(); }
-    background: touch.has-hover && !root.active ? Palette.alternate-background : transparent;
+    property <length> chip-width: max(18px, cnt.preferred-width + 10px);
+    property <length> extra: root.count > 0 ? root.chip-width + 6px : root.dot ? 12px : 0px;
     // The tab is always as wide as its bold title, so going bold on selection does not move the other tabs.
-    preferred-width: bold.preferred-width + 28px;
+    preferred-width: bold.preferred-width + 28px + root.extra;
     min-width: self.preferred-width;
     bold := Text { text: root.title; font-weight: Family.section-weight; visible: false; }
-    touch := TouchArea { clicked => { root.clicked(); } }
+    cnt := Text { text: "\{root.count}"; font-size: Family.caption; font-weight: Family.section-weight; visible: false; }
+    // Reachable with Tab, picked with Space or Enter.
+    if fs.has-focus: Rectangle {
+        width: parent.width;
+        height: parent.height;
+        border-width: 2px;
+        border-color: Palette.accent-background;
+        border-radius: Family.control-radius;
+    }
+    fs := FocusScope {
+        key-pressed(event) => {
+            if event.text == Key.Return || event.text == " " {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+        touch := TouchArea { mouse-cursor: pointer; clicked => { fs.focus(); root.clicked(); } }
+    }
     HorizontalLayout {
         padding-left: 14px;
         padding-right: 14px;
+        spacing: 6px;
+        // Hover darkens the text only: a rounded pill would collide with the flat underline below it.
         Text {
             text: root.title;
             font-weight: root.active ? Family.section-weight : 400;
-            color: root.active ? Palette.foreground : Palette.foreground.with-alpha(0.65);
+            color: root.active ? Palette.foreground : Palette.foreground.with-alpha(touch.has-hover ? 0.9 : 0.65);
             vertical-alignment: center;
+        }
+        if root.count > 0: VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: root.chip-width;
+                height: 18px;
+                border-radius: 9px;
+                background: Palette.foreground.with-alpha(root.active ? 0.14 : 0.08);
+                Text { text: "\{root.count}"; font-size: Family.caption; font-weight: Family.section-weight; color: Family.muted; horizontal-alignment: center; vertical-alignment: center; }
+            }
+        }
+        if root.dot: VerticalLayout {
+            alignment: center;
+            Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Family.info; }
         }
     }
     Rectangle {
@@ -83,6 +122,9 @@ component GlyphButton inherits Rectangle {
         touch := TouchArea { mouse-cursor: pointer; clicked => { fs.focus(); root.clicked(); } }
     }
     @children
+    // An icon alone does not say what it does: the label shows on hover. Last, so it is above the TouchArea: a
+    // Tooltip declared below it never sees the mouse.
+    Tooltip { text: @markdown("\{root.label}"); }
 }
 
 // The burger that opens Preferences. Same size and look in every app.
@@ -142,6 +184,89 @@ export component PlusIcon inherits Path {
     stroke-line-cap: round;
 }
 
+// A text button with no frame, for secondary actions beside tabs and lists. `plus` draws a + before the label. Quiet until
+// hovered; `enabled: false` dims it and ignores clicks.
+export component GhostButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> plus: false;
+    in property <bool> enabled: true;
+    callback clicked();
+    height: Family.control-height;
+    border-radius: Family.control-radius;
+    opacity: root.enabled ? 1 : 0.4;
+    background: root.enabled && touch.pressed ? Palette.foreground.with-alpha(0.16) : root.enabled && touch.has-hover ? Palette.foreground.with-alpha(0.1) : transparent;
+    preferred-width: row.preferred-width;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+    if fs.has-focus: Rectangle {
+        width: parent.width;
+        height: parent.height;
+        border-width: 2px;
+        border-color: Palette.accent-background;
+        border-radius: Family.control-radius;
+    }
+    fs := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.Return || event.text == " " {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+        touch := TouchArea { enabled: root.enabled; mouse-cursor: pointer; clicked => { fs.focus(); root.clicked(); } }
+    }
+    row := HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 6px;
+        alignment: center;
+        if root.plus: VerticalLayout { alignment: center; PlusIcon { tone: Palette.foreground.with-alpha(0.8); } }
+        Text { text: root.text; color: Palette.foreground.with-alpha(0.9); vertical-alignment: center; }
+    }
+}
+
+// The button that deletes or removes for good, in a confirmation: red text and frame, so it is not mistaken for Cancel
+// beside it. Fluent's Button cannot be recoloured, and `primary` (the accent, green on Mint) would read as "safe".
+export component DangerButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked();
+    height: Family.control-height;
+    border-radius: Family.control-radius;
+    border-width: 1px;
+    border-color: Family.danger.with-alpha(0.6);
+    opacity: root.enabled ? 1 : 0.4;
+    background: Family.danger.with-alpha(root.enabled && touch.pressed ? 0.24 : root.enabled && touch.has-hover ? 0.14 : 0);
+    preferred-width: label.preferred-width + 24px;
+    min-width: self.preferred-width;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+    if fs.has-focus: Rectangle {
+        x: -2px;
+        y: -2px;
+        width: parent.width + 4px;
+        height: parent.height + 4px;
+        border-width: 2px;
+        border-color: Palette.accent-background;
+        border-radius: Family.control-radius + 2px;
+    }
+    fs := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.Return || event.text == " " {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+        touch := TouchArea { enabled: root.enabled; mouse-cursor: pointer; clicked => { fs.focus(); root.clicked(); } }
+    }
+    label := Text { text: root.text; color: Family.danger; horizontal-alignment: center; vertical-alignment: center; }
+}
+
 // A warning triangle. Color is never the only sign of a warning: this goes with the words.
 export component AlertIcon inherits Path {
     in property <color> tone: Family.warning;
@@ -162,6 +287,65 @@ export component Icon inherits Image {
     in property <color> tone: Palette.foreground.with-alpha(0.62);
     colorize: root.tone;
     image-fit: contain;
+}
+
+// A square, borderless button with an icon from a file, `Family.control-height` high so it sits level with the other
+// controls of a row. Quiet until hovered; `danger` turns the icon red on hover (a delete button). The caller passes
+// `label` because an icon has no text for a screen reader.
+export component IconButton inherits Rectangle {
+    in property <image> glyph;
+    in property <string> label;
+    in property <bool> danger: false;
+    callback clicked();
+    width: Family.control-height;
+    height: Family.control-height;
+    border-radius: Family.control-radius;
+    background: touch.pressed ? Palette.foreground.with-alpha(0.16) : touch.has-hover ? Palette.foreground.with-alpha(0.1) : transparent;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.clicked(); }
+    Icon {
+        source: root.glyph;
+        width: 16px;
+        height: 16px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        tone: touch.has-hover && root.danger ? Family.danger : Palette.foreground.with-alpha(0.8);
+    }
+    if fs.has-focus: Rectangle {
+        width: parent.width;
+        height: parent.height;
+        border-width: 2px;
+        border-color: Palette.accent-background;
+        border-radius: Family.control-radius;
+    }
+    fs := FocusScope {
+        key-pressed(event) => {
+            if event.text == Key.Return || event.text == " " {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+        touch := TouchArea { mouse-cursor: pointer; clicked => { fs.focus(); root.clicked(); } }
+    }
+    // The label on hover; last, above the TouchArea, so it sees the mouse.
+    Tooltip { text: @markdown("\{root.label}"); }
+}
+
+// Progress of a job, 0 to 1. Drawn by hand, in the info colour: Fluent's bar takes the accent, which is green on Mint
+// and reads as "done" next to a blue "Syncing…".
+export component ProgressBar inherits Rectangle {
+    in property <float> progress;
+    height: 4px;
+    border-radius: 2px;
+    background: Palette.foreground.with-alpha(0.1);
+    Rectangle {
+        x: 0px;
+        width: parent.width * clamp(root.progress, 0, 1);
+        border-radius: 2px;
+        background: Family.info;
+    }
 }
 
 // A small neutral label for a source or a category ("Flatpak"). A status uses a tinted chip instead, never this.

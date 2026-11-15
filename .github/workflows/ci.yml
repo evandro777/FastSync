@@ -25,6 +25,14 @@ jobs:
           sudo apt-get install -y libfontconfig-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libxcb1-dev \
             appstream desktop-file-utils
 
+      # Not apt's rclone: Ubuntu 24.04 has 1.60, and FastSync refuses anything below MIN_RCLONE (1.76), so the
+      # real-rclone tests would panic. Keep the version in step with MIN_RCLONE in crates/core/src/rclone.rs.
+      - name: rclone
+        run: |
+          curl -fsSL -o rclone.deb https://github.com/rclone/rclone/releases/download/v1.76.0/rclone-v1.76.0-linux-amd64.deb
+          echo "9db7ee9b725bce7cdd195b9183449a4c6fb93cad3e6578e70b87c0bc7f6062e9  rclone.deb" | sha256sum -c -
+          sudo apt-get install -y ./rclone.deb
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt

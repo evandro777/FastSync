@@ -61,7 +61,7 @@ Four sizes and two weights. Nothing else.
 
 | Use | Size | Property |
 |---|---|---|
-| Hints, footers, table captions | 11 px | `Family.caption` |
+| Hints, footers, table captions | 12 px | `Family.caption` |
 | Body text, lists, tables | 13 px | `Family.body` |
 | Group titles | 16 px | `Family.title` |
 | Dialog and page titles | 20 px | `Family.page-title` |
@@ -73,9 +73,11 @@ A big number or greeting that is the content of the page (the "Hello, Ana" demo)
 ### Tabs, selection and tables
 
 - **Page tabs are underlined** (`TabItem` in `controls.slint`: bold title, 2 px accent underline, a 1 px `Palette.border` line under the row). **Filters and modes are a segmented control** (FastCheckup's `FilterBar`). A filled `primary` button is never a tab: `primary` is for the one main action of a view.
-- **The picked row is quiet**: `Family.selected` (the accent at 26 % in dark, 18 % in light) plus a `Family.selected-bar` wide accent bar on the left edge. The text keeps `Palette.foreground`. Never fill a row or a menu entry with `Palette.selection-background`.
+- **The picked row is quiet**: `Family.selected` (a neutral foreground tint, 14 % in dark, 9 % in light: a green accent beside green status colours would read as "success") plus a `Family.selected-bar` wide accent bar on the left edge. The text keeps `Palette.foreground`. Never fill a row or a menu entry with `Palette.selection-background`.
 - Tables: a 1 px `Palette.border` under the header, rows of one fixed height, a hairline or a faint alternate tint between rows, numbers right-aligned. Editable cells stay `LineEdit`: it follows the caret in a long value and has the Cut/Copy/Paste menu, which a bare `TextInput` does not.
-- **Every tab row is a `TabBar` of `TabItem`s** (32 px, left-aligned, hairline under it), never Fluent's `TabWidget`, which stretches the tabs over the width. Pages under it stay alive and are only hidden with `visible`, so each keeps its scroll position.
+- **Every tab row is a `TabBar` of `TabItem`s** (32 px, left-aligned, hairline under it), never Fluent's `TabWidget`, which stretches the tabs over the width. A tab darkens its text on hover (no pill: it would collide with the underline) and has a focus ring and is picked with Space or Enter. Pages under it stay alive and are only hidden with `visible`, so each keeps its scroll position.
+- **Icon-only buttons are `IconButton`** (`controls.slint`: 32 px, hover and pressed tints, focus ring, `danger` for a delete button; the caller passes the accessible `label`). **A row of actions shows at most three icon buttons; the rest go in a `more` (⋯) `IconButton` that opens a `ContextMenuArea` menu with `show(...)`, the destructive item last after a `MenuSeparator`** (FastSync's account card). **Progress is `ProgressBar`** (4 px, `Family.info` fill), never Fluent's `ProgressIndicator`, whose accent fill reads as "done" on a green accent. Secondary text (`Family.muted`) is 75 % of the foreground in dark, 70 % in light.
+- **Icon buttons show their `label` as a `Tooltip` on hover** (built into `IconButton` and the burger), so no icon is left unnamed. **The button that deletes or removes for good in a confirmation is a `DangerButton`** (red text and frame, `controls.slint`), never a plain `Button` that looks like Cancel and never `primary` (the accent can be green).
 - A badge is neutral (`NeutralBadge`: `Family.muted` text, 1 px border, no fill) unless it states a status (then a tinted chip). A source or a category is not a status.
 - **The accent marks "active".** The bar and underline of the open tab or nav item use `Palette.accent-background`; the label stays `Palette.foreground`. `Family.info` is for links only.
 - Filters and modes with up to four options use `FilterBar` (also a short interval list like 1/2/5 s). A longer list stays a `ComboBox`.
@@ -89,7 +91,7 @@ Gaps are 4, 8, 12 or 20 px (`Family.gap-*`). Panels and dialogs use the corner r
 
 ### Icons in the window
 
-Line icons with a 2 px stroke and round caps, drawn on a 24 px grid and tinted with `colorize-icon: true`, so they follow the theme. Use the app's own `ui/icons/*.svg`; the shared set (search, refresh, trash, copy, power, folder, info, circle-check, chevrons) comes with the kit; copy into an app only the icons it uses (an unused file is dead weight), and FastCheckup has the largest set to copy from. The `Icon` component is in `controls.slint`. Do not use text symbols (▾, ✕, ×, ⚠, "+ Add") as icons or in labels. `controls.slint` draws the small ones (`CloseButton`, `StepButton`, `PlusIcon`, `AlertIcon`, `MenuButton`) with paths, so an app needs no icon files for them.
+Line icons with a 2 px stroke and round caps, drawn on a 24 px grid and tinted with `colorize-icon: true`, so they follow the theme. Use the app's own `ui/icons/*.svg`; the shared set (search, refresh, trash, copy, power, folder, info, circle-check, chevrons, more) comes with the kit; copy into an app only the icons it uses (an unused file is dead weight), and FastCheckup has the largest set to copy from. The `Icon` component is in `controls.slint`. Do not use text symbols (▾, ✕, ×, ⚠, "+ Add") as icons or in labels. `controls.slint` draws the small ones (`CloseButton`, `StepButton`, `PlusIcon`, `AlertIcon`, `MenuButton`) with paths, so an app needs no icon files for them.
 
 ### Words
 

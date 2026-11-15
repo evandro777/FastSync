@@ -47,6 +47,19 @@ Actions and settings, that needs to be done once.
     - `Secret`: Paste the contents of the private key, whole file, from `-----BEGIN PGP PRIVATE KEY BLOCK-----` to the `END` line, as the secret's value
     - **Never commit the private file!** GitHub will not show the secret again, so keep a private backup (a password manager); if the key is lost, a new key breaks every user's existing remote and they must re-add it.
 
+### Embedded OAuth client (Google Drive, Dropbox and OneDrive)
+
+Optional. The AppImage and Flatpak builds bake in the project's own client IDs, so users do not share rclone's rate-limited one. Without these secrets the builds still work and fall back to rclone's shared ID. How to create the IDs: [`docs/OWN-CLIENT-ID.md`](docs/OWN-CLIENT-ID.md).
+
+- Settings → Secrets and variables → Actions → New repository secret, once for each of:
+    - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`
+    - `DROPBOX_CLIENT_ID`, `DROPBOX_CLIENT_SECRET`
+    - `ONEDRIVE_CLIENT_ID`, `ONEDRIVE_CLIENT_SECRET` (the Azure secret **expires**, at most after 24 months: note the date, create a new one and release again before it does)
+- `appimage.yml` and `flatpak.yml` pass them to the build as `FASTSYNC_*` environment variables (read with `option_env!` in `crates/core/src/rclone.rs`). Secrets are empty on PRs from forks, so those builds use the shared ID.
+- A user's own ID in the Add account dialog always wins over the embedded one.
+- The secret is readable inside the binary (`strings`). It cannot read anyone's files, but all users share its quota; Google's unverified app is also capped at 100 users and shows the "unverified app" warning (Dropbox: 500 users until production approval).
+- Rotated a secret? Update it here and release again: older builds keep the old one.
+
 ### Virus Total checking
 
 Automatically check for virus on deploy, or delete `virustotal.yml`.

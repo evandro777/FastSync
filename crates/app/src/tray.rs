@@ -15,6 +15,8 @@ pub enum Overall {
     Syncing,
     Paused,
     Error,
+    /// The delete guard stopped a run and waits for the user. Same icon as an error, its own words.
+    Stopped,
 }
 
 /// Side of the tray PNGs in `crates/app/tray/`, made into ARGB32 by `build.rs`.
@@ -26,7 +28,7 @@ impl Overall {
             Overall::None | Overall::Idle => include_bytes!(concat!(env!("OUT_DIR"), "/idle.argb")),
             Overall::Syncing => include_bytes!(concat!(env!("OUT_DIR"), "/syncing.argb")),
             Overall::Paused => include_bytes!(concat!(env!("OUT_DIR"), "/paused.argb")),
-            Overall::Error => include_bytes!(concat!(env!("OUT_DIR"), "/error.argb")),
+            Overall::Error | Overall::Stopped => include_bytes!(concat!(env!("OUT_DIR"), "/error.argb")),
         }
     }
 }
@@ -44,6 +46,7 @@ pub struct Labels {
     pub syncing: String,
     pub paused: String,
     pub error: String,
+    pub stopped: String,
     pub none: String,
 }
 
@@ -71,6 +74,7 @@ impl SyncTray {
             Overall::Syncing => &self.labels.syncing,
             Overall::Paused => &self.labels.paused,
             Overall::Error => &self.labels.error,
+            Overall::Stopped => &self.labels.stopped,
         }
     }
 }
@@ -169,6 +173,7 @@ mod tests {
             Overall::Syncing,
             Overall::Paused,
             Overall::Error,
+            Overall::Stopped,
         ] {
             assert_eq!(o.pixmap().len(), (ICON_SIZE * ICON_SIZE * 4) as usize, "{o:?}");
         }

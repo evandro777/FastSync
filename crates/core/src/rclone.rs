@@ -18,18 +18,39 @@ pub struct Item {
     pub mtime: i64,
     pub is_dir: bool,
     pub id: String,
+    /// (hash type, lowercase hex) of the content, when the service lists one (not MEGA).
+    pub hash: Option<(String, String)>,
 }
+
+/// Hash types in the order they are trusted: what each service reports for its files (Drive md5, OneDrive quickxor,
+/// Dropbox its own).
+const HASHES: [&str; 5] = ["md5", "sha1", "quickxor", "dropbox", "sha256"];
 
 pub struct Rclone {
     agent: ureq::Agent,
     base: String,
     auth: String,
     child: std::sync::Mutex<Child>,
+    /// The rclone job of the browser login in progress (see `call_job`), so a cancel can stop it.
+    login_job: std::sync::Mutex<Option<i64>>,
 }
 
 /// `rclone` from `$FASTSYNC_RCLONE` (a dev override), else from `PATH` (the Flatpak puts it in /app/bin).
 fn binary() -> PathBuf {
     std::env::var_os("FASTSYNC_RCLONE").map_or_else(|| "rclone".into(), PathBuf::from)
+}
+
+const MIN_RCLONE: (u64, u64) = (1, 76);
+
+/// `operations/about`'s answer as `(used, total)`; no `used` means the service reports nothing useful.
+fn quota(v: &Value) -> Option<(u64, Option<u64>)> {
+    Some((v["used"].as_u64()?, v["total"].as_u64().filter(|&t| t > 0)))
+}
+
+/// `decomposed` is `core/version`'s `[major, minor, patch]`; anything unreadable counts as too old.
+fn version_ok(decomposed: &Value) -> bool {
+    let n = |i: usize| decomposed[i].as_u64();
+    matches!((n(0), n(1)), (Some(a), Some(b)) if (a, b) >= MIN_RCLONE)
 }
 
 pub fn available() -> bool {
@@ -69,27 +90,55 @@ impl Rclone {
             base: format!("http://127.0.0.1:{port}/"),
             auth: format!("Basic {}", base64(format!("fastsync:{pass}").as_bytes())),
             child: std::sync::Mutex::new(child),
+            login_job: std::sync::Mutex::new(None),
         };
         let start = Instant::now();
         // Dropping `me` on failure kills the child.
-        while me.call("core/pid", json!({})).is_err() {
+        // The port was free a moment ago, not reserved: whoever answers must be the child we started, or the login
+        // data would go to another program.
+        let ours = u64::from(me.child.lock().map_err(|e| e.to_string())?.id());
+        loop {
+            match me.call("core/pid", json!({})) {
+                Ok(v) if v["pid"].as_u64() == Some(ours) => break,
+                Ok(_) => return Err("another program answers on rclone's port".into()),
+                Err(_) => {}
+            }
             if start.elapsed() > Duration::from_secs(10) {
                 return Err("rclone did not start".into());
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        // Older rclone lacks what login relies on (1.76: the extra "shared client_id" question), so refuse it here
+        // instead of failing mid-login.
+        let v = me.call("core/version", json!({}))?;
+        if !version_ok(&v["decomposed"]) {
+            return Err(format!(
+                "rclone {} is too old, FastSync needs {}.{} or newer",
+                v["version"].as_str().unwrap_or("?"),
+                MIN_RCLONE.0,
+                MIN_RCLONE.1
+            ));
+        }
         Ok(me)
     }
 
-    pub fn call(&self, method: &str, body: Value) -> Result<Value> {
-        let mut resp = self
-            .agent
+    fn send(&self, method: &str, body: &Value) -> Result<ureq::http::Response<ureq::Body>> {
+        self.agent
             .post(&format!("{}{method}", self.base))
             .header("Authorization", &self.auth)
             // Exactly `application/json`: with ureq's `; charset=utf-8` rclone ignores the body ("Didn't find key").
             .header("Content-Type", "application/json")
-            .send(serde_json::to_vec(&body).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+            .send(serde_json::to_vec(body).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())
+    }
+
+    /// The method name tells which call failed; rclone's own message does not.
+    fn failure(method: &str, v: &Value) -> String {
+        format!("{method}: {}", v["error"].as_str().unwrap_or("rclone error"))
+    }
+
+    pub fn call(&self, method: &str, body: Value) -> Result<Value> {
+        let mut resp = self.send(method, &body)?;
         let ok = resp.status().is_success();
         let v: Value = resp
             .body_mut()
@@ -97,49 +146,169 @@ impl Rclone {
             .limit(u64::MAX)
             .read_json()
             .map_err(|e| e.to_string())?;
-        if ok {
-            Ok(v)
-        } else {
-            // The method name tells which call failed; rclone's own message does not.
-            Err(format!("{method}: {}", v["error"].as_str().unwrap_or("rclone error")))
-        }
+        if ok { Ok(v) } else { Err(Self::failure(method, &v)) }
     }
 
-    /// Recursive listing of `fs:remote`. A missing folder is an empty list, not an error.
+    /// Listing of `fs:remote`, the whole tree when `recurse`. Every error is an error, "not found" included: the
+    /// cloud's root always exists, so such an answer (seen right after a token change) is a glitch, and reading it as
+    /// an empty cloud made every synced file look deleted.
     /// `exclude`: rclone filter rules (`/Folder/**`) for what must not be listed at all.
-    pub fn list(&self, fs: &str, remote: &str, exclude: &[String]) -> Result<Vec<Item>> {
-        let v = match self.call(
+    pub fn list(&self, fs: &str, remote: &str, exclude: &[String], recurse: bool) -> Result<Vec<Item>> {
+        let method = "operations/list";
+        let body = json!({"fs": fs, "remote": remote, "opt": {"recurse": recurse, "noMimeType": true, "showHash": true}, "_filter": {"ExcludeRule": exclude}});
+        let mut resp = self.send(method, &body)?;
+        if !resp.status().is_success() {
+            let v: Value = resp.body_mut().read_json().map_err(|e| e.to_string())?;
+            return Err(Self::failure(method, &v));
+        }
+        // Straight into the few fields we keep, read as a stream: a tree of 500k files as a generic JSON value
+        // took hundreds of MB. A listing that does not parse is an error, never a shorter list (which would read as
+        // "deleted in the cloud").
+        let listing: Listing = resp
+            .body_mut()
+            .with_config()
+            .limit(u64::MAX)
+            .read_json()
+            .map_err(|e| format!("{method}: {e}"))?;
+        Ok(listing.list.into_iter().filter_map(Entry::into_item).collect())
+    }
+
+    /// The folders directly inside `fs:remote` (one level, for the folder picker): paths from the root of `fs`.
+    /// `exclude`: filter rules for folders that cannot be listed (see `exclusions`).
+    pub fn list_dirs(&self, fs: &str, remote: &str, exclude: &[String]) -> Result<Vec<String>> {
+        let v = self.call(
             "operations/list",
-            json!({"fs": fs, "remote": remote, "opt": {"recurse": true, "noMimeType": true}, "_filter": {"ExcludeRule": exclude}}),
-        ) {
-            Ok(v) => v,
-            Err(e) if e.contains("not found") => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
-        Ok(v["list"]
-            .as_array()
-            .map_or_else(Vec::new, |a| a.iter().filter_map(parse_item).collect()))
+            json!({"fs": fs, "remote": remote, "opt": {"dirsOnly": true, "noMimeType": true}, "_filter": {"ExcludeRule": exclude}}),
+        )?;
+        let mut dirs: Vec<String> = v["list"].as_array().map_or_else(Vec::new, |a| {
+            a.iter()
+                .filter_map(parse_item)
+                .filter(|i| i.is_dir)
+                .map(|i| i.path)
+                .collect()
+        });
+        dirs.sort_by_key(|d| d.to_lowercase());
+        Ok(dirs)
     }
 
     pub fn stat(&self, fs: &str, remote: &str) -> Result<Option<Item>> {
         let v = self.call(
             "operations/stat",
-            json!({"fs": fs, "remote": remote, "opt": {"noMimeType": true}}),
+            json!({"fs": fs, "remote": remote, "opt": {"noMimeType": true, "showHash": true}}),
         )?;
         Ok(parse_item(&v["item"]))
     }
 
-    pub fn copyfile(&self, src_fs: &str, src: &str, dst_fs: &str, dst: &str) -> Result<()> {
+    /// The `kind` hash of a local file, computed by rclone (it reads the whole file).
+    pub fn local_hash(&self, dir: &str, rel: &str, kind: &str) -> Option<String> {
+        let v = self
+            .call(
+                "operations/stat",
+                json!({"fs": dir, "remote": rel, "opt": {"noMimeType": true, "showHash": true, "hashTypes": [kind]}}),
+            )
+            .ok()?;
+        v["item"]["Hashes"][kind]
+            .as_str()
+            .filter(|h| !h.is_empty())
+            .map(str::to_lowercase)
+    }
+
+    /// `group` (the account id) keeps `speed` per account: `core/stats` otherwise adds every account together.
+    pub fn copyfile(&self, group: &str, src_fs: &str, src: &str, dst_fs: &str, dst: &str) -> Result<()> {
         self.call(
             "operations/copyfile",
-            json!({"srcFs": src_fs, "srcRemote": src, "dstFs": dst_fs, "dstRemote": dst}),
+            json!({"srcFs": src_fs, "srcRemote": src, "dstFs": dst_fs, "dstRemote": dst, "_group": group}),
         )
         .map(drop)
+    }
+
+    /// `(used, total)` bytes of the cloud account behind `fs` (`operations/about`); `total` is None when the plan has
+    /// no limit or the service does not say.
+    pub fn about(&self, fs: &str) -> Result<(u64, Option<u64>)> {
+        let v = self.call("operations/about", json!({"fs": fs}))?;
+        quota(&v).ok_or_else(|| "operations/about: no usage reported".to_owned())
+    }
+
+    /// Server-side move inside one remote (`operations/movefile`): no bytes cross the network.
+    pub fn movefile(&self, fs: &str, src: &str, dst: &str) -> Result<()> {
+        self.call(
+            "operations/movefile",
+            json!({"srcFs": fs, "srcRemote": src, "dstFs": fs, "dstRemote": dst}),
+        )
+        .map(drop)
+    }
+
+    /// Bytes per second of the transfers running in `group` right now (None when rclone does not say).
+    pub fn speed(&self, group: &str) -> Option<f64> {
+        self.call("core/stats", json!({"group": group}))
+            .ok()?
+            .get("speed")?
+            .as_f64()
+    }
+
+    /// Creates the folder `fs:remote` with its parents; fine when it exists already.
+    pub fn mkdir(&self, fs: &str, remote: &str) -> Result<()> {
+        self.call("operations/mkdir", json!({"fs": fs, "remote": remote}))
+            .map(drop)
+    }
+
+    /// Removes the folder `fs:remote` only when it is empty (`operations/rmdir`, never a purge).
+    pub fn rmdir(&self, fs: &str, remote: &str) -> Result<()> {
+        self.call("operations/rmdir", json!({"fs": fs, "remote": remote}))
+            .map(drop)
     }
 
     pub fn deletefile(&self, fs: &str, remote: &str) -> Result<()> {
         self.call("operations/deletefile", json!({"fs": fs, "remote": remote}))
             .map(drop)
+    }
+
+    /// A public share link for `fs:remote` (a file; folders work on most providers too).
+    pub fn public_link(&self, fs: &str, remote: &str) -> Result<String> {
+        let v = self.call("operations/publiclink", json!({"fs": fs, "remote": remote}))?;
+        v["url"]
+            .as_str()
+            .filter(|u| !u.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| "operations/publiclink: no link returned".to_owned())
+    }
+
+    /// A call that can block for minutes (the login waits for the browser), run as an rclone job so `cancel_login`
+    /// can stop it. A login nobody finished otherwise keeps rclone's auth server on port 53682 until rclone's own
+    /// timeout, and the next login fails with "address already in use". Errors read like `call`'s.
+    fn call_job(&self, method: &str, mut body: Value) -> Result<Value> {
+        body["_async"] = json!(true);
+        let id = self.call(method, body)?["jobid"]
+            .as_i64()
+            .ok_or("rclone gave no job id")?;
+        *self.login_job.lock().map_err(|e| e.to_string())? = Some(id);
+        let done = loop {
+            match self.call("job/status", json!({"jobid": id})) {
+                Ok(s) if s["finished"].as_bool() == Some(true) => break Ok(s),
+                Ok(_) => std::thread::sleep(Duration::from_millis(200)),
+                Err(e) => break Err(e),
+            }
+        };
+        if let Ok(mut j) = self.login_job.lock()
+            && *j == Some(id)
+        {
+            *j = None;
+        }
+        let s = done?;
+        if s["success"].as_bool() == Some(true) {
+            Ok(s["output"].clone())
+        } else {
+            Err(format!("{method}: {}", s["error"].as_str().unwrap_or("rclone error")))
+        }
+    }
+
+    /// Stops the login that is waiting for the browser (if any), freeing the auth server's port. Its `login` call
+    /// returns an error at once.
+    pub fn cancel_login(&self) {
+        let id = self.login_job.lock().ok().and_then(|mut j| j.take());
+        if let Some(id) = id {
+            let _ = self.call("job/stop", json!({"jobid": id}));
+        }
     }
 
     pub fn config_get(&self, name: &str) -> Result<Value> {
@@ -165,12 +334,19 @@ impl Rclone {
             let body = json!({"name": name, "type": kind, "parameters": {"user": user, "pass": pass}, "opt": {"obscure": true}});
             return self.call("config/create", body).map(drop);
         }
+        // A login abandoned earlier would still hold the auth server's port.
+        self.cancel_login();
         // Sent with every call, as rclone asks for config defaults.
         let params = login_params(kind, client);
-        let mut v = self.call(
+        let first = self.call_job(
             "config/create",
             json!({"name": name, "type": kind, "parameters": params, "opt": {"nonInteractive": true}}),
         )?;
+        self.finish_config(name, &params, first)
+    }
+
+    /// Answers rclone's config questions (see `answer`) until it is done. `v` is the reply to the first call.
+    fn finish_config(&self, name: &str, params: &Value, mut v: Value) -> Result<()> {
         for _ in 0..20 {
             if let Some(e) = v["Error"].as_str().filter(|e| !e.is_empty()) {
                 return Err(e.to_string());
@@ -180,9 +356,92 @@ impl Rclone {
                 return Ok(());
             }
             let result = answer(&v["Option"]);
-            v = self.call("config/update", json!({"name": name, "parameters": params, "opt": {"nonInteractive": true, "continue": true, "state": state, "result": result}}))?;
+            v = self.call_job("config/update", json!({"name": name, "parameters": params, "opt": {"nonInteractive": true, "continue": true, "state": state, "result": result}}))?;
         }
         Err("login did not finish".into())
+    }
+
+    /// Writes `params` as the whole remote `id`. `create` over an existing name replaces it; its settings already
+    /// include the token, so rclone asks whether to replace it (`answer` says no); `noObscure`: MEGA's password comes
+    /// back obscured.
+    fn replace_remote(&self, id: &str, kind: &str, params: &Value) -> Result<()> {
+        let first = self.call(
+            "config/create",
+            json!({"name": id, "type": kind, "parameters": params, "opt": {"nonInteractive": true, "noObscure": true}}),
+        )?;
+        self.finish_config(id, params, first)?;
+        // rclone keeps the filesystems it opened, with their old settings and token: clear them. A failure here only
+        // means the old ones live until rclone drops them.
+        let _ = self.call("fscache/clear", json!({}));
+        Ok(())
+    }
+
+    /// Drive logins made before FastSync skipped shortcuts still follow them, which shows a shortcut's folder as a
+    /// second real copy (downloaded again; a delete inside it would delete the original). Adds the setting to such
+    /// a login, keeping everything else. Local to rclone's config, no network. Not Drive, or already set: nothing.
+    pub fn skip_shortcuts(&self, id: &str) -> Result<()> {
+        let cfg = self.config_get(id)?;
+        if cfg["type"] != "drive" || cfg["skip_shortcuts"].as_str() == Some("true") {
+            return Ok(());
+        }
+        let old = copy_params(&cfg);
+        let mut new = old.clone();
+        new["skip_shortcuts"] = "true".into();
+        self.replace_remote(id, "drive", &new).inspect_err(|_| {
+            let _ = self.replace_remote(id, "drive", &old);
+        })
+    }
+
+    /// Replaces the login of the remote `id` (same name, so its DB and runner stay valid) with a new one, never
+    /// leaving it half-made: the new login is made under a temporary name and checked by listing the root; only then
+    /// are its settings copied over the real remote, as a whole (an old client ID would not fit the new token). Any
+    /// failure leaves the old login untouched.
+    pub fn reauth(
+        &self,
+        id: &str,
+        kind: &str,
+        user_pass: Option<(&str, &str)>,
+        client: Option<(&str, &str)>,
+        // Asked once the new login is checked, just before it replaces the old one: false (the user cancelled while
+        // the browser was open) drops it.
+        proceed: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        let tmp = format!("{id}x");
+        let result = self.swap_login(id, &tmp, kind, user_pass, client, proceed);
+        self.config_delete(&tmp);
+        result
+    }
+
+    fn swap_login(
+        &self,
+        id: &str,
+        tmp: &str,
+        kind: &str,
+        user_pass: Option<(&str, &str)>,
+        client: Option<(&str, &str)>,
+        proceed: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        // A leftover of a crashed run would make rclone ask whether to replace its token.
+        self.config_delete(tmp);
+        self.login(tmp, kind, user_pass, client)?;
+        self.list_dirs(&format!("{tmp}:"), "", &exclusions(kind))?;
+        if kind == "mega" {
+            mega_login_works(&self.config_get(tmp)?)?;
+        }
+        if !proceed() {
+            return Err("cancelled".into());
+        }
+        let new = copy_params(&self.config_get(tmp)?);
+        let old = copy_params(&self.config_get(id)?);
+        let apply = |params: &Value| self.replace_remote(id, kind, params);
+        // The copy is checked on the real remote too: a setting that did not survive the round trip (MEGA's
+        // obscured password) would otherwise replace a working login with a broken one.
+        let checked = apply(&new).and_then(|()| self.list_dirs(&format!("{id}:"), "", &exclusions(kind)).map(drop));
+        if let Err(e) = checked {
+            let _ = apply(&old);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// The OAuth access token and its expiry (epoch seconds, 0 when unknown). A cheap call first makes rclone
@@ -222,23 +481,89 @@ pub fn exclusions(kind: &str) -> Vec<String> {
     }
 }
 
+/// `exclusions` plus the unchecked folders, so a big excluded tree is not even listed. A name with a glob character
+/// is left out: the rule would also hide a sibling (`a[1]` matches `a1`), which looks like a remote delete. The engine
+/// skips unchecked folders by itself, so those are only listed, not synced.
+pub fn exclude_rules(kind: &str, unchecked: &[String]) -> Vec<String> {
+    let mut rules = exclusions(kind);
+    rules.extend(
+        unchecked
+            .iter()
+            .filter(|p| !p.contains(['*', '?', '[', ']', '{', '}', '\\']))
+            .map(|p| format!("/{p}/**")),
+    );
+    rules
+}
+
+impl RcloneRemote {
+    /// The remote's name (`id:` before the colon) is the account id: the stats group of its transfers.
+    pub fn group(&self) -> &str {
+        self.fs.split(':').next().unwrap_or("")
+    }
+}
+
 impl crate::engine::Remote for RcloneRemote {
     fn list(&self) -> Result<Vec<Item>> {
-        self.rc.list(&self.fs, "", &self.exclude)
+        self.rc.list(&self.fs, "", &self.exclude, true)
+    }
+    fn list_dir(&self, rel: &str) -> Result<Vec<Item>> {
+        self.rc.list(&self.fs, rel, &self.exclude, false)
     }
     fn stat(&self, rel: &str) -> Result<Option<Item>> {
         self.rc.stat(&self.fs, rel)
     }
     fn upload(&self, local_root: &Path, rel: &str) -> Result<()> {
-        self.rc.copyfile(&local_root.to_string_lossy(), rel, &self.fs, rel)
+        let copy = || {
+            self.rc
+                .copyfile(self.group(), &local_root.to_string_lossy(), rel, &self.fs, rel)
+        };
+        match (copy(), rel.rsplit_once('/')) {
+            // OneDrive's copyfile into a folder it does not have yet fails (Drive and Dropbox create it): make the
+            // folder, then once more. Only on this error, so the usual upload costs no extra request.
+            (Err(e), Some((dir, _))) if e.contains("directory not found") => {
+                self.rc.mkdir(&self.fs, dir)?;
+                copy()
+            }
+            (r, _) => r,
+        }
     }
     fn download(&self, rel: &str, dest: &Path) -> Result<()> {
         let (dir, name) = (dest.parent().ok_or("bad path")?, dest.file_name().ok_or("bad path")?);
-        self.rc
-            .copyfile(&self.fs, rel, &dir.to_string_lossy(), &name.to_string_lossy())
+        self.rc.copyfile(
+            self.group(),
+            &self.fs,
+            rel,
+            &dir.to_string_lossy(),
+            &name.to_string_lossy(),
+        )
     }
     fn delete(&self, rel: &str) -> Result<()> {
         self.rc.deletefile(&self.fs, rel)
+    }
+    fn remove_empty_dir(&self, rel: &str) -> Result<()> {
+        self.rc.rmdir(&self.fs, rel)
+    }
+    fn forget_cache(&self) {
+        // One cache for every account's remote in the shared rcd: the others just rebuild theirs on next use.
+        let _ = self.rc.call("fscache/clear", json!({}));
+    }
+    fn rename(&self, from: &str, to: &str) -> Result<()> {
+        // OneDrive does not create the target folder (see `upload`); a failure falls back to upload + delete anyway.
+        match (self.rc.movefile(&self.fs, from, to), to.rsplit_once('/')) {
+            (Err(e), Some((dir, _))) if e.contains("directory not found") => {
+                self.rc.mkdir(&self.fs, dir)?;
+                self.rc.movefile(&self.fs, from, to)
+            }
+            (r, _) => r,
+        }
+    }
+    fn same_content(&self, local_root: &Path, rel: &str, remote: &Item) -> bool {
+        let Some((kind, want)) = &remote.hash else {
+            return false;
+        };
+        self.rc
+            .local_hash(&local_root.to_string_lossy(), rel, kind)
+            .is_some_and(|got| &got == want)
     }
 }
 
@@ -258,10 +583,73 @@ impl Rclone {
     }
 }
 
+/// MEGA's login, tried for real. rclone keeps a logged-in MEGA session per email, and any remote with that email
+/// reuses it without looking at its password, so a listing through the running rclone passes with a wrong or an empty
+/// password. A fresh process has no session. The remote is made from environment variables, not the command line,
+/// which every local user can read in /proc.
+fn mega_login_works(cfg: &Value) -> Result<()> {
+    let out = Command::new(binary())
+        .args([
+            "lsf",
+            "--dirs-only",
+            "--max-depth",
+            "1",
+            "--retries",
+            "1",
+            "--low-level-retries",
+            "1",
+        ])
+        .args(["--contimeout", "20s", "--timeout", "30s", "probe:"])
+        .envs(mega_probe_env(cfg))
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot start rclone: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    Err(err
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("MEGA login failed")
+        .trim()
+        .to_string())
+}
+
+/// The remote `probe:` of `mega_login_works`, from a `config/get` (its password is already obscured, as rclone wants).
+fn mega_probe_env(cfg: &Value) -> [(&'static str, String); 4] {
+    let get = |k: &str| cfg[k].as_str().unwrap_or("").to_string();
+    [
+        ("RCLONE_CONFIG", "/dev/null".into()),
+        ("RCLONE_CONFIG_PROBE_TYPE", "mega".into()),
+        ("RCLONE_CONFIG_PROBE_USER", get("user")),
+        ("RCLONE_CONFIG_PROBE_PASS", get("pass")),
+    ]
+}
+
+/// The settings of a remote (`config/get`) minus its `type`, as the parameters for creating another one.
+fn copy_params(cfg: &Value) -> Value {
+    let mut p = serde_json::Map::new();
+    for (k, v) in cfg.as_object().into_iter().flatten() {
+        if k != "type"
+            && let Some(s) = v.as_str()
+        {
+            p.insert(k.clone(), s.into());
+        }
+    }
+    Value::Object(p)
+}
+
 /// Our answer to one of rclone's login questions. Yes to "use a web browser on this machine" (we are a desktop
 /// app) and to newer rclone's "continue using the shared client_id anyway?" (default No: asked only when the user
 /// gave no client ID of their own, and then the shared one is what they chose). Everything else: the default.
 fn answer(opt: &Value) -> String {
+    // "Token already configured - replace it?": no. It only comes up when the settings being created carry a token
+    // (a re-authentication copying a checked one), and yes would open the browser again.
+    if opt["Name"] == "config_refresh_token" {
+        return "false".into();
+    }
     let help = opt["Help"].as_str().unwrap_or("").to_lowercase();
     if opt["Name"] == "config_is_local" || (opt["Type"] == "bool" && help.contains("shared client")) {
         return "true".into();
@@ -273,14 +661,45 @@ fn answer(opt: &Value) -> String {
     }
 }
 
+/// Whether `id` is the project's own built-in client ID for `kind` (the saved login holds it too, so it must not
+/// show up as "the user's own client" when editing).
+pub fn is_embedded_client(kind: &str, id: &str) -> bool {
+    embedded_client(kind).is_some_and(|(i, _)| i == id)
+}
+
+/// The project's own OAuth client, baked in at build time from CI secrets (never in the repo). It is only a default:
+/// the user's own ID wins, and without these variables (local builds, forks) rclone's shared ID is used. The secret
+/// is readable in the binary, as for any desktop app.
+fn embedded_client(kind: &str) -> Option<(&'static str, &'static str)> {
+    let (id, secret) = match kind {
+        "drive" => (
+            option_env!("FASTSYNC_GOOGLE_CLIENT_ID"),
+            option_env!("FASTSYNC_GOOGLE_CLIENT_SECRET"),
+        ),
+        "dropbox" => (
+            option_env!("FASTSYNC_DROPBOX_CLIENT_ID"),
+            option_env!("FASTSYNC_DROPBOX_CLIENT_SECRET"),
+        ),
+        "onedrive" => (
+            option_env!("FASTSYNC_ONEDRIVE_CLIENT_ID"),
+            option_env!("FASTSYNC_ONEDRIVE_CLIENT_SECRET"),
+        ),
+        _ => return None,
+    };
+    id.zip(secret).filter(|(i, s)| !i.is_empty() && !s.is_empty())
+}
+
 /// The config parameters of an OAuth login. Google Docs and Sheets have no file content: without `skip_gdocs`
-/// rclone lists them as .docx/.xlsx exports, and a later local edit would upload a duplicate.
+/// rclone lists them as .docx/.xlsx exports, and a later local edit would upload a duplicate. A shortcut is a link,
+/// not content: without `skip_shortcuts` rclone shows its target under the shortcut's path, so the files would sync
+/// twice and a delete in one place would delete the original (`Rclone::skip_shortcuts` fixes older logins).
 pub fn login_params(kind: &str, client: Option<(&str, &str)>) -> Value {
     let mut p = serde_json::Map::new();
     if kind == "drive" {
         p.insert("skip_gdocs".into(), "true".into());
+        p.insert("skip_shortcuts".into(), "true".into());
     }
-    if let Some((id, secret)) = client {
+    if let Some((id, secret)) = client.or_else(|| embedded_client(kind)) {
         p.insert("client_id".into(), id.into());
         p.insert("client_secret".into(), secret.into());
     }
@@ -293,14 +712,49 @@ pub fn now_secs() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// The reply of `operations/list`.
+#[derive(serde::Deserialize)]
+struct Listing {
+    // No default: rclone always sends `"list": []` for an empty folder, so a reply without the key is a glitch, not
+    // an empty cloud.
+    list: Vec<Entry>,
+}
+
+/// One entry of an rclone listing: only the fields `Item` keeps.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Entry {
+    path: Option<String>,
+    size: Option<i64>,
+    mod_time: Option<String>,
+    is_dir: Option<bool>,
+    #[serde(rename = "ID")]
+    id: Option<String>,
+    hashes: Option<std::collections::HashMap<String, Option<String>>>,
+}
+
+impl Entry {
+    /// None for an entry without a path.
+    fn into_item(self) -> Option<Item> {
+        let hash = self.hashes.and_then(|m| {
+            HASHES.iter().find_map(|k| {
+                let h = m.get(*k)?.as_deref().filter(|h| !h.is_empty())?;
+                Some((k.to_string(), h.to_lowercase()))
+            })
+        });
+        Some(Item {
+            path: self.path?,
+            size: self.size.unwrap_or(0).max(0) as u64,
+            mtime: self.mod_time.as_deref().and_then(parse_time).unwrap_or(0),
+            is_dir: self.is_dir.unwrap_or(false),
+            id: self.id.unwrap_or_default(),
+            hash,
+        })
+    }
+}
+
 fn parse_item(v: &Value) -> Option<Item> {
-    Some(Item {
-        path: v["Path"].as_str()?.to_string(),
-        size: v["Size"].as_i64().unwrap_or(0).max(0) as u64,
-        mtime: v["ModTime"].as_str().and_then(parse_time).unwrap_or(0),
-        is_dir: v["IsDir"].as_bool().unwrap_or(false),
-        id: v["ID"].as_str().unwrap_or("").to_string(),
-    })
+    serde_json::from_value::<Entry>(v.clone()).ok()?.into_item()
 }
 
 /// RFC 3339 (`2026-11-11T15:10:08.123456789Z`, `...+02:00`) to epoch milliseconds.
@@ -365,12 +819,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quota_reads_used_and_an_optional_total() {
+        assert_eq!(quota(&json!({"used": 5, "free": 10, "total": 15})), Some((5, Some(15))));
+        assert_eq!(quota(&json!({"used": 5})), Some((5, None)));
+        assert_eq!(quota(&json!({"used": 5, "total": 0})), Some((5, None)));
+        assert_eq!(quota(&json!({})), None);
+    }
+
+    #[test]
+    fn old_rclone_is_refused() {
+        assert!(version_ok(&json!([1, 76, 0])));
+        assert!(version_ok(&json!([2, 0, 0])));
+        assert!(!version_ok(&json!([1, 75, 9])));
+        assert!(!version_ok(&json!(null)));
+    }
+
+    #[test]
     fn times_parse_with_fractions_and_offsets() {
         assert_eq!(parse_time("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_time("2026-11-11T15:10:08.123456789Z"), Some(1_794_409_808_123));
         assert_eq!(parse_time("2026-11-11T17:10:08+02:00"), Some(1_794_409_808_000));
         assert_eq!(parse_time("2024-02-29T00:00:00Z"), Some(1_709_164_800_000));
         assert_eq!(parse_time("garbage"), None);
+    }
+
+    #[test]
+    fn listings_carry_the_trusted_hash_and_ignore_empty_ones() {
+        let item = |h: Value| parse_item(&json!({"Path": "a", "Size": 1, "Hashes": h})).unwrap().hash;
+        assert_eq!(
+            item(json!({"quickxor": "ABCD"})),
+            Some(("quickxor".into(), "abcd".into()))
+        );
+        // An empty value is "no hash"; the next type in the order is used.
+        assert_eq!(
+            item(json!({"md5": "", "dropbox": "ff"})),
+            Some(("dropbox".into(), "ff".into()))
+        );
+        assert_eq!(item(json!({})), None);
+        assert_eq!(parse_item(&json!({"Path": "a"})).unwrap().hash, None);
     }
 
     #[test]
@@ -386,15 +872,48 @@ mod tests {
         );
         assert_eq!(answer(&json!({"Name": "x", "Default": "abc"})), "abc");
         assert_eq!(answer(&json!({"Name": "x"})), "");
+        // A token that is already there is kept, whatever rclone's default says.
+        assert_eq!(
+            answer(&json!({"Name": "config_refresh_token", "Default": true})),
+            "false"
+        );
+    }
+
+    #[test]
+    fn the_mega_probe_carries_the_login_in_the_environment() {
+        let env = mega_probe_env(&json!({"type": "mega", "user": "me@example.com", "pass": "obscured"}));
+        assert!(env.contains(&("RCLONE_CONFIG_PROBE_USER", "me@example.com".to_string())));
+        assert!(env.contains(&("RCLONE_CONFIG_PROBE_PASS", "obscured".to_string())));
+        // No settings file: nothing of the user's is read or written.
+        assert!(env.contains(&("RCLONE_CONFIG", "/dev/null".to_string())));
+        // A missing password is an empty one, which MEGA refuses: never a skipped check.
+        assert!(mega_probe_env(&json!({"user": "x"})).contains(&("RCLONE_CONFIG_PROBE_PASS", String::new())));
+    }
+
+    #[test]
+    fn a_remote_is_copied_without_its_type() {
+        let cfg = json!({"type": "drive", "token": "{\"a\":1}", "client_id": "id", "drive_id": "d", "n": 3});
+        assert_eq!(
+            copy_params(&cfg),
+            json!({"token": "{\"a\":1}", "client_id": "id", "drive_id": "d"})
+        );
+        assert_eq!(copy_params(&Value::Null), json!({}));
     }
 
     #[test]
     fn login_params_add_the_own_client_and_skip_google_docs() {
-        assert_eq!(login_params("drive", None), json!({"skip_gdocs": "true"}));
-        assert_eq!(login_params("dropbox", None), json!({}));
+        // Without the build-time variables (the usual test run) nothing is added.
+        if embedded_client("drive").is_none() {
+            assert_eq!(
+                login_params("drive", None),
+                json!({"skip_gdocs": "true", "skip_shortcuts": "true"})
+            );
+            assert_eq!(login_params("dropbox", None), json!({}));
+        }
+        assert!(embedded_client("mega").is_none());
         assert_eq!(
             login_params("drive", Some(("id", "sec"))),
-            json!({"skip_gdocs": "true", "client_id": "id", "client_secret": "sec"})
+            json!({"skip_gdocs": "true", "skip_shortcuts": "true", "client_id": "id", "client_secret": "sec"})
         );
         assert_eq!(
             login_params("onedrive", Some(("id", "sec"))),
@@ -407,6 +926,15 @@ mod tests {
         assert_eq!(base64(b"fastsync:x"), "ZmFzdHN5bmM6eA==");
         assert_eq!(base64(b"ab"), "YWI=");
         assert_eq!(base64(b"abc"), "YWJj");
+    }
+
+    #[test]
+    fn a_listing_that_does_not_parse_is_an_error_not_a_shorter_list() {
+        let parse = |s: &str| serde_json::from_str::<Listing>(s).map(|l| l.list.len());
+        assert_eq!(parse(r#"{"list": []}"#).unwrap(), 0, "an empty cloud says so");
+        assert_eq!(parse(r#"{"list": [{"Path": "a", "Size": 1}]}"#).unwrap(), 1);
+        assert!(parse("{}").is_err(), "no `list` is not an empty cloud");
+        assert!(parse(r#"{"list": [{"Path": "a", "Size": "x"}]}"#).is_err());
     }
 
     #[test]

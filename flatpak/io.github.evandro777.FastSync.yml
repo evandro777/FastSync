@@ -19,6 +19,7 @@ finish-args:
   - --socket=fallback-x11
   - --filesystem=home
   - --talk-name=org.kde.StatusNotifierWatcher
+  - --talk-name=org.freedesktop.Notifications
 
 modules:
   # The official static rclone build: the transport and login layer. Checksums from
@@ -46,7 +47,7 @@ modules:
       env:
         CARGO_HOME: /run/build/fastsync/cargo
     build-commands:
-      - cargo build --release --offline --locked
+      - set -a; . ./flatpak/embedded.env; set +a; cargo build --release --offline --locked
       - install -Dm755 target/release/fastsync ${FLATPAK_DEST}/bin/fastsync
       - install -Dm644 packaging/io.github.evandro777.FastSync.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
       - install -Dm644 packaging/io.github.evandro777.FastSync.metainfo.xml ${FLATPAK_DEST}/share/metainfo/${FLATPAK_ID}.metainfo.xml
