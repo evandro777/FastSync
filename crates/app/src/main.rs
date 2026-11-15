@@ -23,6 +23,7 @@ mod fixtures;
 mod instance;
 mod nemo;
 mod notify;
+mod portal;
 mod tray;
 
 use tray::Overall;
@@ -215,12 +216,24 @@ fn row_state(acct: &Account, st: Option<&Status>) -> (i32, String, (i32, i32)) {
     }
 }
 
-/// (kind 0-3, file name, done, total, speed text) of a running sync; all empty when nothing is planned yet.
+/// (kind 0-6, file name, done, total, speed text) of a running sync; all empty when nothing is planned yet. Kinds 1-3
+/// are transfers; 4 listing the cloud (done/total = top-level folders), 5 reading the local folder, 6 comparing
+/// (done/total = files): those carry no file, and the "speed" is the elapsed time as `m:ss`.
 fn live(st: Option<&Status>) -> (i32, String, i32, i32, String) {
-    use fastsync_core::engine::Kind;
+    use fastsync_core::engine::{Kind, Phase};
     let Some(Status::Syncing(p, speed)) = st else {
         return Default::default();
     };
+    let phase = match p.phase {
+        Phase::Transfer => None,
+        Phase::ListCloud => Some(4),
+        Phase::ScanLocal => Some(5),
+        Phase::Compare => Some(6),
+    };
+    if let Some(kind) = phase {
+        let clock = format!("{}:{:02}", p.secs / 60, p.secs % 60);
+        return (kind, String::new(), p.done as i32, p.total as i32, clock);
+    }
     if p.total == 0 {
         return Default::default();
     }
@@ -1671,6 +1684,19 @@ fn main() {
     });
     ui.on_open_website(|| xdg_open(env!("CARGO_PKG_REPOSITORY").into()));
     ui.on_open_help(|| xdg_open(HELP_URL.into()));
+    ui.on_add_pick_folder({
+        let weak = ui.as_weak();
+        move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let title = ui.global::<Tr>().invoke_pick_folder_title().to_string();
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                if let Some(p) = portal::pick_folder(&title) {
+                    let _ = weak.upgrade_in_event_loop(move |ui| ui.set_add_local(p.to_string_lossy().as_ref().into()));
+                }
+            });
+        }
+    });
     // Opens a dialog directly, for the same script.
     #[cfg(debug_assertions)]
     match std::env::var("FASTSYNC_PAGE").as_deref() {

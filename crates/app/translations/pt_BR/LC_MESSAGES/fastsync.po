@@ -328,6 +328,22 @@ msgid "Checking for changes…"
 msgstr "Verificando alterações…"
 
 msgctxt "AccountCard"
+msgid "Listing cloud folders: {} of {}"
+msgstr "Listando pastas na nuvem: {} de {}"
+
+msgctxt "AccountCard"
+msgid "Listing cloud files…"
+msgstr "Listando arquivos na nuvem…"
+
+msgctxt "AccountCard"
+msgid "Reading the local folder…"
+msgstr "Lendo a pasta local…"
+
+msgctxt "AccountCard"
+msgid "Comparing files: {} of {}"
+msgstr "Comparando arquivos: {} de {}"
+
+msgctxt "AccountCard"
 msgid "{} of {}"
 msgstr "{} de {}"
 
@@ -450,6 +466,14 @@ msgstr "Pasta local"
 msgctxt "AddDialog"
 msgid "Edit account"
 msgstr "Editar conta"
+
+msgctxt "AddDialog"
+msgid "Browse…"
+msgstr "Procurar…"
+
+msgctxt "Tr"
+msgid "Choose the local folder"
+msgstr "Escolha a pasta local"
 
 msgctxt "AddDialog"
 msgid "Download only (mirror the cloud)"

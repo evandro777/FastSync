@@ -17,7 +17,7 @@ use crate::{
     accounts::{Account, account_dir},
     db::Db,
     delta::{self, Change, Poll},
-    engine::{Engine, Progress, Report, ignored},
+    engine::{Engine, Phase, Progress, Report, ignored},
     ignore::{RULES, Rules},
     rclone::{Rclone, RcloneRemote, exclude_rules, now_secs},
 };
@@ -604,7 +604,7 @@ fn syncing() -> Status {
 /// While a run works: once a second, tell the UI which file is moving and how fast. Silent when nothing changed
 /// (and while the run has not planned anything yet), so an idle account costs no rclone calls.
 fn ticker(rc: &Rclone, group: &str, progress: &Mutex<Progress>, on_status: &dyn Fn(Status), over: &AtomicBool) {
-    let mut last = None;
+    let (mut last, start) = (None, std::time::Instant::now());
     while !over.load(Ordering::Relaxed) {
         // Short naps, so a finished run is not held up for a whole second.
         for _ in 0..10 {
@@ -613,11 +613,17 @@ fn ticker(rc: &Rclone, group: &str, progress: &Mutex<Progress>, on_status: &dyn 
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        let p = progress.lock().map(|g| g.clone()).unwrap_or_default();
-        if p.total == 0 {
+        let mut p = progress.lock().map(|g| g.clone()).unwrap_or_default();
+        if p.total == 0 && p.phase == Phase::Transfer {
             continue;
         }
-        let speed = rc.speed(group).unwrap_or(0.0);
+        // Listing and comparing move no bytes: the clock is what shows the card is alive, and no rclone call is needed.
+        let speed = if p.phase == Phase::Transfer {
+            rc.speed(group).unwrap_or(0.0)
+        } else {
+            p.secs = start.elapsed().as_secs();
+            0.0
+        };
         let now = Some((p.clone(), speed));
         if now != last {
             on_status(Status::Syncing(p, speed));

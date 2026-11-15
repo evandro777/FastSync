@@ -10,6 +10,7 @@ export global Tr {
     public pure function tray-pause() -> string { return @tr("Pause syncing"); }
     public pure function tray-resume() -> string { return @tr("Resume syncing"); }
     public pure function tray-quit() -> string { return @tr("Quit"); }
+    public pure function pick-folder-title() -> string { return @tr("Choose the local folder"); }
     public pure function tray-idle() -> string { return @tr("Everything is up to date"); }
     public pure function tray-syncing() -> string { return @tr("Syncing…"); }
     public pure function tray-paused() -> string { return @tr("Paused"); }
@@ -70,6 +71,8 @@ export struct AccountRow {
     download-only: bool,
     // For state 1 once a run has a plan: `transfer` 0 none, 1 upload, 2 download, 3 removal; `file` is the name
     // being handled, `done` of `total` files are finished and `speed` reads like "2.4 MB/s" ("" = unknown).
+    // Before the plan: 4 listing the cloud (`done` of `total` folders), 5 reading the local folder, 6 comparing
+    // (`done` of `total` files); `speed` is then the elapsed time, "4:12".
     transfer: int,
     file: string,
     done: int,
@@ -437,6 +440,7 @@ component AddDialog inherits Dialog {
     in-out property <bool> relogin;
     callback submit();
     callback open-help();
+    callback pick-folder();
 
     Text {
         text: root.edit-id == "" ? @tr("Add account") : @tr("Edit account");
@@ -471,7 +475,11 @@ component AddDialog inherits Dialog {
         VerticalLayout {
             spacing: Family.gap-s;
             Text { text: @tr("Local folder"); color: Family.muted; font-size: Family.caption; }
-            LineEdit { text <=> root.local; enabled: !root.busy; }
+            HorizontalLayout {
+                spacing: Family.gap-s;
+                LineEdit { text <=> root.local; enabled: !root.busy; horizontal-stretch: 1; }
+                Button { text: @tr("Browse…"); enabled: !root.busy; clicked => { root.pick-folder(); } }
+            }
         }
         // Its own group: glued to the field above it, the checkbox read as part of the folder input.
         VerticalLayout {
@@ -1031,7 +1039,7 @@ component AccountCard inherits Rectangle {
         }
         }
         // What is moving right now. Hidden until the run has a plan (a scan has nothing to name yet).
-        if root.acct.state == 1 && root.acct.total > 0: VerticalLayout {
+        if root.acct.state == 1 && root.acct.total > 0 && root.acct.transfer >= 1 && root.acct.transfer <= 3: VerticalLayout {
             spacing: Family.gap-s;
             HorizontalLayout {
                 spacing: Family.gap-m;
@@ -1056,10 +1064,30 @@ component AccountCard inherits Rectangle {
         }
         // A run that has not planned anything yet is listing the cloud and walking the folder. Saying so tells a slow
         // listing (a big or throttled cloud) apart from a sync that never started.
-        if root.acct.state == 1 && root.acct.total == 0: Text {
+        if root.acct.state == 1 && root.acct.transfer == 0: Text {
             text: @tr("Checking for changes…");
             color: Family.muted;
             font-size: Family.caption;
+        }
+        // The first sync of a big cloud spends minutes here: which step it is on, how far, and a clock that proves
+        // the card is not frozen. The listing and the comparison have a count, the local walk has none.
+        if root.acct.state == 1 && root.acct.transfer >= 4: VerticalLayout {
+            spacing: Family.gap-s;
+            HorizontalLayout {
+                spacing: Family.gap-m;
+                Text {
+                    text: root.acct.transfer == 4 ? (root.acct.total > 0 ? @tr("Listing cloud folders: {} of {}", root.acct.done, root.acct.total) : @tr("Listing cloud files…"))
+                        : root.acct.transfer == 5 ? @tr("Reading the local folder…")
+                        : @tr("Comparing files: {} of {}", root.acct.done, root.acct.total);
+                    color: Family.muted;
+                    font-size: Family.caption;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    min-width: 0px;
+                }
+                Text { text: root.acct.speed; color: Family.muted; font-size: Family.caption; }
+            }
+            if root.acct.total > 0 && root.acct.transfer != 5: ProgressBar { progress: root.acct.done / root.acct.total; }
         }
         // Under the row, so a long message gets the whole card width. The raw message can be selected and copied.
         if root.acct.state == 3: SelectableText {
@@ -1180,6 +1208,7 @@ export component Main inherits Window {
     callback folders-save();
     callback add-kind-changed(int);
     callback add-submit();
+    callback add-pick-folder();
     // Opens the guide to creating one's own OAuth client in the browser.
     callback open-help();
     callback add-cancel();
@@ -1346,6 +1375,7 @@ export component Main inherits Window {
         client-id <=> root.add-client-id;
         client-secret <=> root.add-client-secret;
         open-help => { root.open-help(); }
+        pick-folder => { root.add-pick-folder(); }
         submit => { root.add-submit(); }
         dismiss => {
             root.add-open = false;

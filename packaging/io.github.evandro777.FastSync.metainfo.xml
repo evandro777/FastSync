@@ -27,7 +27,7 @@
   <launchable type="desktop-id">io.github.evandro777.FastSync.desktop</launchable>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="0.2.0" date="2026-11-15">
+    <release version="0.2.1" date="2026-11-15">
       <description>
         <p>First release.</p>
         <ul>
@@ -36,6 +36,7 @@
           <li>A run that would delete too many files stops and asks first; removed files go to a trash folder.</li>
           <li>Activity log, conflict notifications, storage use on each account card, ignore rules.</li>
           <li>Nemo menu to copy a share link or open a file on the web, and a status badge on the synced folder.</li>
+          <li>Loading bar when first time setup</li>
         </ul>
       </description>
     </release>

@@ -151,7 +151,18 @@ pub fn apply(ui: &Main, mode: usize) {
         ),
         // Syncing with no plan yet: the "Checking for changes…" line (below the fold of the 600x450 snapshot).
         row("OneDrive", "/home/user/OneDrive", 1, ""),
+        // The first sync of a big cloud: listing (folders done), reading the local folder, comparing (files done).
+        row("Dropbox", "/home/user/Big Dropbox", 1, ""),
+        row("MEGA", "/home/user/MEGA", 1, ""),
+        row("OneDrive", "/home/user/OneDrive Archive", 1, ""),
     ];
+    for (i, (kind, done, total, clock)) in [(4, 3, 12, "4:12"), (5, 0, 0, "0:41"), (6, 40000, 104000, "9:03")]
+        .into_iter()
+        .enumerate()
+    {
+        let r = &mut all[7 + i];
+        (r.transfer, r.done, r.total, r.speed) = (kind, done, total, clock.into());
+    }
     // The long path with the "Download only" suffix: the path must be the part that is cut.
     all[2].download_only = true;
     all[4].download_only = true;
@@ -163,7 +174,7 @@ pub fn apply(ui: &Main, mode: usize) {
         12,
         "2.4 MB/s".into(),
     );
-    let count = [0, 1, 7][mode];
+    let count = [0, 1, 10][mode];
     ui.set_accounts(ModelRc::new(VecModel::from(all[..count].to_vec())));
     // The add dialog: plain when empty, "waiting for the browser" with one row, a long error with many.
     ui.set_add_busy(mode == 1);

@@ -7,7 +7,10 @@ use std::{
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering::Relaxed},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering::Relaxed},
+    },
 };
 
 use crate::{
@@ -23,6 +26,11 @@ pub type Result<T> = std::result::Result<T, String>;
 pub trait Remote: Send + Sync {
     /// Every file and folder, recursively.
     fn list(&self) -> Result<Vec<Item>>;
+    /// `list`, telling `on_progress(folders done, folders total)` as it goes. A remote that cannot split its listing
+    /// just lists, and the card then shows the phase without a count.
+    fn list_progress(&self, _on_progress: &(dyn Fn(usize, usize) + Sync)) -> Result<Vec<Item>> {
+        self.list()
+    }
     /// The files and folders directly in `rel` (`""` = the root), paths from the root: one request for many files.
     /// The default errors, which makes the engine ask for each file with `stat` instead.
     fn list_dir(&self, _rel: &str) -> Result<Vec<Item>> {
@@ -76,13 +84,33 @@ pub enum Kind {
     Remove,
 }
 
-/// Where a run is: the file being handled now and how many of the planned ones are done. `total == 0` = not running.
+/// What a run is doing before and between transfers. A big first sync spends minutes outside `Transfer`, and the card
+/// used to say only "Checking for changes…" for all of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Phase {
+    /// Moving files (or idle when `total == 0`).
+    #[default]
+    Transfer,
+    /// Listing the cloud: `done` of `total` top-level folders.
+    ListCloud,
+    /// Walking the local folder (no count).
+    ScanLocal,
+    /// Comparing both sides: `done` of `total` files.
+    Compare,
+}
+
+/// Where a run is: the file being handled now and how many of the planned ones are done. `total == 0` and `phase ==
+/// Transfer` = not running.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Progress {
     pub done: usize,
     pub total: usize,
     pub kind: Kind,
     pub path: String,
+    pub phase: Phase,
+    /// Seconds since the run started, filled in by the runner's ticker outside `Transfer` so the card keeps moving
+    /// while one slow call (a huge folder's listing) reports nothing.
+    pub secs: u64,
 }
 
 struct Work {
@@ -475,9 +503,21 @@ impl<R: Remote> Engine<R> {
     /// without a delta API.
     pub fn full_scan(&mut self) -> Report {
         self.remote.forget_cache();
-        let items = match self.remote.list() {
+        let phase = |phase, done, total| {
+            if let Ok(mut g) = self.progress.lock() {
+                *g = Progress {
+                    done,
+                    total,
+                    phase,
+                    ..Default::default()
+                };
+            }
+        };
+        phase(Phase::ListCloud, 0, 0);
+        let items = match self.remote.list_progress(&|d, t| phase(Phase::ListCloud, d, t)) {
             Ok(i) => i,
             Err(e) => {
+                self.set_progress(Progress::default());
                 self.db
                     .log("error", "", None, &format!("listing the cloud failed: {e}"));
                 return Report {
@@ -486,6 +526,7 @@ impl<R: Remote> Engine<R> {
                 };
             }
         };
+        phase(Phase::ScanLocal, 0, 0);
         let mut report = Report::default();
         self.drop_excluded(&mut report);
         let dirs: Vec<(String, String)> = items
@@ -791,6 +832,53 @@ impl<R: Remote> Engine<R> {
         }
     }
 
+    /// Two different stamps do not make two different files: an upload the app was closed during, or a file put in
+    /// the cloud by another tool (or a folder that already holds the same files, like a first sync onto an existing
+    /// copy), would otherwise be split into a conflict copy of itself. A `Conflict` of equal sizes whose bytes the
+    /// service's hash proves equal becomes `Adopt`. Each check reads a whole local file, so they run `PARALLEL` at a
+    /// time (and show their count).
+    fn adopt_identical(&self, plan: &mut [Planned]) {
+        let todo: Vec<usize> = (0..plan.len())
+            .filter(|&i| {
+                let (w, a, _) = &plan[i];
+                *a == Action::Conflict && matches!((w.local, &w.remote), (Some(l), Some(r)) if l.size == r.size)
+            })
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+        let (next, finished) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let same = Mutex::new(Vec::new());
+        // Plain references, not `self`: the engine holds the SQLite connection, which must stay on this thread.
+        let (remote, root, progress) = (&self.remote, &self.root, &self.progress);
+        let (view, total) = (&*plan, todo.len());
+        std::thread::scope(|s| {
+            for _ in 0..PARALLEL.min(total) {
+                s.spawn(|| {
+                    while let Some(&i) = todo.get(next.fetch_add(1, Relaxed)) {
+                        let (w, ..) = &view[i];
+                        if w.remote.as_ref().is_some_and(|r| remote.same_content(root, &w.path, r))
+                            && let Ok(mut v) = same.lock()
+                        {
+                            v.push(i);
+                        }
+                        if let Ok(mut g) = progress.lock() {
+                            *g = Progress {
+                                done: finished.fetch_add(1, Relaxed) + 1,
+                                total,
+                                phase: Phase::Compare,
+                                ..Default::default()
+                            };
+                        }
+                    }
+                });
+            }
+        });
+        for i in same.into_inner().unwrap_or_default() {
+            plan[i].1 = Action::Adopt;
+        }
+    }
+
     fn run(&mut self, mut work: VecDeque<Work>, mut report: Report) -> Report {
         let mut plan = Vec::new();
         // A mirror trashes local-only files, and a new account has no DB rows to measure the guard against: count
@@ -801,7 +889,15 @@ impl<R: Remote> Engine<R> {
             0
         };
         let (paths, cloud_seen) = (work.len(), work.iter().filter(|w| w.remote.is_some()).count());
-        for w in work.drain(..) {
+        for (n, w) in work.drain(..).enumerate() {
+            if n % 256 == 0 {
+                self.set_progress(Progress {
+                    done: n,
+                    total: paths,
+                    phase: Phase::Compare,
+                    ..Default::default()
+                });
+            }
             let base = match self.db.base(&w.path) {
                 Ok(b) => b,
                 Err(e) => {
@@ -823,14 +919,7 @@ impl<R: Remote> Engine<R> {
             } else {
                 decide(w.local, remote, base)
             };
-            // Two different stamps do not make two different files: an upload the app was closed during, or a file
-            // put in the cloud by another tool, would otherwise be split into a conflict copy of itself.
-            let identical = action == Action::Conflict
-                && matches!((w.local, &w.remote), (Some(l), Some(r)) if l.size == r.size)
-                && w.remote
-                    .as_ref()
-                    .is_some_and(|r| self.remote.same_content(&self.root, &w.path, r));
-            let action = if identical { Action::Adopt } else { action };
+            // (Same size, other stamp: `same_content` below, after the loop, so the hashing runs in parallel.)
             // Quitting mid-upload leaves an empty item in the cloud (OneDrive lists it, its website hides it). An
             // empty cloud file holds nothing to lose, so the local file goes up instead of being renamed away and
             // replaced by the empty one. Never in a mirror: there the cloud is the truth.
@@ -855,6 +944,7 @@ impl<R: Remote> Engine<R> {
                 plan.push((w, action, base));
             }
         }
+        self.adopt_identical(&mut plan);
         // Before the guard: a rename is not a delete, whatever the folder's size.
         let mut plan = self.pair_moves(plan);
         self.pair_copies(&mut plan);
@@ -867,6 +957,7 @@ impl<R: Remote> Engine<R> {
             Ok(n) => n.max(local_files),
             Err(e) => {
                 report.errors.push(format!("state database: {e}"));
+                self.set_progress(Progress::default());
                 return report;
             }
         };
@@ -907,6 +998,7 @@ impl<R: Remote> Engine<R> {
             }
             self.db.log("stopped", "", None, &listed);
             report.aborted = Some((deletes, known, sample));
+            self.set_progress(Progress::default());
             return report;
         }
         let mut plan: VecDeque<_> = plan.into();
@@ -938,6 +1030,15 @@ impl<R: Remote> Engine<R> {
                     total,
                     kind,
                     path: w.path.clone(),
+                    ..Default::default()
+                });
+            } else if done % 256 == 0 {
+                // Adopting thousands of files already on disk names no file, but is not a frozen card either.
+                self.set_progress(Progress {
+                    done,
+                    total,
+                    phase: Phase::Compare,
+                    ..Default::default()
                 });
             }
             done += 1;
@@ -1017,6 +1118,7 @@ impl<R: Remote> Engine<R> {
                                     Kind::Down
                                 },
                                 path: w.path.clone(),
+                                ..Default::default()
                             };
                         }
                         let result = transfer(remote, root, download_only, &w, action);
@@ -1145,7 +1247,7 @@ fn sig_item(i: &Item) -> Sig {
 
 /// Uploads and downloads running at once. The cloud's per-call latency, not bandwidth, bounds a sync of many small
 /// files; four keeps well inside the providers' rate limits (rclone retries a 429 by itself).
-const PARALLEL: usize = 4;
+pub(crate) const PARALLEL: usize = 4;
 
 /// The refusals every action shares: nothing is read or written through a symlinked folder, and a mirror never
 /// changes the cloud.

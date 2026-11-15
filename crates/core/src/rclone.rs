@@ -506,6 +506,54 @@ impl crate::engine::Remote for RcloneRemote {
     fn list(&self) -> Result<Vec<Item>> {
         self.rc.list(&self.fs, "", &self.exclude, true)
     }
+    /// The root's own files and folders first, then every top-level folder as a recursive listing of its own, a few at
+    /// a time: one recursive call over a 100k-file Dropbox answers only at the very end (minutes, nothing to show),
+    /// and its pages are read one after the other. Any failed part fails the whole listing, as before: a shorter list
+    /// would read as "deleted in the cloud".
+    fn list_progress(&self, on_progress: &(dyn Fn(usize, usize) + Sync)) -> Result<Vec<Item>> {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let mut items = self.rc.list(&self.fs, "", &self.exclude, false)?;
+        let dirs: Vec<String> = items.iter().filter(|i| i.is_dir).map(|i| i.path.clone()).collect();
+        // Drive allows two root folders with one name, and a path reaches only one of them: the old single walk it is.
+        if dirs.iter().collect::<std::collections::HashSet<_>>().len() != dirs.len() {
+            return self.list();
+        }
+        on_progress(0, dirs.len());
+        let (next, done) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let parts = std::sync::Mutex::new(Vec::new());
+        let failed = std::sync::Mutex::new(None);
+        std::thread::scope(|s| {
+            for _ in 0..crate::engine::PARALLEL.min(dirs.len()) {
+                s.spawn(|| {
+                    while failed.lock().is_ok_and(|f| f.is_none()) {
+                        let Some(dir) = dirs.get(next.fetch_add(1, Relaxed)) else {
+                            break;
+                        };
+                        match self.rc.list(&self.fs, dir, &self.exclude, true) {
+                            Ok(v) => {
+                                if let Ok(mut p) = parts.lock() {
+                                    p.push(v);
+                                }
+                                on_progress(done.fetch_add(1, Relaxed) + 1, dirs.len());
+                            }
+                            Err(e) => {
+                                if let Ok(mut f) = failed.lock() {
+                                    f.get_or_insert(format!("{dir}: {e}"));
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(e) = failed.into_inner().map_err(|e| e.to_string())? {
+            return Err(e);
+        }
+        for p in parts.into_inner().map_err(|e| e.to_string())? {
+            items.extend(p);
+        }
+        Ok(items)
+    }
     fn list_dir(&self, rel: &str) -> Result<Vec<Item>> {
         self.rc.list(&self.fs, rel, &self.exclude, false)
     }

@@ -153,6 +153,47 @@ fn many_new_files_in_a_new_cloud_folder_upload_through_rclone() {
     let _ = fs::remove_dir_all(&base);
 }
 
+/// The listing split per top-level folder (parallel, with a count) is the same list as one recursive call: root
+/// files, nested folders and the excluded vault included, and it counts every top-level folder.
+#[test]
+fn a_listing_split_by_folder_equals_the_recursive_one() {
+    if !available() {
+        eprintln!("skipped: rclone not found");
+        return;
+    }
+    use fastsync_core::engine::Remote;
+    use std::sync::Mutex;
+    let base = std::env::temp_dir().join(format!("fastsync-rc-split-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let remote = base.join("remote");
+    fs::create_dir_all(&remote).unwrap();
+    fs::write(base.join("rclone.conf"), "").unwrap();
+    for (dir, files) in [("a", 3), ("b/deep/er", 2), ("c", 0), ("Personal Vault", 1)] {
+        fs::create_dir_all(remote.join(dir)).unwrap();
+        for i in 0..files {
+            fs::write(remote.join(dir).join(format!("f{i}.txt")), "x").unwrap();
+        }
+    }
+    fs::write(remote.join("root.txt"), "r").unwrap();
+    let rc = Arc::new(Rclone::start(&base.join("rclone.conf")).expect("rclone rcd starts"));
+    let r = RcloneRemote {
+        rc,
+        fs: remote.to_string_lossy().to_string(),
+        exclude: fastsync_core::rclone::exclusions("onedrive"),
+    };
+    let seen = Mutex::new(Vec::new());
+    let mut split = r.list_progress(&|d, t| seen.lock().unwrap().push((d, t))).unwrap();
+    let mut whole = r.list().unwrap();
+    split.sort_by(|a, b| a.path.cmp(&b.path));
+    whole.sort_by(|a, b| a.path.cmp(&b.path));
+    assert_eq!(split, whole);
+    assert!(split.iter().any(|i| i.path == "b/deep/er/f1.txt") && split.iter().all(|i| !i.path.contains("Vault")));
+    let seen = seen.into_inner().unwrap();
+    assert_eq!(seen.first(), Some(&(0, 3)), "{seen:?}");
+    assert_eq!(seen.last(), Some(&(3, 3)), "{seen:?}");
+    let _ = fs::remove_dir_all(&base);
+}
+
 /// A Drive login made before shortcuts were skipped gets the setting added, with its token and client kept; a login
 /// that has it, or is not Drive, is left alone. No network: the token is a made-up one and nothing is listed.
 #[test]
