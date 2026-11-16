@@ -96,6 +96,80 @@ pub fn conflict_name(path: &str, date: &str, n: u32) -> String {
     if dir.is_empty() { name } else { format!("{dir}/{name}") }
 }
 
+/// `myfile.txt` -> `myfile (Case Conflict).txt`, the name Dropbox's own client gives the second of two files whose
+/// names differ only by case; `n > 1` adds a counter.
+pub fn case_conflict_name(path: &str, n: u32) -> String {
+    let (dir, file) = path.rsplit_once('/').map_or(("", path), |(d, f)| (d, f));
+    let (stem, ext) = match file.rfind('.') {
+        Some(i) if i > 0 => file.split_at(i),
+        _ => (file, ""),
+    };
+    let name = if n > 1 {
+        format!("{stem} (Case Conflict {n}){ext}")
+    } else {
+        format!("{stem} (Case Conflict){ext}")
+    };
+    if dir.is_empty() { name } else { format!("{dir}/{name}") }
+}
+
+/// What one name of a group that differs only by case looks like to the engine.
+#[derive(Clone, Debug)]
+pub struct CaseFact {
+    pub path: String,
+    /// A file with exactly this name is on disk.
+    pub local: bool,
+    /// The DB has a row for exactly this name: we synced it.
+    pub row: bool,
+    /// The cloud holds a file with exactly this name.
+    pub cloud: bool,
+    /// Modified time of the local file (to keep the oldest when none was ever synced).
+    pub mtime: i64,
+}
+
+/// What to do with such a group, decided from the facts alone.
+#[derive(Debug, Default, PartialEq)]
+pub struct CaseResolution {
+    /// `(old, new)`: the file was renamed here by changing case only (`MyFile.txt` -> `myfile.txt`). Both names go
+    /// through the normal plan and pair as a move; a case-insensitive cloud would otherwise take the new name for the
+    /// old file and the old name for a delete of it.
+    pub rename: Vec<(String, String)>,
+    /// Local files nobody synced yet that must be renamed to a `Case Conflict` name, as Dropbox's client does, so both
+    /// files exist in the cloud under names it can tell apart.
+    pub movers: Vec<String>,
+    /// Names left alone (shown as a problem): there is nothing safe to do with them.
+    pub skip: Vec<String>,
+}
+
+pub fn resolve_case_group(group: &[CaseFact]) -> CaseResolution {
+    let mut out = CaseResolution::default();
+    let unsynced = |f: &CaseFact| f.local && !f.row && !f.cloud;
+    if let [a, b] = group {
+        for (old, new) in [(a, b), (b, a)] {
+            if old.row && !old.local && unsynced(new) {
+                out.rename.push((old.path.clone(), new.path.clone()));
+                return out;
+            }
+        }
+    }
+    let mut movers: Vec<&CaseFact> = group.iter().filter(|f| unsynced(f)).collect();
+    let others = group.len() - movers.len();
+    if movers.is_empty() {
+        out.skip = group.iter().map(|f| f.path.clone()).collect();
+        return out;
+    }
+    // Nothing of them was ever synced: the oldest keeps its name, the rest get the conflict name.
+    if others == 0 {
+        movers.sort_by(|a, b| (a.mtime, &a.path).cmp(&(b.mtime, &b.path)));
+        movers.remove(0);
+    }
+    out.movers = movers.iter().map(|f| f.path.clone()).collect();
+    // Two names that were both synced before (a service that allows it): which one is "the" file is not ours to say.
+    if others >= 2 {
+        out.skip = group.iter().filter(|f| !unsynced(f)).map(|f| f.path.clone()).collect();
+    }
+    out
+}
+
 /// Download-only (mirror) accounts: the cloud is the truth and is never written. A local edit or a local-only file
 /// loses (`Conflict` there means: local copy to the trash, then download); `Upload` and `DeleteRemote` never come out.
 pub fn decide_down(local: Option<Sig>, remote: Option<Sig>, base: Option<Base>) -> Action {
@@ -287,6 +361,84 @@ mod tests {
         assert!(!delete_guard_ok(51, 100, 50));
         assert!(!delete_guard_ok(100, 100, 50));
         assert!(delete_guard_ok(0, 1000, 50));
+    }
+
+    fn fact(path: &str, local: bool, row: bool, cloud: bool, mtime: i64) -> CaseFact {
+        CaseFact {
+            path: path.into(),
+            local,
+            row,
+            cloud,
+            mtime,
+        }
+    }
+
+    #[test]
+    fn case_conflict_names_follow_dropbox() {
+        assert_eq!(case_conflict_name("myfile.txt", 1), "myfile (Case Conflict).txt");
+        assert_eq!(
+            case_conflict_name("d/e/myfile.txt", 2),
+            "d/e/myfile (Case Conflict 2).txt"
+        );
+        assert_eq!(case_conflict_name(".bashrc", 1), ".bashrc (Case Conflict)");
+        assert_eq!(case_conflict_name("a.tar.gz", 1), "a.tar (Case Conflict).gz");
+    }
+
+    #[test]
+    fn a_case_only_rename_is_a_rename_and_never_a_conflict() {
+        // MyFile.txt synced, gone here; myfile.txt new here.
+        let g = [
+            fact("MyFile.txt", false, true, true, 0),
+            fact("myfile.txt", true, false, false, 5),
+        ];
+        let r = resolve_case_group(&g);
+        assert_eq!(r.rename, [("MyFile.txt".to_string(), "myfile.txt".to_string())]);
+        assert!(r.movers.is_empty() && r.skip.is_empty());
+        // The same either way round.
+        let g = [g[1].clone(), g[0].clone()];
+        assert_eq!(resolve_case_group(&g).rename.len(), 1);
+    }
+
+    #[test]
+    fn a_second_file_differing_only_by_case_is_renamed_as_a_case_conflict() {
+        // MyFile.txt synced and still here; myfile.txt created next to it.
+        let g = [
+            fact("MyFile.txt", true, true, true, 0),
+            fact("myfile.txt", true, false, false, 9),
+        ];
+        let r = resolve_case_group(&g);
+        assert_eq!(
+            (r.movers, r.skip, r.rename.len()),
+            (vec!["myfile.txt".to_string()], vec![], 0)
+        );
+        // The first one only in the cloud (not downloaded yet): same.
+        let g = [
+            fact("Report.txt", false, false, true, 0),
+            fact("report.txt", true, false, false, 9),
+        ];
+        assert_eq!(resolve_case_group(&g).movers, ["report.txt"]);
+    }
+
+    #[test]
+    fn two_new_files_keep_the_oldest_name_and_two_synced_ones_are_left_alone() {
+        let g = [
+            fact("A.txt", true, false, false, 50),
+            fact("a.txt", true, false, false, 10),
+        ];
+        let r = resolve_case_group(&g);
+        assert_eq!(r.movers, ["A.txt"], "the older a.txt keeps its name");
+        // Both synced before (Drive allows it): nothing safe to do, a third new one is still renamed.
+        let g = [
+            fact("A.txt", true, true, true, 0),
+            fact("a.txt", true, true, true, 0),
+            fact("a.TXT", true, false, false, 7),
+        ];
+        let r = resolve_case_group(&g);
+        assert_eq!(r.movers, ["a.TXT"]);
+        assert_eq!(r.skip, ["A.txt", "a.txt"]);
+        // Nothing new at all: skipped, as before.
+        let g = [fact("A.txt", true, true, true, 0), fact("a.txt", true, true, true, 0)];
+        assert_eq!(resolve_case_group(&g).skip.len(), 2);
     }
 
     #[test]

@@ -200,6 +200,9 @@ impl Rclone {
         limit: Option<Duration>,
     ) -> Result<ureq::http::Response<ureq::Body>> {
         let seen = self.restarts.load(std::sync::atomic::Ordering::Relaxed);
+        // shortcut: after a crash the old port is reused without checking who holds it, so another local process that
+        // grabbed it in between would see this one request (`wait_ready` checks the pid only afterwards). Needs a
+        // crash plus a hostile local user; upgrade by asking rclone for its own port (`--rc-addr :0`) if that matters.
         let first = self.post(method, body, limit);
         // A failed call with a dead rclone behind it: start it again and ask once more. The caller's own retry
         // logic still sees an error when that fails too.
@@ -323,6 +326,24 @@ impl Rclone {
         self.call(
             "operations/movefile",
             json!({"srcFs": fs, "srcRemote": src, "dstFs": fs, "dstRemote": dst}),
+        )
+        .map(drop)
+    }
+
+    /// Renames the folder `src` to `dst` inside one remote (`sync/move` of one folder onto another): rclone uses the
+    /// service's own folder move when it has one, else moves the files server-side one by one.
+    pub fn movedir(&self, fs: &str, src: &str, dst: &str) -> Result<()> {
+        // `fs` is `<id>:` for a login, a plain path for rclone's local backend (the tests).
+        let at = |p: &str| {
+            if fs.ends_with([':', '/']) {
+                format!("{fs}{p}")
+            } else {
+                format!("{fs}/{p}")
+            }
+        };
+        self.call(
+            "sync/move",
+            json!({"srcFs": at(src), "dstFs": at(dst), "deleteEmptySrcDirs": true}),
         )
         .map(drop)
     }
@@ -775,6 +796,27 @@ impl crate::engine::Remote for RcloneRemote {
             (r, _) => r,
         }
     }
+    fn list_under(&self, dir: &str) -> Result<Vec<Item>> {
+        self.rc.list(&self.fs, dir, &[], true)
+    }
+    fn move_dir(&self, from: &str, to: &str) -> Result<()> {
+        self.rc.movedir(&self.fs, from, to)
+    }
+    fn copy(&self, from: &str, to: &str) -> Result<()> {
+        // Inside one remote rclone asks the service to copy (Dropbox, Drive, OneDrive): no bytes cross the network.
+        // OneDrive does not create the target folder (see `upload`).
+        let go = || self.rc.copyfile(self.group(), &self.fs, from, &self.fs, to);
+        match (go(), to.rsplit_once('/')) {
+            (Err(e), Some((dir, _))) if e.contains("directory not found") => {
+                self.rc.mkdir(&self.fs, dir)?;
+                go()
+            }
+            (r, _) => r,
+        }
+    }
+    fn local_hash(&self, local_root: &Path, rel: &str, kind: &str) -> Result<Option<String>> {
+        self.rc.local_hash(&local_root.to_string_lossy(), rel, kind)
+    }
     fn same_content(&self, local_root: &Path, rel: &str, remote: &Item) -> bool {
         self.compare(local_root, rel, remote).unwrap_or(false)
     }
@@ -1012,7 +1054,7 @@ pub fn parse_time(s: &str) -> Option<i64> {
     Some(((days * 86_400 + h * 3600 + mi * 60 + sec - offset) * 1000) + ms)
 }
 
-fn random_hex() -> String {
+pub(crate) fn random_hex() -> String {
     use std::io::Read;
     let mut b = [0u8; 16];
     // /dev/urandom always exists on Linux; a failure would leave a zero password, so stop instead.

@@ -210,6 +210,8 @@ fn row_state(acct: &Account, st: Option<&Status>) -> (i32, String, (i32, i32)) {
         Some(Status::Idle(_)) => (0, String::new(), (0, 0)),
         Some(Status::Paused) => (2, String::new(), (0, 0)),
         Some(Status::Error(e)) => (3, e.clone(), (0, 0)),
+        // The count rides in `deletes`, which only state 4 otherwise reads.
+        Some(Status::Problems(e, n)) => (3, e.clone(), (*n as i32, 0)),
         // The raw paths, not translated, like a problem's message.
         Some(Status::Stopped(d, k, paths)) => (4, paths.join("\n"), (*d as i32, *k as i32)),
         Some(Status::Syncing(..)) | None => (1, String::new(), (0, 0)),
@@ -1525,7 +1527,7 @@ fn main() {
                 s.login_gen
             };
             let acct = Account {
-                id: accounts::new_id(),
+                id: accounts::new_id(&state().accounts),
                 kind: kind.into(),
                 local,
                 download_only: ui.get_add_download_only(),

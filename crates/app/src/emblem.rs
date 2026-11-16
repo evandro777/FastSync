@@ -24,7 +24,7 @@ pub fn name(st: Option<&Status>) -> Option<&'static str> {
         Status::Idle(_) => "emblem-fastsync-idle",
         Status::Syncing(..) => "emblem-fastsync-syncing",
         Status::Paused => "emblem-fastsync-paused",
-        Status::Error(_) | Status::Stopped(..) => "emblem-fastsync-error",
+        Status::Error(_) | Status::Problems(..) | Status::Stopped(..) => "emblem-fastsync-error",
     })
 }
 

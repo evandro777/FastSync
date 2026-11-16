@@ -3,7 +3,7 @@
 //! the DB proves we synced it (a download-only mirror also trashes local-only files, behind the delete guard), a DB row is written only after its transfer succeeded, downloads land in a temp file
 //! and are renamed into place, and a run that would delete too much is stopped.
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -12,12 +12,14 @@ use std::{
 
 use crate::{
     db::Db,
-    decide::{Action, Base, Sig, case_collisions, conflict_name, decide, decide_down, delete_guard_ok},
+    decide::{Action, Base, MIN_FILES, Sig, conflict_name, decide, decide_down, delete_guard_ok},
     ignore::Rules,
     rclone::{Item, now_secs},
 };
 
+mod case;
 mod pair;
+use case::{CASE_TMP, CLASH_WHY, case_siblings, is_old_file, move_dir_by_case, rename_by_case, spelling_kept};
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -49,6 +51,26 @@ pub trait Remote: Send + Sync {
     /// Moves a cloud file server-side, without overwriting. On an error the engine uploads and deletes instead.
     fn rename(&self, _from: &str, _to: &str) -> Result<()> {
         Err("rename unsupported".into())
+    }
+    /// Every file and folder under the cloud folder `dir`, recursively and unfiltered (nothing ignored or excluded
+    /// is left out), paths from the root. The default errors, which keeps a folder rename file by file.
+    fn list_under(&self, _dir: &str) -> Result<Vec<Item>> {
+        Err("list_under unsupported".into())
+    }
+    /// Renames the cloud folder `from` to `to` as a whole, server-side. `to` does not exist. An error leaves the
+    /// engine moving the files one by one.
+    fn move_dir(&self, _from: &str, _to: &str) -> Result<()> {
+        Err("move_dir unsupported".into())
+    }
+    /// Copies a cloud file to a new name inside the cloud (no bytes cross the network). On an error the engine
+    /// uploads instead.
+    fn copy(&self, _from: &str, _to: &str) -> Result<()> {
+        Err("copy unsupported".into())
+    }
+    /// The `kind` hash of the local file `local_root/rel`; `None` when the service has none to compare with.
+    /// Asked once per file by `pair_uploads`, then compared with each candidate's cloud hash.
+    fn local_hash(&self, _local_root: &Path, _rel: &str, _kind: &str) -> Result<Option<String>> {
+        Ok(None)
     }
     /// Removes the cloud folder `rel` only if it is empty; an error (also "not empty") changes nothing.
     fn remove_empty_dir(&self, _rel: &str) -> Result<()> {
@@ -89,6 +111,41 @@ pub struct Report {
     /// Pause or Stop ended the run early: what is left was not looked at, so this is neither "up to date" nor a
     /// clean run (no feed cursor saved, nothing confirmed). The runner scans in full when it goes on.
     pub cancelled: bool,
+    /// Paths whose action failed (`fail`): the runner retries just these, not the whole cloud.
+    pub failed: Vec<String>,
+    /// The run did nothing and asks for a full scan instead (too many folders reported at once to list one by one).
+    pub wants_full: bool,
+    /// Paths left for later without an error: the file changed under the transfer (an editor saved it). The edit
+    /// already queued them; the runner keeps them too, in case that event was missed.
+    pub later: Vec<String>,
+    /// Errors about one path that retrying cannot change (a name clash) or that `fail` counted: `errors` holds all of
+    /// them, and whatever is not counted here is not about one path (a listing, the state DB).
+    pub(crate) accounted: usize,
+    /// How many of `errors` are `skip`s: states, not failures. A run with only these is still a clean comparison.
+    pub skipped: usize,
+}
+
+impl Report {
+    /// One action on `path` failed: on the card, and retried by itself (a stat and the transfer, no listing).
+    pub fn fail(&mut self, path: &str, why: &str) {
+        self.errors.push(format!("{path}: {why}"));
+        self.failed.push(path.to_string());
+        self.accounted += 1;
+    }
+
+    /// A state the path is in (two names that differ only by case) that retrying changes nothing about: on the card,
+    /// never retried. The next full scan looks again, as does any change to the files.
+    pub fn skip(&mut self, path: &str, why: &str) {
+        self.errors.push(format!("{path}: {why}"));
+        self.accounted += 1;
+        self.skipped += 1;
+    }
+
+    /// True when an error is not about one path (the cloud listing failed, the state DB): only a full scan retries it.
+    /// Anything pushed straight into `errors` counts as this, the safe default.
+    pub fn has_global_failure(&self) -> bool {
+        self.errors.len() > self.accounted
+    }
 }
 
 /// How many of the paths a stopped run would delete are named to the user (the card says "and N more").
@@ -158,8 +215,6 @@ pub struct Engine<R: Remote> {
     pub root: PathBuf,
     pub remote: R,
     pub db: Db,
-    /// Largest share (percent) of the known files one run may delete.
-    pub guard_percent: usize,
     /// The user accepted this many deletes (the count the card showed): the guard lets a run delete no more than that,
     /// whatever the share, so a card that sat for days cannot approve a bigger delete than it named.
     pub confirmed_deletes: Option<usize>,
@@ -177,6 +232,10 @@ pub struct Engine<R: Remote> {
     /// Set by Pause and Stop (from the UI thread) to end the run in progress: it finishes the transfers under way,
     /// starts no new one and returns `Report.cancelled`. The runner clears it before every run.
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// `(old, new, sig)`: new local files that must get a `Case Conflict` name. Planned with the new name (the plan
+    /// already counts the file there), renamed by `run` only after the delete guard and the cancel checks have passed,
+    /// so a stopped or cut-short run never leaves a user's file renamed.
+    case_renames: Vec<(String, String, Sig)>,
 }
 
 /// Editor and downloader leftovers, and the native clients' own state, that must never be synced. The native
@@ -255,6 +314,40 @@ fn local_sig(root: &Path, rel: &str) -> Option<Sig> {
     m.is_file().then(|| sig_of(&m))
 }
 
+/// More reported folders than this are not listed one by one: the run asks for a full scan instead.
+const FEED_DIRS_MAX: usize = 30;
+
+/// `Remote::list_under` for each folder, `PARALLEL` at a time, in the order given. A cancel stops before the next
+/// folder; the answers then miss folders, which only matters to a run that is being cancelled anyway.
+fn list_folders<R: Remote>(
+    remote: &R,
+    dirs: &[String],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Vec<(String, Result<Vec<Item>>)> {
+    let next = AtomicUsize::new(0);
+    let mut got: Vec<(usize, Result<Vec<Item>>)> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..PARALLEL.min(dirs.len()))
+            .map(|_| {
+                s.spawn(|| {
+                    let mut got = Vec::new();
+                    while !cancel.load(Relaxed) {
+                        let i = next.fetch_add(1, Relaxed);
+                        let Some(d) = dirs.get(i) else { break };
+                        got.push((i, remote.list_under(d)));
+                    }
+                    got
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    });
+    got.sort_by_key(|(i, _)| *i);
+    got.into_iter().map(|(i, r)| (dirs[i].clone(), r)).collect()
+}
+
 /// True when a folder on the way to `rel` (below `root`) is a symlink.
 fn under_symlink(root: &Path, rel: &str) -> bool {
     let mut p = root.to_path_buf();
@@ -321,12 +414,33 @@ fn lookup<R: Remote>(
                         && let Some(job) = jobs.get(next.fetch_add(1, Relaxed))
                     {
                         match job {
-                            Lookup::One(i) => got.push((*i, remote.stat(&paths[*i]))),
+                            Lookup::One(i) => {
+                                // A case-insensitive cloud answers for `Report.txt` when asked for `report.txt`: if it
+                                // says the name it holds, that is a clash, not the same file.
+                                let got_one = match remote.stat(&paths[*i]) {
+                                    Ok(Some(it))
+                                        if it.path != paths[*i]
+                                            && it.path.to_lowercase() == paths[*i].to_lowercase() =>
+                                    {
+                                        Err(CLASH_WHY.to_string())
+                                    }
+                                    other => other,
+                                };
+                                got.push((*i, got_one));
+                            }
                             Lookup::Dir { dir, idx } => match remote.list_dir(dir) {
                                 Ok(items) => {
                                     let mut by_path: HashMap<String, Item> =
                                         items.into_iter().map(|i| (i.path.clone(), i)).collect();
-                                    got.extend(idx.iter().map(|&i| (i, Ok(by_path.remove(&paths[i])))));
+                                    let lower: HashSet<String> = by_path.keys().map(|k| k.to_lowercase()).collect();
+                                    got.extend(idx.iter().map(|&i| match by_path.remove(&paths[i]) {
+                                        Some(it) => (i, Ok(Some(it))),
+                                        // Only another spelling of the name is there: the cloud treats it as one file.
+                                        None if lower.contains(&paths[i].to_lowercase()) => {
+                                            (i, Err(CLASH_WHY.to_string()))
+                                        }
+                                        None => (i, Ok(None)),
+                                    }));
                                 }
                                 // "Not found" must not by itself read as "everything in it is gone" (a glitch did once
                                 // for the root): the folder's own `stat` has to say it is gone too. One request
@@ -423,8 +537,9 @@ fn blocked(path: &str, bad: &[String]) -> bool {
         .any(|b| b.is_empty() || excluded(path, std::slice::from_ref(b)))
 }
 
+/// The local date, so an evening conflict is not named after tomorrow (UTC is only the fallback).
 fn today() -> String {
-    stamp(now_secs())[..10].to_string()
+    crate::db::local_date().unwrap_or_else(|| stamp(now_secs())[..10].to_string())
 }
 
 /// "2026-11-13 14:05:09" (UTC) for a unix time: the activity log's copyable text.
@@ -454,7 +569,6 @@ impl<R: Remote> Engine<R> {
             root,
             remote,
             db,
-            guard_percent: 50,
             confirmed_deletes: None,
             restore: false,
             excluded: Vec::new(),
@@ -462,6 +576,7 @@ impl<R: Remote> Engine<R> {
             download_only: false,
             progress: Default::default(),
             cancel: Default::default(),
+            case_renames: Vec::new(),
         }
     }
 
@@ -504,6 +619,7 @@ impl<R: Remote> Engine<R> {
     /// without a delta API.
     pub fn full_scan(&mut self) -> Report {
         crate::debug::log(|| "scan     full scan".into());
+        self.case_renames.clear();
         self.remote.forget_cache();
         let phase = |phase, done, total| {
             if let Ok(mut g) = self.progress.lock() {
@@ -578,44 +694,104 @@ impl<R: Remote> Engine<R> {
             );
         }
         let known: Vec<String> = self.db.all().unwrap_or_default().into_iter().map(|(p, _)| p).collect();
-        let paths: BTreeSet<&str> = local
-            .keys()
-            .chain(remote.keys())
-            .chain(known.iter())
-            .map(String::as_str)
-            .collect();
-        let clash = case_collisions(paths.iter().copied());
+        let mut local = local;
+        // Names that differ only by case: a rename by case alone is a rename, a second file gets its `Case Conflict`
+        // name, and what is neither is left alone (see `resolve_case_group`).
+        let settled = self.settle_case_clashes(
+            local
+                .keys()
+                .chain(remote.keys())
+                .chain(known.iter())
+                .map(String::as_str),
+            &|p| remote.contains_key(p),
+            &mut report,
+        );
+        // Planned under the new name; `run` renames the files once the delete guard and the cancel checks have passed.
+        for (old, new) in &settled.moved {
+            if let Some(s) = local.remove(old) {
+                local.insert(new.clone(), s);
+                self.case_renames.push((old.clone(), new.clone(), s));
+            }
+        }
+        // Owned names, so the cloud items can be moved out of `remote` into the work (a clone of every item doubled
+        // the memory of a scan of a big cloud).
+        let paths: BTreeSet<String> = local.keys().chain(remote.keys()).chain(known.iter()).cloned().collect();
+        drop(known);
+        // A new name that is the old one with other case has no cloud copy of its own, whatever the listing says.
+        let renamed_to: HashSet<&str> = settled.renames.iter().map(|(_, n)| n.as_str()).collect();
         let mut work = VecDeque::new();
         for p in paths {
-            if blocked(p, &bad) {
+            if blocked(&p, &bad) {
                 continue;
             }
-            if duplicate.contains(p) {
+            if duplicate.contains(&p) {
                 let why = "two cloud files have this name, skipped";
-                self.db.log("error", p, None, why);
-                report.errors.push(format!("{p}: {why}"));
+                self.db.log("error", &p, None, why);
+                report.skip(&p, why);
                 continue;
             }
-            if clash.contains(p) {
-                let why = "another file differs only by upper/lower case, skipped";
-                self.db.log("error", p, None, why);
-                report.errors.push(format!("{p}: {why}"));
+            if settled.skip.contains(&p) {
+                self.db.log("error", &p, None, CLASH_WHY);
+                report.skip(&p, CLASH_WHY);
                 continue;
             }
+            let cloud = remote.remove(&p);
             work.push_back(Work {
-                path: p.to_string(),
-                local: local.get(p).copied(),
-                remote: remote.get(p).cloned(),
+                local: local.get(&p).copied(),
+                remote: if renamed_to.contains(p.as_str()) { None } else { cloud },
+                path: p,
                 from: None,
             });
         }
         self.run(work, report)
     }
 
+    /// The folders among `dirs` that get a listing: the top ones only (copying a tree in makes the feed report every new
+    /// subfolder, and each listing is recursive), and not the ones that are unchecked, hidden by the rules, behind a
+    /// symlink or not a clean relative path. Compared with `ancestor/`, not by sorting: `a b` sorts between `a` and
+    /// `a/b`.
+    fn feed_dirs_to_list(&self, dirs: &[String]) -> Vec<String> {
+        let mut sorted: Vec<&String> = dirs.iter().collect();
+        sorted.sort();
+        let mut top: Vec<&String> = Vec::new();
+        for d in sorted {
+            if !top
+                .iter()
+                .any(|a| d.strip_prefix(a.as_str()).is_some_and(|r| r.starts_with('/')))
+            {
+                top.push(d);
+            }
+        }
+        top.into_iter()
+            .filter(|d| {
+                safe_rel(d)
+                    && !excluded(d, &self.excluded)
+                    && !under_symlink(&self.root, d)
+                    && !self.ignore.matches_dir(d)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Compares only these paths (from inotify or a remote delta). A folder expands to the files in it.
     pub fn sync_paths(&mut self, paths: &[String]) -> Report {
-        crate::debug::log(|| format!("scan     {} changed path(s)", paths.len()));
+        self.sync_paths_in(paths, &[])
+    }
+
+    /// `sync_paths`, also listing the cloud folders `dirs` (a new or moved folder whose contents the feed did not
+    /// report): one recursive request for each instead of a scan of the whole cloud. A folder that cannot be listed is
+    /// a global error, so the retry is a full scan and the feed's cursor is not saved.
+    pub fn sync_paths_in(&mut self, paths: &[String], dirs: &[String]) -> Report {
+        crate::debug::log(|| format!("scan     {} changed path(s), {} folder(s)", paths.len(), dirs.len()));
+        self.case_renames.clear();
         let mut report = Report::default();
+        let to_list = self.feed_dirs_to_list(dirs);
+        // Dozens of folders at once (an archive unpacked in the cloud) cost as many listings as the whole cloud has
+        // folders to read at all: one full scan does that with progress and in parallel. Nothing has been touched yet.
+        if to_list.len() > FEED_DIRS_MAX {
+            report.wants_full = true;
+            return report;
+        }
         let mut all = BTreeSet::new();
         let mut bad: Vec<String> = Vec::new();
         for p in paths {
@@ -654,21 +830,139 @@ impl<R: Remote> Engine<R> {
             all.extend(self.db.under(p).unwrap_or_default());
             all.insert(p.clone());
         }
+        // What the cloud holds in the folders it said changed, listed in one request each, `PARALLEL` at a time. The
+        // cache goes first: a folder moved or renamed in the cloud would otherwise still answer under its old path
+        // (see `forget_cache`).
+        let mut listed: HashMap<String, Item> = HashMap::new();
+        if !to_list.is_empty() {
+            self.remote.forget_cache();
+        }
+        for (d, res) in list_folders(&self.remote, &to_list, &self.cancel) {
+            match res {
+                Ok(items) => {
+                    for it in items {
+                        if !it.is_dir && safe_rel(&it.path) {
+                            listed.insert(it.path.clone(), it);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Not knowing what is in it is not "nothing": only a full scan can look again.
+                    self.db
+                        .log("error", &d, None, &format!("listing the folder failed: {e}"));
+                    report.errors.push(format!("{d}: {e}"));
+                }
+            }
+        }
+        all.extend(listed.keys().cloned());
         all.retain(|p| !excluded(p, &self.excluded) && !self.skippable(p) && !blocked(p, &bad));
-        let all: Vec<String> = all.into_iter().collect();
+        let mut all: Vec<String> = all.into_iter().collect();
+        // The name check `full_scan` makes over the whole tree, for these paths and their namesakes on disk or in a
+        // folder listing: a watcher event for `report.txt` next to a synced `Report.txt` must not reach the cloud, where
+        // they are one file. A rename by case alone is a rename; a second file gets its `Case Conflict` name.
+        let siblings = case_siblings(&self.root, &self.db, &all);
+        let settled = self.settle_case_clashes(
+            siblings
+                .iter()
+                .map(String::as_str)
+                .chain(listed.keys().map(String::as_str)),
+            &|p| listed.contains_key(p),
+            &mut report,
+        );
+        let renamed_away: HashSet<&str> = settled.moved.iter().map(|(old, _)| old.as_str()).collect();
+        all.retain(|p| {
+            let skip = settled.skip.contains(p);
+            if skip {
+                self.db.log("error", p, None, CLASH_WHY);
+                report.skip(p, CLASH_WHY);
+            }
+            !skip && !renamed_away.contains(p.as_str())
+        });
+        all.extend(settled.moved.iter().map(|(_, new)| new.clone()));
+        // Planned under the new name; `run` renames the files once the delete guard and the cancel checks have passed.
+        for (old, new) in &settled.moved {
+            if let Some(s) = local_sig(&self.root, old) {
+                self.case_renames.push((old.clone(), new.clone(), s));
+            }
+        }
+        // The old name of a rename by case alone is looked at too, even when only the new one was reported.
+        for (old, _) in &settled.renames {
+            if !all.contains(old) {
+                all.push(old.clone());
+            }
+        }
+        // The listing already answered for these; ask the cloud only about the rest.
+        let (known, ask): (Vec<String>, Vec<String>) = all.into_iter().partition(|p| listed.contains_key(p));
         let mut work = VecDeque::new();
-        for (i, res) in lookup(&self.remote, &self.db, &all, &self.cancel) {
-            let p = all[i].clone();
+        for p in known {
+            work.push_back(Work {
+                local: self.planned_sig(&p),
+                remote: listed.remove(&p),
+                from: None,
+                path: p,
+            });
+        }
+        let mut answers: HashMap<String, Result<Option<Item>>> = lookup(&self.remote, &self.db, &ask, &self.cancel)
+            .into_iter()
+            .map(|(i, r)| (ask[i].clone(), r))
+            .collect();
+        // A case-insensitive cloud answers for the new name of a rename by case alone with the old file itself: the new
+        // name has no cloud copy of its own, or it would be adopted and the old name deleted with it. Only when the
+        // answer really is the old file: a cloud that allows both names may hold another file under the new one, and
+        // that one must be left alone (it is then an ordinary conflict).
+        for (old, new) in &settled.renames {
+            let same = match (answers.get(old), answers.get(new)) {
+                (Some(Ok(Some(o))), Some(Ok(Some(found)))) => is_old_file(found, o, new),
+                (Some(Ok(Some(_))), Some(Err(e))) => e == CLASH_WHY,
+                _ => false,
+            };
+            if same {
+                answers.insert(new.clone(), Ok(None));
+            }
+        }
+        for p in &ask {
+            let p = p.clone();
+            let Some(res) = answers.remove(&p) else {
+                continue;
+            };
             match res {
                 Ok(item) => work.push_back(Work {
-                    local: local_sig(&self.root, &p),
+                    local: self.planned_sig(&p),
                     remote: item.filter(|i| !i.is_dir),
                     from: None,
                     path: p,
                 }),
+                // The cloud holds only another spelling of this name. A new local file gets its `Case Conflict` name
+                // and goes up as a file of its own; anything else is left alone.
+                Err(e) if e == CLASH_WHY => {
+                    let sig = local_sig(&self.root, &p);
+                    let new_file = !self.download_only && sig.is_some() && self.db.base(&p).ok().flatten().is_none();
+                    let planned: Vec<String> = self.case_renames.iter().map(|(_, n, _)| n.clone()).collect();
+                    match new_file.then(|| self.plan_case_conflict(&p, &planned)) {
+                        Some(Ok(new)) => {
+                            work.push_back(Work {
+                                local: sig,
+                                remote: None,
+                                from: None,
+                                path: new.clone(),
+                            });
+                            if let Some(s) = sig {
+                                self.case_renames.push((p.clone(), new, s));
+                            }
+                        }
+                        Some(Err(e)) => {
+                            self.db.log("error", &p, None, &e);
+                            report.fail(&p, &e);
+                        }
+                        None => {
+                            self.db.log("error", &p, None, CLASH_WHY);
+                            report.skip(&p, CLASH_WHY);
+                        }
+                    }
+                }
                 Err(e) => {
                     self.db.log("error", &p, None, &e);
-                    report.errors.push(format!("{p}: {e}"));
+                    report.fail(&p, &e);
                 }
             }
         }
@@ -814,6 +1108,7 @@ impl<R: Remote> Engine<R> {
         // Before the guard: a rename is not a delete, whatever the folder's size.
         let mut plan = self.pair_moves(plan);
         self.pair_copies(&mut plan);
+        self.pair_uploads(&mut plan);
         // Nothing was done yet: a cancel here costs nothing, and the guard must not judge a plan that was cut short.
         if self.cancelled() {
             self.set_progress(Progress::default());
@@ -835,7 +1130,7 @@ impl<R: Remote> Engine<R> {
         };
         let allowed = match self.confirmed_deletes {
             Some(cap) => deletes <= cap,
-            None => delete_guard_ok(deletes, known, self.guard_percent),
+            None => delete_guard_ok(deletes, known, GUARD_PERCENT) && !self.folder_wiped(&plan),
         };
         if !allowed {
             let sample = plan
@@ -873,6 +1168,10 @@ impl<R: Remote> Engine<R> {
             self.set_progress(Progress::default());
             return report;
         }
+        // The plan counted the new local files under their `Case Conflict` names: rename them now that nothing stops the
+        // run. One that changed meanwhile stays where it is, and its upload is dropped.
+        let dropped = self.apply_case_renames(&mut report);
+        plan.retain(|(w, ..)| !dropped.contains(&w.path));
         let mut plan: VecDeque<_> = plan.into();
         let (mut done, mut total) = (0, plan.len());
         let mut transfers = Vec::new();
@@ -932,11 +1231,33 @@ impl<R: Remote> Engine<R> {
                 Err(e) => log_failed(&self.db, &w, &e, &mut report),
             }
         }
+        // A folder renamed here goes as one cloud call; what that cannot prove stays one move per file.
+        done += self.move_dirs(&mut transfers, (done, total), &mut report, &mut gone);
         self.run_transfers(transfers, done, total, &mut report, &mut gone);
         self.prune_cloud_dirs(&gone);
         self.set_progress(Progress::default());
         report.cancelled = self.cancelled();
         report
+    }
+
+    /// True when the plan deletes every known file of one top-level folder of `MIN_FILES` or more: a disk mounted
+    /// inside the synced folder that went away looks exactly like that, and stays under the account-wide share. A rule
+    /// that hides a folder (a delete with the local file still there) is not counted.
+    fn folder_wiped(&self, plan: &[(Work, Action, Option<Base>)]) -> bool {
+        let mut gone: HashMap<&str, usize> = HashMap::new();
+        for (w, a, _) in plan {
+            let wiped = match a {
+                Action::DeleteLocal => true,
+                Action::DeleteRemote => w.local.is_none(),
+                _ => false,
+            };
+            if let (true, Some((top, _))) = (wiped, w.path.split_once('/')) {
+                *gone.entry(top).or_default() += 1;
+            }
+        }
+        gone.into_iter()
+            // A mirror's local-only files have no row: only folders the DB knows are judged (the share rule covers it).
+            .any(|(top, n)| n >= MIN_FILES && self.db.under(top).is_ok_and(|k| !k.is_empty() && n >= k.len()))
     }
 
     /// Removes the cloud folders that deleting or moving files out left empty. Sync has no folders of its own, so
@@ -1015,15 +1336,20 @@ impl<R: Remote> Engine<R> {
             }
             drop(tx);
             for (w, action, result) in rx {
+                if matches!(&result, Err(e) if e == CHANGED) {
+                    report.later.push(w.path.clone());
+                    finished.fetch_add(1, Relaxed);
+                    continue;
+                }
                 // The new row first: a crash in between leaves two rows (the old one reads as gone on both sides and
                 // is forgotten next run), never none.
                 // `Ok(false)`: nothing was done and nothing is logged.
                 let saved = result.and_then(|done| match done {
                     Done::Row(b, id) => {
                         db.set(&w.path, &b, &id).map_err(|e| e.to_string())?;
-                        // A download's `from` is the file it was copied from: that one stays.
+                        // A download's or upload's `from` is the file it was copied from: that one stays.
                         match &w.from {
-                            Some(f) if action != Action::Download => {
+                            Some(f) if matches!(action, Action::MoveLocal | Action::MoveRemote) => {
                                 db.forget(&f.path).map_err(|e| e.to_string()).map(|()| true)
                             }
                             _ => Ok(true),
@@ -1142,6 +1468,9 @@ fn sig_item(i: &Item) -> Sig {
 /// files; four keeps well inside the providers' rate limits (rclone retries a 429 by itself).
 pub(crate) const PARALLEL: usize = 4;
 
+/// Largest share (percent) of the known files one run may delete.
+const GUARD_PERCENT: usize = 50;
+
 /// The refusals every action shares: nothing is read or written through a symlinked folder, and a mirror never
 /// changes the cloud.
 fn refuse(root: &Path, download_only: bool, path: &str, action: Action) -> Result<()> {
@@ -1182,9 +1511,30 @@ fn transfer<R: Remote>(
                 None if remote.stat(&w.path)?.is_some() => return Err("appeared in the cloud, will retry".into()),
                 None => {}
             }
-            remote.upload(root, &w.path)?;
-            // What the remote reports now is the base, so its own echo in a delta compares equal.
-            let r = remote.stat(&w.path)?.ok_or("uploaded file not found")?;
+            // A local copy of a synced file: let the service copy it. Only a result whose hash is the proven one
+            // counts (the source may have changed since the plan); anything else is uploaded below.
+            let copied = w.from.as_deref().and_then(|f| {
+                let want = f.remote.as_ref()?.hash.as_ref()?;
+                remote.copy(&f.path, &w.path).ok()?;
+                let got = remote.stat(&w.path).ok()??;
+                (got.size == l.size && got.hash.as_ref() == Some(want)).then_some(got)
+            });
+            let r = match copied {
+                Some(r) => r,
+                None => {
+                    if let Err(e) = remote.upload(root, &w.path) {
+                        // A file saved while it uploads fails rclone's hash check ("corrupted on transfer") about
+                        // bytes that were fine when read: not an error, the new version goes up on its own.
+                        return Err(if local_sig(root, &w.path) != w.local {
+                            CHANGED.into()
+                        } else {
+                            e
+                        });
+                    }
+                    // What the remote reports now is the base, so its own echo in a delta compares equal.
+                    remote.stat(&w.path)?.ok_or("uploaded file not found")?
+                }
+            };
             Ok((
                 Base {
                     local: l,
@@ -1235,12 +1585,39 @@ fn transfer<R: Remote>(
                 return Err("changed locally, will retry".into());
             }
             cloud_unchanged(remote, &from.path, old)?;
+            // A rename by case alone (`MyFile.txt` -> `myfile.txt`): a case-insensitive cloud answers for the new name
+            // with the old file itself, which is not "something that appeared". Another file under the new name is.
+            let case_only = from.path.to_lowercase() == w.path.to_lowercase();
             // A move over an existing cloud file would replace it.
-            if remote.stat(&w.path)?.is_some() {
+            if let Some(found) = remote.stat(&w.path)?
+                && !(case_only && is_old_file(&found, old, &w.path))
+            {
                 return Err("appeared in the cloud, will retry".into());
             }
             // A service that cannot move gets what the unpaired plan would have done: upload, then delete the old.
-            if remote.rename(&from.path, &w.path).is_err() {
+            // Never for a case-only rename: on a case-insensitive cloud the upload lands on the old file and the
+            // delete would then remove the only copy.
+            if case_only {
+                // Only a folder part differs (`Docs/a.txt` -> `docs/a.txt`): moving the file cannot change the folder's
+                // name, only renaming the whole folder can (`move_dirs`, which needs every file of it to move).
+                let parent = |p: &str| p.rsplit_once('/').map_or(String::new(), |(d, _)| d.to_string());
+                if parent(&from.path) != parent(&w.path) {
+                    return Err(
+                        "its folder was renamed by case alone: only the whole folder can be renamed in the \
+                                cloud, and something else is in it; will retry"
+                            .into(),
+                    );
+                }
+                // Checked after the rename, whatever it answered: "ok" is not "renamed" for a cloud that ignores case.
+                let direct = remote
+                    .rename(&from.path, &w.path)
+                    .and_then(|()| spelling_kept(remote, &w.path));
+                if let Err(e) = direct {
+                    rename_by_case(remote, &from.path, &w.path)
+                        .and_then(|()| spelling_kept(remote, &w.path))
+                        .map_err(|e2| format!("could not rename the cloud file, will retry: {e}; {e2}"))?;
+                }
+            } else if remote.rename(&from.path, &w.path).is_err() {
                 remote.upload(root, &w.path)?;
                 remote.delete(&from.path)?;
             }
@@ -1256,6 +1633,10 @@ fn transfer<R: Remote>(
         _ => Err("not a transfer".into()),
     }
 }
+
+/// What `transfer` and `fetch` say when the local file changed under them. `run_transfers` does not show it as an
+/// error (an edit is no failure, and the edit's own event syncs the new version): the path goes to `Report.later`.
+const CHANGED: &str = "changed while transferring, will retry";
 
 /// What a finished transfer leaves to record.
 enum Done {
@@ -1348,37 +1729,39 @@ fn fetch<R: Remote>(
     // The counter keeps parallel downloads (and two runs in one second) from sharing a temp file.
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = tmp_dir.join(format!("{}-{}-{n}", std::process::id(), now_secs()));
-    // A failed local copy is no error: the download below does the job.
-    let copied = copy_of.is_some_and(|f| copy_local(root, f, &tmp, r.mtime).is_ok());
-    if !copied {
-        remote.download(path, &tmp)?;
-    }
-    // The user edited it while it downloaded: keep their edit, the next run sorts it out.
-    if local_sig(root, path) != expect_local {
-        let _ = fs::remove_file(&tmp);
-        return Err("changed while downloading, will retry".into());
-    }
-    let dest = root.join(path);
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    if expect_local.is_none() {
-        // Nothing was here a moment ago: a file that appeared since (saved by the user between the check above and
-        // here) must not be replaced, and `rename` would. A hard link fails when the name exists.
-        match fs::hard_link(&tmp, &dest) {
-            Ok(()) => {
-                let _ = fs::remove_file(&tmp);
-            }
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                let _ = fs::remove_file(&tmp);
-                return Err("a file or link with this name appeared here, not replaced".into());
-            }
-            // A file system without hard links: the plain rename (the old, tiny window).
-            Err(_) => fs::rename(&tmp, &dest).map_err(|e| e.to_string())?,
+    let placed = (|| -> Result<()> {
+        // A failed local copy is no error: the download below does the job.
+        let copied = copy_of.is_some_and(|f| copy_local(root, f, &tmp, r.mtime).is_ok());
+        if !copied {
+            remote.download(path, &tmp)?;
         }
-    } else {
-        fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
-    }
+        // The user edited it while it downloaded: keep their edit, the next run sorts it out.
+        if local_sig(root, path) != expect_local {
+            return Err(CHANGED.into());
+        }
+        let dest = root.join(path);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        if expect_local.is_none() {
+            // Nothing was here a moment ago: a file that appeared since (saved by the user between the check above
+            // and here) must not be replaced, and `rename` would. A hard link fails when the name exists.
+            match fs::hard_link(&tmp, &dest) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    Err("a file or link with this name appeared here, not replaced".into())
+                }
+                // A file system without hard links: the plain rename (the old, tiny window).
+                Err(_) => fs::rename(&tmp, &dest).map_err(|e| e.to_string()),
+            }
+        } else {
+            fs::rename(&tmp, &dest).map_err(|e| e.to_string())
+        }
+    })();
+    // Whatever happened, no temp copy stays behind: a retried failure would otherwise leave one full-size file per
+    // try until the next start. (After a rename there is nothing to remove.)
+    let _ = fs::remove_file(&tmp);
+    placed?;
     let l = local_sig(root, path).ok_or("downloaded file not found")?;
     Ok((
         Base {
@@ -1442,1711 +1825,12 @@ fn log_done(db: &Db, w: &Work, action: Action, report: &mut Report) {
 
 fn log_failed(db: &Db, w: &Work, e: &str, report: &mut Report) {
     db.log("error", &w.path, None, e);
-    report.errors.push(format!("{}: {e}", w.path));
+    report.fail(&w.path, e);
+    // A move's old path is part of the same job: it is looked at again too, or its delete would wait for a full scan.
+    if let Some(f) = &w.from {
+        report.failed.push(f.path.clone());
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A folder standing in for the cloud, so the whole engine runs without rclone or a network.
-    struct DirRemote(PathBuf);
-
-    impl DirRemote {
-        fn item(&self, rel: &str, m: &fs::Metadata) -> Item {
-            let s = sig_of(m);
-            Item {
-                path: rel.into(),
-                size: s.size,
-                mtime: s.mtime,
-                is_dir: m.is_dir(),
-                id: String::new(),
-                hash: None,
-            }
-        }
-    }
-
-    impl Remote for DirRemote {
-        fn list(&self) -> Result<Vec<Item>> {
-            Ok(scan(&self.0, &[], &Rules::default())
-                .0
-                .into_iter()
-                .map(|(p, s)| Item {
-                    path: p,
-                    size: s.size,
-                    mtime: s.mtime,
-                    is_dir: false,
-                    id: String::new(),
-                    hash: None,
-                })
-                .collect())
-        }
-        fn list_dir(&self, rel: &str) -> Result<Vec<Item>> {
-            // rclone's wording for a folder that is not there.
-            let rd = fs::read_dir(self.0.join(rel)).map_err(|_| "operations/list: directory not found".to_string())?;
-            Ok(rd
-                .flatten()
-                .filter_map(|e| {
-                    let p = if rel.is_empty() {
-                        e.file_name().to_string_lossy().into()
-                    } else {
-                        format!("{rel}/{}", e.file_name().to_string_lossy())
-                    };
-                    e.metadata().ok().map(|m| self.item(&p, &m))
-                })
-                .collect())
-        }
-        fn stat(&self, rel: &str) -> Result<Option<Item>> {
-            Ok(fs::metadata(self.0.join(rel)).ok().map(|m| self.item(rel, &m)))
-        }
-        fn upload(&self, root: &Path, rel: &str) -> Result<()> {
-            copy_keep_time(&root.join(rel), &self.0.join(rel))
-        }
-        fn download(&self, rel: &str, dest: &Path) -> Result<()> {
-            copy_keep_time(&self.0.join(rel), dest)
-        }
-        fn delete(&self, rel: &str) -> Result<()> {
-            fs::remove_file(self.0.join(rel)).map_err(|e| e.to_string())
-        }
-        fn rename(&self, from: &str, to: &str) -> Result<()> {
-            fs::create_dir_all(self.0.join(to).parent().unwrap()).map_err(|e| e.to_string())?;
-            fs::rename(self.0.join(from), self.0.join(to)).map_err(|e| e.to_string())
-        }
-        fn remove_empty_dir(&self, rel: &str) -> Result<()> {
-            // Fails on a folder with anything in it, like rclone's rmdir.
-            fs::remove_dir(self.0.join(rel)).map_err(|e| e.to_string())
-        }
-        fn same_content(&self, root: &Path, rel: &str, remote: &Item) -> bool {
-            matches!((fs::read(root.join(rel)), fs::read(self.0.join(&remote.path))), (Ok(a), Ok(b)) if a == b)
-        }
-    }
-
-    fn copy_keep_time(from: &Path, to: &Path) -> Result<()> {
-        fs::create_dir_all(to.parent().unwrap()).map_err(|e| e.to_string())?;
-        fs::copy(from, to).map_err(|e| e.to_string())?;
-        let t = fs::metadata(from)
-            .and_then(|m| m.modified())
-            .map_err(|e| e.to_string())?;
-        fs::File::options()
-            .write(true)
-            .open(to)
-            .and_then(|f| f.set_modified(t))
-            .map_err(|e| e.to_string())
-    }
-
-    struct Fixture {
-        base: PathBuf,
-        engine: Engine<DirRemote>,
-    }
-
-    impl Fixture {
-        fn new(name: &str) -> Self {
-            let base = std::env::temp_dir().join(format!("fastsync-test-{}-{name}", std::process::id()));
-            let _ = fs::remove_dir_all(&base);
-            let (local, remote) = (base.join("local"), base.join("remote"));
-            fs::create_dir_all(&local).unwrap();
-            fs::create_dir_all(&remote).unwrap();
-            Self {
-                engine: Engine::new(local, DirRemote(remote), Db::memory().unwrap()),
-                base,
-            }
-        }
-        fn local(&self, p: &str) -> PathBuf {
-            self.engine.root.join(p)
-        }
-        fn remote(&self, p: &str) -> PathBuf {
-            self.engine.remote.0.join(p)
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.base);
-        }
-    }
-
-    fn write(p: PathBuf, text: &str, secs_ago: u64) {
-        fs::create_dir_all(p.parent().unwrap()).unwrap();
-        fs::write(&p, text).unwrap();
-        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
-        fs::File::options()
-            .write(true)
-            .open(&p)
-            .unwrap()
-            .set_modified(t)
-            .unwrap();
-    }
-
-    /// Counts the lookups of `sync_paths`; `list_err` makes every listing fail with that text.
-    struct Calls {
-        inner: DirRemote,
-        list_err: Option<&'static str>,
-        lists: AtomicUsize,
-        stats: AtomicUsize,
-    }
-
-    impl Calls {
-        fn new(inner: DirRemote, list_err: Option<&'static str>) -> Self {
-            Self {
-                inner,
-                list_err,
-                lists: AtomicUsize::new(0),
-                stats: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    impl Remote for Calls {
-        fn list(&self) -> Result<Vec<Item>> {
-            self.inner.list()
-        }
-        fn list_dir(&self, rel: &str) -> Result<Vec<Item>> {
-            self.lists.fetch_add(1, Relaxed);
-            if let Some(e) = self.list_err {
-                return Err(e.into());
-            }
-            self.inner.list_dir(rel)
-        }
-        fn stat(&self, rel: &str) -> Result<Option<Item>> {
-            self.stats.fetch_add(1, Relaxed);
-            self.inner.stat(rel)
-        }
-        fn upload(&self, root: &Path, rel: &str) -> Result<()> {
-            self.inner.upload(root, rel)
-        }
-        fn download(&self, rel: &str, dest: &Path) -> Result<()> {
-            self.inner.download(rel, dest)
-        }
-        fn delete(&self, rel: &str) -> Result<()> {
-            self.inner.delete(rel)
-        }
-    }
-
-    /// A cloud that lists `dup.txt` twice, as Drive can.
-    struct Twice(DirRemote);
-    impl Remote for Twice {
-        fn list(&self) -> Result<Vec<Item>> {
-            let mut all = self.0.list()?;
-            if let Some(i) = all.iter().find(|i| i.path == "dup.txt").cloned() {
-                all.push(Item { size: i.size + 1, ..i });
-            }
-            Ok(all)
-        }
-        fn stat(&self, rel: &str) -> Result<Option<Item>> {
-            self.0.stat(rel)
-        }
-        fn upload(&self, root: &Path, rel: &str) -> Result<()> {
-            self.0.upload(root, rel)
-        }
-        fn download(&self, rel: &str, dest: &Path) -> Result<()> {
-            self.0.download(rel, dest)
-        }
-        fn delete(&self, rel: &str) -> Result<()> {
-            self.0.delete(rel)
-        }
-    }
-
-    /// A cloud whose empty files `links` says are symlinks (as Dropbox's metadata does); `fail`: the lookup errors.
-    struct Links {
-        inner: DirRemote,
-        links: Vec<(&'static str, &'static str)>,
-        fail: bool,
-    }
-    impl Remote for Links {
-        fn list(&self) -> Result<Vec<Item>> {
-            self.inner.list()
-        }
-        fn stat(&self, rel: &str) -> Result<Option<Item>> {
-            self.inner.stat(rel)
-        }
-        fn upload(&self, root: &Path, rel: &str) -> Result<()> {
-            self.inner.upload(root, rel)
-        }
-        fn download(&self, rel: &str, dest: &Path) -> Result<()> {
-            self.inner.download(rel, dest)
-        }
-        fn delete(&self, rel: &str) -> Result<()> {
-            self.inner.delete(rel)
-        }
-        fn link_target(&self, rel: &str) -> Result<Option<String>> {
-            if self.fail {
-                return Err("dropbox metadata: HTTP 429".into());
-            }
-            Ok(self.links.iter().find(|(p, _)| *p == rel).map(|(_, t)| t.to_string()))
-        }
-    }
-
-    fn with_links(f: &Fixture, links: Vec<(&'static str, &'static str)>, fail: bool) -> Engine<Links> {
-        Engine::new(
-            f.engine.root.clone(),
-            Links {
-                inner: DirRemote(f.remote("")),
-                links,
-                fail,
-            },
-            Db::memory().unwrap(),
-        )
-    }
-
-    #[test]
-    fn a_cloud_symlink_becomes_a_link_here_and_stays_one() {
-        let f = Fixture::new("link-made");
-        write(f.remote("bin/vite"), "", 100);
-        let mut e = with_links(&f, vec![("bin/vite", "../vite/bin/vite.js")], false);
-        let r = e.full_scan();
-        assert!(r.errors.is_empty() && r.transferred == 1, "{r:?}");
-        let link = f.local("bin/vite");
-        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
-        assert_eq!(fs::read_link(&link).unwrap(), Path::new("../vite/bin/vite.js"));
-        // No row (it could not describe a link), and the next scan leaves everything alone: nothing deleted, nothing
-        // downloaded over the link.
-        assert!(e.db.base("bin/vite").unwrap().is_none());
-        let r = e.full_scan();
-        assert!(
-            r.errors.is_empty() && r.transferred == 0 && r.aborted.is_none(),
-            "{r:?}"
-        );
-        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
-        assert!(f.remote("bin/vite").exists(), "the cloud entry stays");
-    }
-
-    #[test]
-    fn a_cloud_symlink_that_leaves_the_folder_is_not_made_and_is_not_an_error() {
-        let f = Fixture::new("link-unsafe");
-        for p in ["abs", "up", "deep/up"] {
-            write(f.remote(p), "", 100);
-        }
-        let mut e = with_links(
-            &f,
-            vec![("abs", "/home/other/Dropbox/x"), ("up", "../x"), ("deep/up", "../../x")],
-            false,
-        );
-        let r = e.full_scan();
-        assert!(r.errors.is_empty() && r.transferred == 0, "{r:?}");
-        for p in ["abs", "up", "deep/up"] {
-            assert!(fs::symlink_metadata(f.local(p)).is_err(), "{p} must not exist");
-        }
-    }
-
-    #[test]
-    fn a_failed_link_lookup_is_retried_and_never_leaves_an_empty_file() {
-        let f = Fixture::new("link-retry");
-        write(f.remote("bin/vite"), "", 100);
-        let mut e = with_links(&f, vec![("bin/vite", "x")], true);
-        let r = e.full_scan();
-        assert_eq!(r.errors.len(), 1, "{r:?}");
-        assert!(fs::symlink_metadata(f.local("bin/vite")).is_err());
-    }
-
-    #[test]
-    fn an_empty_cloud_file_that_is_no_link_is_still_downloaded() {
-        let f = Fixture::new("link-none");
-        write(f.remote("pkg/__init__.py"), "", 100);
-        let mut e = with_links(&f, vec![], false);
-        let r = e.full_scan();
-        assert!(r.errors.is_empty() && r.transferred == 1, "{r:?}");
-        let m = fs::symlink_metadata(f.local("pkg/__init__.py")).unwrap();
-        assert!(m.is_file() && m.len() == 0);
-    }
-
-    #[test]
-    fn link_targets_must_stay_inside_the_folder() {
-        for (rel, target, ok) in [
-            ("a", "b", true),
-            ("a", "./b/../c", true),
-            ("d/a", "../b", true),
-            ("d/a", "../../b", false),
-            ("a", "../b", false),
-            ("d/e/a", "../../x/../y", true),
-            ("a", "/etc/passwd", false),
-            ("a", "", false),
-            ("a", "b\0c", false),
-        ] {
-            assert_eq!(safe_link_target(rel, target), ok, "{rel} -> {target}");
-        }
-        assert!(!safe_link_target("a", &"b/".repeat(2100)));
-    }
-
-    #[test]
-    fn two_cloud_files_with_one_name_are_skipped_and_the_rest_still_syncs() {
-        let f = Fixture::new("dupname");
-        write(f.remote("dup.txt"), "cloud", 100);
-        write(f.local("dup.txt"), "mine", 50);
-        write(f.remote("ok.txt"), "fine", 100);
-        let mut e = Engine::new(
-            f.engine.root.clone(),
-            Twice(DirRemote(f.remote(""))),
-            Db::memory().unwrap(),
-        );
-        let r = e.full_scan();
-        assert!(r.errors.len() == 1 && r.errors[0].contains("dup.txt"), "{r:?}");
-        assert_eq!(fs::read_to_string(f.local("dup.txt")).unwrap(), "mine");
-        assert_eq!(fs::read_to_string(f.local("ok.txt")).unwrap(), "fine");
-        assert!(e.db.base("dup.txt").unwrap().is_none());
-    }
-
-    fn many_new_files(name: &str, list_err: Option<&'static str>) -> (Fixture, Engine<Calls>, Vec<String>) {
-        let f = Fixture::new(name);
-        let e = Engine::new(
-            f.engine.root.clone(),
-            Calls::new(DirRemote(f.engine.remote.0.clone()), list_err),
-            Db::memory().unwrap(),
-        );
-        let mut paths: Vec<String> = (0..20).map(|i| format!("a/f{i}.txt")).collect();
-        paths.push("b/x.txt".into());
-        for p in &paths {
-            write(f.local(p), "x", 100);
-        }
-        (f, e, paths)
-    }
-
-    #[test]
-    fn many_new_files_in_a_folder_cost_one_listing() {
-        let (f, mut e, paths) = many_new_files("list-many", None);
-        let r = e.sync_paths(&paths);
-        assert!(r.errors.is_empty() && r.transferred == 21, "{r:?}");
-        // `a` (20 files, new to the DB and to the cloud) is listed once, `b/x.txt` alone is a plain stat. The
-        // other stats are the uploads' own check afterwards.
-        assert_eq!(e.remote.lists.load(Relaxed), 1);
-        assert!(f.remote("a/f19.txt").exists() && f.remote("b/x.txt").exists());
-    }
-
-    #[test]
-    fn a_failed_listing_falls_back_to_one_stat_per_file() {
-        let (f, mut e, paths) = many_new_files("list-fails", Some("boom"));
-        let r = e.sync_paths(&paths);
-        assert!(r.errors.is_empty() && r.transferred == 21, "{r:?}");
-        assert_eq!(e.remote.lists.load(Relaxed), 1);
-        assert!(e.remote.stats.load(Relaxed) >= 21);
-        assert!(f.remote("a/f0.txt").exists());
-    }
-
-    #[test]
-    fn a_folder_gone_from_the_cloud_costs_one_listing_and_one_stat() {
-        let (f, mut e, paths) = many_new_files("list-gone", None);
-        assert_eq!(e.sync_paths(&paths).transferred, 21);
-        fs::remove_dir_all(f.remote("a")).unwrap();
-        let (lists, stats) = (e.remote.lists.load(Relaxed), e.remote.stats.load(Relaxed));
-        let own: Vec<String> = paths[..3].to_vec();
-        let r = e.sync_paths(&own);
-        assert!(r.errors.is_empty(), "{r:?}");
-        assert_eq!(e.remote.lists.load(Relaxed), lists + 1);
-        assert_eq!(
-            e.remote.stats.load(Relaxed),
-            stats + 1,
-            "the folder itself, not each file"
-        );
-        // Same outcome as a stat per file: the cloud copy is gone, so the local one goes to the trash.
-        assert!(!f.local(&paths[0]).exists() && f.local(&paths[3]).exists());
-        assert_eq!(e.db.base(&paths[0]).unwrap(), None);
-    }
-
-    #[test]
-    fn not_found_while_the_folder_still_exists_is_not_read_as_gone() {
-        let (f, mut e, paths) = many_new_files("list-glitch", None);
-        assert_eq!(e.sync_paths(&paths).transferred, 21);
-        // The listing says "not found" but the folder and its files are there: a glitch, nothing may be deleted.
-        e.remote.list_err = Some("operations/list: directory not found");
-        let stats = e.remote.stats.load(Relaxed);
-        let own: Vec<String> = paths[..3].to_vec();
-        let r = e.sync_paths(&own);
-        assert!(r.errors.is_empty() && r.transferred == 0, "{r:?}");
-        assert!(
-            e.remote.stats.load(Relaxed) >= stats + 1 + 3,
-            "folder stat, then one per file"
-        );
-        assert!(f.local(&paths[0]).exists() && f.remote(&paths[0]).exists());
-        assert!(e.db.base(&paths[0]).unwrap().is_some());
-    }
-
-    /// Records what `Engine.progress` says at the moment each upload starts.
-    struct Spy(
-        DirRemote,
-        std::sync::Arc<std::sync::Mutex<Progress>>,
-        std::sync::Arc<std::sync::Mutex<Vec<Progress>>>,
-    );
-
-    impl Remote for Spy {
-        fn list(&self) -> Result<Vec<Item>> {
-            self.0.list()
-        }
-        fn stat(&self, rel: &str) -> Result<Option<Item>> {
-            self.0.stat(rel)
-        }
-        fn upload(&self, root: &Path, rel: &str) -> Result<()> {
-            self.2.lock().unwrap().push(self.1.lock().unwrap().clone());
-            self.0.upload(root, rel)
-        }
-        fn download(&self, rel: &str, dest: &Path) -> Result<()> {
-            self.0.download(rel, dest)
-        }
-        fn delete(&self, rel: &str) -> Result<()> {
-            self.0.delete(rel)
-        }
-    }
-
-    /// A cloud that runs a hook once, at the first upload or delete: something changes while the run is under way.
-    struct Racy(DirRemote, std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>);
-
-    impl Remote for Racy {
-        fn list(&self) -> Result<Vec<Item>> {
-            self.0.list()
-        }
-        fn stat(&self, rel: &str) -> Result<Option<Item>> {
-            self.0.stat(rel)
-        }
-        fn upload(&self, root: &Path, rel: &str) -> Result<()> {
-            if let Some(hook) = self.1.lock().unwrap().take() {
-                hook();
-            }
-            self.0.upload(root, rel)
-        }
-        fn download(&self, rel: &str, dest: &Path) -> Result<()> {
-            self.0.download(rel, dest)
-        }
-        fn delete(&self, rel: &str) -> Result<()> {
-            if let Some(hook) = self.1.lock().unwrap().take() {
-                hook();
-            }
-            self.0.delete(rel)
-        }
-    }
-
-    fn racy(f: &Fixture) -> Engine<Racy> {
-        let remote = Racy(DirRemote(f.engine.remote.0.clone()), Default::default());
-        Engine::new(f.engine.root.clone(), remote, Db::memory().unwrap())
-    }
-
-    /// Counts how many uploads are inside `upload` at the same moment.
-    struct Slow(
-        DirRemote,
-        std::sync::atomic::AtomicUsize,
-        std::sync::atomic::AtomicUsize,
-    );
-
-    impl Remote for Slow {
-        fn list(&self) -> Result<Vec<Item>> {
-            self.0.list()
-        }
-        fn stat(&self, rel: &str) -> Result<Option<Item>> {
-            self.0.stat(rel)
-        }
-        fn upload(&self, root: &Path, rel: &str) -> Result<()> {
-            use std::sync::atomic::Ordering::SeqCst;
-            let now = self.1.fetch_add(1, SeqCst) + 1;
-            self.2.fetch_max(now, SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            self.1.fetch_sub(1, SeqCst);
-            self.0.upload(root, rel)
-        }
-        fn download(&self, rel: &str, dest: &Path) -> Result<()> {
-            self.0.download(rel, dest)
-        }
-        fn delete(&self, rel: &str) -> Result<()> {
-            self.0.delete(rel)
-        }
-    }
-
-    #[test]
-    fn transfers_run_side_by_side_and_every_row_is_written() {
-        let f = Fixture::new("parallel");
-        let remote = Slow(
-            DirRemote(f.engine.remote.0.clone()),
-            Default::default(),
-            Default::default(),
-        );
-        let mut e = Engine::new(f.engine.root.clone(), remote, Db::memory().unwrap());
-        for i in 0..12 {
-            write(f.local(&format!("up{i}.txt")), "x", 100);
-            write(f.remote(&format!("down{i}.txt")), "y", 100);
-        }
-        let r = e.full_scan();
-        assert!(r.errors.is_empty() && r.transferred == 24, "{r:?}");
-        let peak = e.remote.2.load(std::sync::atomic::Ordering::SeqCst);
-        assert!((2..=PARALLEL).contains(&peak), "peak {peak}");
-        assert_eq!(e.db.count().unwrap(), 24);
-        assert!((0..12).all(|i| f.remote(&format!("up{i}.txt")).exists() && f.local(&format!("down{i}.txt")).exists()));
-        assert_eq!(e.full_scan().transferred, 0, "the rows describe what is on disk");
-    }
-
-    #[test]
-    fn a_cloud_edit_made_during_the_run_is_not_overwritten() {
-        let f = Fixture::new("race-cloud");
-        let mut e = racy(&f);
-        write(f.local("b.txt"), "one", 100);
-        write(f.local("c.txt"), "one", 100);
-        e.full_scan();
-        write(f.local("b.txt"), "two!!", 50);
-        // c deleted here: its cloud delete is a one-at-a-time step that always runs before the uploads start, so
-        // the cloud edit of b lands after the plan was made and before b's upload, with no thread timing involved.
-        fs::remove_file(f.local("c.txt")).unwrap();
-        let cloud_b = f.remote("b.txt");
-        *e.remote.1.lock().unwrap() = Some(Box::new(move || fs::write(cloud_b, "cloud edit").unwrap()));
-        let r = e.full_scan();
-        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
-        assert_eq!(fs::read_to_string(f.remote("b.txt")).unwrap(), "cloud edit");
-        assert!(!f.remote("c.txt").exists());
-    }
-
-    #[test]
-    fn a_new_file_never_overwrites_one_that_appeared_in_the_cloud_since_the_listing() {
-        let f = Fixture::new("race-new");
-        let mut e = racy(&f);
-        write(f.local("c.txt"), "one", 100);
-        e.full_scan();
-        fs::remove_file(f.local("c.txt")).unwrap();
-        write(f.local("n.txt"), "mine", 50);
-        // The delete of c runs before the upload of n, after the plan: another device creates n meanwhile.
-        let cloud_n = f.remote("n.txt");
-        *e.remote.1.lock().unwrap() = Some(Box::new(move || fs::write(cloud_n, "theirs").unwrap()));
-        let r = e.full_scan();
-        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
-        assert_eq!(fs::read_to_string(f.remote("n.txt")).unwrap(), "theirs");
-    }
-
-    #[test]
-    fn a_run_cancelled_before_it_acts_does_nothing_and_says_so() {
-        let mut f = Fixture::new("cancel-early");
-        write(f.local("up.txt"), "u", 100);
-        write(f.remote("down.txt"), "d", 100);
-        f.engine.cancel.store(true, Relaxed);
-        let r = f.engine.full_scan();
-        assert!(r.cancelled && r.transferred == 0 && r.errors.is_empty(), "{r:?}");
-        assert!(!f.remote("up.txt").exists() && !f.local("down.txt").exists());
-        f.engine.cancel.store(false, Relaxed);
-        let r = f.engine.full_scan();
-        assert!(!r.cancelled && f.remote("up.txt").exists() && f.local("down.txt").exists());
-    }
-
-    #[test]
-    fn a_cancel_during_a_run_lets_the_action_under_way_finish_and_starts_no_transfer() {
-        let f = Fixture::new("cancel-mid");
-        let mut e = racy(&f);
-        write(f.local("c.txt"), "one", 100);
-        e.full_scan();
-        fs::remove_file(f.local("c.txt")).unwrap();
-        write(f.local("n.txt"), "mine", 50);
-        // The cloud delete of c runs first; the user presses Pause right then, before the upload of n starts.
-        let cancel = e.cancel.clone();
-        *e.remote.1.lock().unwrap() = Some(Box::new(move || cancel.store(true, Relaxed)));
-        let r = e.full_scan();
-        assert!(r.cancelled && r.errors.is_empty(), "{r:?}");
-        assert!(!f.remote("c.txt").exists(), "the delete under way finished");
-        assert!(!f.remote("n.txt").exists(), "no new transfer started");
-    }
-
-    #[test]
-    fn a_pause_during_a_big_copy_in_skips_the_cloud_lookups_and_acts_on_nothing() {
-        let (f, mut e, paths) = many_new_files("cancel-lookup", None);
-        e.cancel.store(true, Relaxed);
-        let r = e.sync_paths(&paths);
-        assert!(r.cancelled && r.transferred == 0 && r.errors.is_empty(), "{r:?}");
-        assert_eq!(
-            e.remote.lists.load(Relaxed) + e.remote.stats.load(Relaxed),
-            0,
-            "no cloud call at all"
-        );
-        assert!(!f.remote("a/f0.txt").exists());
-    }
-
-    #[test]
-    fn a_symlink_holding_a_name_is_skipped_not_an_error() {
-        let mut f = Fixture::new("no-replace");
-        // A symlink is not a regular file, so `scan` sees "nothing here"; the name is still taken. Planning a
-        // download over it failed on every retry, which also kept the run from ever counting as clean.
-        std::os::unix::fs::symlink("/nowhere", f.local("s.txt")).unwrap();
-        write(f.remote("s.txt"), "cloud", 100);
-        let r = f.engine.full_scan();
-        assert!(r.errors.is_empty() && r.transferred == 0, "{r:?}");
-        assert!(fs::symlink_metadata(f.local("s.txt")).unwrap().file_type().is_symlink());
-        assert!(f.remote("s.txt").exists(), "the cloud copy stays");
-    }
-
-    #[test]
-    fn a_local_edit_made_during_the_run_is_not_trashed() {
-        let f = Fixture::new("race-local");
-        let mut e = racy(&f);
-        write(f.local("a.txt"), "one", 100);
-        write(f.local("b.txt"), "one", 100);
-        e.full_scan();
-        // b deleted in the cloud: the plan says "trash the local copy". a deleted here comes first in the plan, and
-        // its cloud call is where the user edits b.
-        fs::remove_file(f.remote("b.txt")).unwrap();
-        fs::remove_file(f.local("a.txt")).unwrap();
-        let local_b = f.local("b.txt");
-        *e.remote.1.lock().unwrap() = Some(Box::new(move || fs::write(local_b, "user edit").unwrap()));
-        let r = e.full_scan();
-        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
-        assert_eq!(fs::read_to_string(f.local("b.txt")).unwrap(), "user edit");
-    }
-
-    #[test]
-    fn a_folder_replaced_by_a_file_deletes_what_was_below_it() {
-        let mut f = Fixture::new("folder-to-file");
-        write(f.local("docs/x.txt"), "x", 100);
-        f.engine.full_scan();
-        assert!(f.remote("docs/x.txt").exists());
-        fs::remove_dir_all(f.local("docs")).unwrap();
-        fs::write(f.local("docs"), "now a file").unwrap();
-        let r = f.engine.sync_paths(&["docs/x.txt".to_string()]);
-        assert!(r.errors.is_empty(), "{r:?}");
-        assert!(!f.remote("docs/x.txt").exists(), "not read as unreadable");
-    }
-
-    #[test]
-    fn an_unreadable_folder_is_not_read_as_deleted() {
-        use std::os::unix::fs::PermissionsExt;
-        let mut f = Fixture::new("unreadable");
-        write(f.local("keep.txt"), "k", 100);
-        write(f.local("locked/a.txt"), "a", 100);
-        f.engine.full_scan();
-        assert!(f.remote("locked/a.txt").exists());
-        let locked = f.local("locked");
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-        // Running as root reads it anyway: nothing to prove then.
-        if fs::read_dir(&locked).is_ok() {
-            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-            return;
-        }
-        let full = f.engine.full_scan();
-        let paths = f.engine.sync_paths(&["locked/a.txt".to_string(), "locked".to_string()]);
-        let walked = f.engine.local_changes();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(f.remote("locked/a.txt").exists(), "the cloud copy must stay");
-        assert!(full.errors.is_empty() && paths.errors.is_empty() && paths.transferred == 0);
-        assert!(!walked.iter().any(|p| p.starts_with("locked")), "{walked:?}");
-    }
-
-    #[test]
-    fn stamp_is_a_utc_date_and_time() {
-        assert_eq!(stamp(0), "1970-01-01 00:00:00");
-        assert_eq!(stamp(1_794_578_709), "2026-11-13 14:05:09");
-    }
-
-    #[test]
-    fn transfers_and_failures_leave_rows_in_the_activity_log() {
-        let mut f = Fixture::new("log");
-        let file = f.base.join("state.db");
-        f.engine.db = Db::open(&file).unwrap();
-        write(f.local("up.txt"), "mine", 100);
-        write(f.remote("down.txt"), "theirs!", 100);
-        f.engine.full_scan();
-        // A cloud that cannot be listed is a logged problem, not an empty cloud.
-        struct Broken;
-        impl Remote for Broken {
-            fn list(&self) -> Result<Vec<Item>> {
-                Err("boom".into())
-            }
-            fn stat(&self, _: &str) -> Result<Option<Item>> {
-                Ok(None)
-            }
-            fn upload(&self, _: &Path, _: &str) -> Result<()> {
-                Ok(())
-            }
-            fn download(&self, _: &str, _: &Path) -> Result<()> {
-                Ok(())
-            }
-            fn delete(&self, _: &str) -> Result<()> {
-                Ok(())
-            }
-            fn same_content(&self, _: &Path, _: &str, _: &Item) -> bool {
-                false
-            }
-        }
-        let mut broken = Engine::new(f.engine.root.clone(), Broken, Db::open(&file).unwrap());
-        broken.full_scan();
-        let rows = crate::db::read_log(&file, 10).unwrap();
-        let find = |k: &str, p: &str| rows.iter().find(|r| r.kind == k && r.path == p);
-        assert_eq!(find("up", "up.txt").and_then(|r| r.size), Some(4));
-        assert_eq!(find("down", "down.txt").and_then(|r| r.size), Some(7));
-        assert!(find("error", "").is_some_and(|r| r.msg.contains("boom")));
-    }
-
-    #[test]
-    fn an_empty_cloud_file_left_by_an_interrupted_upload_is_filled_not_split_into_a_conflict() {
-        let mut f = Fixture::new("empty-cloud");
-        write(f.local("big.bin"), "the real data", 5000);
-        write(f.remote("big.bin"), "", 100);
-        let r = f.engine.full_scan();
-        assert!(r.errors.is_empty(), "{r:?}");
-        assert_eq!(r.transferred, 1);
-        assert_eq!(fs::read_to_string(f.remote("big.bin")).unwrap(), "the real data");
-        assert_eq!(fs::read_to_string(f.local("big.bin")).unwrap(), "the real data");
-        let names: Vec<_> = fs::read_dir(&f.engine.root)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(!names.iter().any(|n| n.contains("conflict")), "{names:?}");
-        assert_eq!(f.engine.full_scan().transferred, 0);
-        // A mirror keeps the cloud as the truth: its local copy is replaced, never uploaded.
-        let mut m = Fixture::new("empty-cloud-mirror");
-        m.engine.download_only = true;
-        write(m.local("big.bin"), "the real data", 5000);
-        write(m.remote("big.bin"), "", 100);
-        m.engine.full_scan();
-        assert_eq!(fs::read_to_string(m.remote("big.bin")).unwrap(), "");
-    }
-
-    #[test]
-    fn the_same_bytes_with_different_times_are_adopted_not_split_into_a_conflict() {
-        let mut f = Fixture::new("same-bytes");
-        write(f.local("a.pdf"), "same bytes", 5000);
-        write(f.remote("a.pdf"), "same bytes", 100);
-        write(f.local("b.pdf"), "local text", 5000);
-        write(f.remote("b.pdf"), "other text", 100);
-        let r = f.engine.full_scan();
-        assert!(r.errors.is_empty(), "{r:?}");
-        assert!(f.engine.db.base("a.pdf").unwrap().is_some(), "recorded as synced");
-        let names: Vec<String> = fs::read_dir(&f.engine.root)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(!names.iter().any(|n| n.starts_with("a (conflict")), "{names:?}");
-        // Different bytes of the same size still split, so no edit is ever lost.
-        assert!(names.iter().any(|n| n.starts_with("b (conflict")), "{names:?}");
-        assert_eq!(f.engine.full_scan().transferred, 0, "and the next scan finds nothing");
-    }
-
-    /// A cloud whose byte check always fails, as when rclone cannot read the local file.
-    struct CannotCompare(DirRemote);
-
-    impl Remote for CannotCompare {
-        fn list(&self) -> Result<Vec<Item>> {
-            self.0.list()
-        }
-        fn stat(&self, rel: &str) -> Result<Option<Item>> {
-            self.0.stat(rel)
-        }
-        fn upload(&self, root: &Path, rel: &str) -> Result<()> {
-            self.0.upload(root, rel)
-        }
-        fn download(&self, rel: &str, dest: &Path) -> Result<()> {
-            self.0.download(rel, dest)
-        }
-        fn delete(&self, rel: &str) -> Result<()> {
-            self.0.delete(rel)
-        }
-        fn compare(&self, _: &Path, _: &str, _: &Item) -> Result<bool> {
-            Err("permission denied".into())
-        }
-    }
-
-    #[test]
-    fn a_failed_byte_check_skips_the_file_with_an_error_instead_of_splitting_it() {
-        let f = Fixture::new("cannot-compare");
-        let remote = CannotCompare(DirRemote(f.engine.remote.0.clone()));
-        let mut e = Engine::new(f.engine.root.clone(), remote, Db::memory().unwrap());
-        write(f.local("a.pdf"), "same bytes", 5000);
-        write(f.remote("a.pdf"), "same bytes", 100);
-        write(f.remote("new.txt"), "unrelated", 100);
-        let r = e.full_scan();
-        assert_eq!(r.errors.len(), 1, "{r:?}");
-        assert!(
-            r.errors[0].contains("a.pdf") && r.errors[0].contains("could not compare"),
-            "{r:?}"
-        );
-        let names: Vec<String> = fs::read_dir(&f.engine.root)
-            .unwrap()
-            .flatten()
-            .map(|d| d.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(!names.iter().any(|n| n.contains("conflict")), "{names:?}");
-        assert_eq!(fs::read_to_string(f.local("a.pdf")).unwrap(), "same bytes");
-        assert!(e.db.base("a.pdf").unwrap().is_none(), "not recorded as synced either");
-        assert!(f.local("new.txt").exists(), "the rest of the run goes on");
-    }
-
-    #[test]
-    fn progress_counts_the_planned_files_and_clears_when_the_run_ends() {
-        let base = std::env::temp_dir().join(format!("fastsync-test-{}-progress", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        let (local, remote) = (base.join("local"), base.join("remote"));
-        fs::create_dir_all(&remote).unwrap();
-        write(local.join("a.txt"), "a", 100);
-        write(local.join("b.txt"), "b", 100);
-        let (progress, seen) = (
-            Default::default(),
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-        );
-        let spy = Spy(DirRemote(remote), std::sync::Arc::clone(&progress), seen.clone());
-        let mut e = Engine::new(local, spy, Db::memory().unwrap());
-        e.progress = progress;
-        assert_eq!(e.full_scan().transferred, 2);
-        let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 2);
-        assert!(seen.iter().all(|p| p.total == 2 && p.kind == Kind::Up));
-        // Side by side, so the second may start before the first has finished: `done` only counts finished ones.
-        assert!(seen.iter().any(|p| p.done == 0) && seen.iter().all(|p| p.done < 2));
-        assert_eq!(*e.progress.lock().unwrap(), Progress::default());
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn first_sync_merges_both_sides_then_edits_flow_each_way() {
-        let mut f = Fixture::new("merge");
-        write(f.local("a.txt"), "local", 100);
-        write(f.remote("dir/b.txt"), "remote", 100);
-        let r = f.engine.full_scan();
-        assert!(r.errors.is_empty() && r.aborted.is_none(), "{r:?}");
-        assert_eq!(fs::read_to_string(f.remote("a.txt")).unwrap(), "local");
-        assert_eq!(fs::read_to_string(f.local("dir/b.txt")).unwrap(), "remote");
-        // A second scan finds nothing to do (no echo).
-        assert_eq!(f.engine.full_scan().transferred, 0);
-        // Local edit goes up, through the incremental path.
-        write(f.local("a.txt"), "local v2", 10);
-        assert_eq!(f.engine.sync_paths(&["a.txt".into()]).transferred, 1);
-        assert_eq!(fs::read_to_string(f.remote("a.txt")).unwrap(), "local v2");
-        // Remote edit comes down.
-        write(f.remote("dir/b.txt"), "remote v2!", 5);
-        assert_eq!(f.engine.sync_paths(&["dir/b.txt".into()]).transferred, 1);
-        assert_eq!(fs::read_to_string(f.local("dir/b.txt")).unwrap(), "remote v2!");
-        assert_eq!(
-            f.engine.sync_paths(&["a.txt".into(), "dir/b.txt".into()]).transferred,
-            0
-        );
-    }
-
-    #[test]
-    fn a_path_from_the_cloud_feed_is_not_taken_for_the_echo_of_our_own_write() {
-        let mut f = Fixture::new("feed");
-        write(f.local("a.txt"), "one", 100);
-        assert!(f.engine.full_scan().errors.is_empty());
-        write(f.remote("a.txt"), "edited in the cloud", 5);
-        // The same path from inotify is an echo (local file == DB row); from the feed it is a real change.
-        assert!(f.engine.paths_to_sync(vec!["a.txt".into()], vec![], false).is_empty());
-        let paths = f.engine.paths_to_sync(vec![], vec!["a.txt".into()], false);
-        assert_eq!(paths, ["a.txt"]);
-        assert_eq!(f.engine.sync_paths(&paths).transferred, 1);
-        assert_eq!(fs::read_to_string(f.local("a.txt")).unwrap(), "edited in the cloud");
-        // A delete in the cloud arrives the same way.
-        fs::remove_file(f.remote("a.txt")).unwrap();
-        let paths = f.engine.paths_to_sync(vec![], vec!["a.txt".into()], false);
-        assert!(f.engine.sync_paths(&paths).errors.is_empty());
-        assert!(!f.local("a.txt").exists());
-    }
-
-    #[test]
-    fn a_remote_delete_trashes_the_local_file_instead_of_removing_it() {
-        let mut f = Fixture::new("trash");
-        write(f.local("gone/x.txt"), "x", 100);
-        f.engine.full_scan();
-        fs::remove_file(f.remote("gone/x.txt")).unwrap();
-        f.engine.sync_paths(&["gone/x.txt".into()]);
-        assert!(!f.local("gone/x.txt").exists());
-        assert!(!f.local("gone").exists(), "the empty folder is cleaned up");
-        let trash = f.local(".fastsync/trash");
-        let stamp = fs::read_dir(&trash).unwrap().next().unwrap().unwrap().path();
-        assert_eq!(fs::read_to_string(stamp.join("gone/x.txt")).unwrap(), "x");
-        assert_eq!(f.engine.db.base("gone/x.txt").unwrap(), None);
-    }
-
-    #[test]
-    fn a_local_delete_deletes_remotely_and_a_file_never_synced_is_not_deleted() {
-        let mut f = Fixture::new("del");
-        write(f.local("a.txt"), "a", 100);
-        f.engine.full_scan();
-        fs::remove_file(f.local("a.txt")).unwrap();
-        f.engine.sync_paths(&["a.txt".into()]);
-        assert!(!f.remote("a.txt").exists());
-        // New on the remote and unknown to the DB: it must come down, not be treated as a deletion.
-        write(f.remote("new.txt"), "n", 100);
-        f.engine.full_scan();
-        assert!(f.local("new.txt").exists());
-    }
-
-    /// `n` synced files of different sizes in `d/`, so each one has a single possible partner.
-    fn synced_folder(f: &mut Fixture, n: usize) {
-        for i in 0..n {
-            write(f.local(&format!("d/f{i}.txt")), &"x".repeat(i + 1), 100);
-        }
-        let r = f.engine.full_scan();
-        assert!(r.errors.is_empty() && r.aborted.is_none(), "{r:?}");
-    }
-
-    #[test]
-    fn a_folder_renamed_in_the_cloud_is_renamed_here_not_downloaded_again() {
-        let mut f = Fixture::new("move-local");
-        synced_folder(&mut f, 12);
-        fs::rename(f.remote("d"), f.remote("e")).unwrap();
-        // 12 of 12 known files: unpaired, this is 12 deletes and the guard stops the run.
-        let r = f.engine.full_scan();
-        assert!(r.errors.is_empty() && r.aborted.is_none(), "{r:?}");
-        assert_eq!(r.transferred, 12);
-        for i in 0..12 {
-            assert_eq!(
-                fs::read_to_string(f.local(&format!("e/f{i}.txt"))).unwrap(),
-                "x".repeat(i + 1)
-            );
-            assert!(!f.local(&format!("d/f{i}.txt")).exists());
-            assert_eq!(f.engine.db.base(&format!("d/f{i}.txt")).unwrap(), None);
-            assert!(f.engine.db.base(&format!("e/f{i}.txt")).unwrap().is_some());
-        }
-        assert!(!f.local("d").exists(), "the empty folder is cleaned up");
-        // No trash. (The first sync was a local-only folder uploaded, so nothing was ever downloaded here: the temp
-        // folder a download creates must not exist.)
-        assert!(!f.local(".fastsync").exists());
-        assert_eq!(f.engine.full_scan().transferred, 0);
-    }
-
-    #[test]
-    fn a_folder_renamed_here_is_moved_in_the_cloud_not_uploaded_again() {
-        use std::os::unix::fs::MetadataExt;
-        let mut f = Fixture::new("move-remote");
-        synced_folder(&mut f, 12);
-        let ino = fs::metadata(f.remote("d/f3.txt")).unwrap().ino();
-        fs::rename(f.local("d"), f.local("e")).unwrap();
-        let r = f.engine.full_scan();
-        assert!(r.errors.is_empty() && r.aborted.is_none(), "{r:?}");
-        assert_eq!(r.transferred, 12);
-        // The same cloud file, not a copy.
-        assert_eq!(fs::metadata(f.remote("e/f3.txt")).unwrap().ino(), ino);
-        assert!(!f.remote("d/f3.txt").exists());
-        assert_eq!(f.engine.db.base("d/f3.txt").unwrap(), None);
-        assert!(f.engine.db.base("e/f3.txt").unwrap().is_some());
-        assert_eq!(f.engine.full_scan().transferred, 0);
-    }
-
-    #[test]
-    fn the_same_size_with_other_bytes_is_not_a_move() {
-        let mut f = Fixture::new("move-other");
-        write(f.local("a.txt"), "aaaa", 100);
-        f.engine.full_scan();
-        // Renamed in the cloud, but the new file only has the same size.
-        fs::remove_file(f.remote("a.txt")).unwrap();
-        write(f.remote("b.txt"), "bbbb", 100);
-        let r = f.engine.full_scan();
-        assert!(r.errors.is_empty(), "{r:?}");
-        assert_eq!(fs::read_to_string(f.local("b.txt")).unwrap(), "bbbb");
-        let trash = fs::read_dir(f.local(".fastsync/trash"))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        assert_eq!(fs::read_to_string(trash.join("a.txt")).unwrap(), "aaaa");
-    }
-
-    /// A cloud that refuses every download: a copy made from a local file must not need one.
-    struct NoDownload(DirRemote);
-
-    impl Remote for NoDownload {
-        fn list(&self) -> Result<Vec<Item>> {
-            self.0.list()
-        }
-        fn stat(&self, rel: &str) -> Result<Option<Item>> {
-            self.0.stat(rel)
-        }
-        fn upload(&self, root: &Path, rel: &str) -> Result<()> {
-            self.0.upload(root, rel)
-        }
-        fn download(&self, _: &str, _: &Path) -> Result<()> {
-            Err("downloaded".into())
-        }
-        fn delete(&self, rel: &str) -> Result<()> {
-            self.0.delete(rel)
-        }
-        fn same_content(&self, root: &Path, rel: &str, remote: &Item) -> bool {
-            self.0.same_content(root, rel, remote)
-        }
-    }
-
-    #[test]
-    fn a_file_duplicated_in_the_cloud_is_copied_locally_not_downloaded() {
-        let f = Fixture::new("copy-local");
-        let big = "x".repeat(COPY_MIN as usize + 10);
-        let mut e = Engine::new(
-            f.engine.root.clone(),
-            NoDownload(DirRemote(f.engine.remote.0.clone())),
-            Db::memory().unwrap(),
-        );
-        write(f.local("a.bin"), &big, 100);
-        assert!(e.full_scan().errors.is_empty());
-        fs::copy(f.remote("a.bin"), f.remote("b.bin")).unwrap();
-        let r = e.full_scan();
-        assert!(r.errors.is_empty(), "{r:?}");
-        assert_eq!(fs::read_to_string(f.local("b.bin")).unwrap(), big);
-        assert!(e.db.base("a.bin").unwrap().is_some(), "the source keeps its row");
-        assert!(f.local("a.bin").exists());
-        assert_eq!(e.full_scan().transferred, 0);
-    }
-
-    #[test]
-    fn a_cloud_file_with_the_size_of_another_but_other_bytes_is_downloaded() {
-        let mut f = Fixture::new("copy-other");
-        write(f.local("a.bin"), &"a".repeat(COPY_MIN as usize), 100);
-        f.engine.full_scan();
-        write(f.remote("b.bin"), &"b".repeat(COPY_MIN as usize), 100);
-        let r = f.engine.full_scan();
-        assert!(r.errors.is_empty(), "{r:?}");
-        assert_eq!(
-            fs::read_to_string(f.local("b.bin")).unwrap(),
-            "b".repeat(COPY_MIN as usize)
-        );
-        assert_eq!(
-            fs::read_to_string(f.local("a.bin")).unwrap(),
-            "a".repeat(COPY_MIN as usize)
-        );
-    }
-
-    #[test]
-    fn a_mirror_follows_a_cloud_rename_but_never_moves_the_cloud() {
-        let mut f = Fixture::new("move-mirror");
-        f.engine.download_only = true;
-        write(f.remote("a/x.txt"), "xx", 100);
-        f.engine.full_scan();
-        let ino = std::os::unix::fs::MetadataExt::ino(&fs::metadata(f.local("a/x.txt")).unwrap());
-        fs::rename(f.remote("a"), f.remote("b")).unwrap();
-        f.engine.full_scan();
-        assert!(!f.local("a/x.txt").exists());
-        // The same local file, not a fresh download.
-        assert_eq!(
-            std::os::unix::fs::MetadataExt::ino(&fs::metadata(f.local("b/x.txt")).unwrap()),
-            ino
-        );
-        // A local rename is a local-only file: trashed, and the cloud file comes back.
-        fs::rename(f.local("b/x.txt"), f.local("b/y.txt")).unwrap();
-        f.engine.full_scan();
-        assert!(f.remote("b/x.txt").exists() && !f.remote("b/y.txt").exists());
-        assert!(f.local("b/x.txt").exists() && !f.local("b/y.txt").exists());
-    }
-
-    #[test]
-    fn a_move_never_overwrites_a_file_changed_since_the_plan() {
-        let f = Fixture::new("move-stale");
-        write(f.local("old.txt"), "one", 100);
-        let stale = local_sig(&f.engine.root, "old.txt");
-        write(f.local("old.txt"), "edited!", 10);
-        let item = Item {
-            path: "new.txt".into(),
-            size: 3,
-            mtime: 0,
-            is_dir: false,
-            id: String::new(),
-            hash: None,
-        };
-        let w = Work {
-            path: "new.txt".into(),
-            local: None,
-            remote: Some(item),
-            from: Some(Box::new(Moved {
-                path: "old.txt".into(),
-                local: stale,
-                remote: None,
-            })),
-        };
-        let e = transfer(&f.engine.remote, &f.engine.root, false, &w, Action::MoveLocal).unwrap_err();
-        assert!(e.contains("changed locally"), "{e}");
-        assert_eq!(fs::read_to_string(f.local("old.txt")).unwrap(), "edited!");
-        assert!(!f.local("new.txt").exists());
-    }
-
-    /// rclone's folder cache: after a folder moved in the cloud, its old path still answers (with the files now at
-    /// the new path) until `forget_cache`.
-    struct Cached {
-        inner: DirRemote,
-        /// (old folder, new folder) while the cache is stale.
-        stale: std::sync::Mutex<Option<(String, String)>>,
-        downloads: AtomicUsize,
-    }
-
-    impl Cached {
-        /// The real path behind `rel` and whether the answer comes from the stale cache.
-        fn real(&self, rel: &str) -> String {
-            match &*self.stale.lock().unwrap() {
-                Some((old, new)) if rel == old || rel.starts_with(&format!("{old}/")) => {
-                    format!("{new}{}", &rel[old.len()..])
-                }
-                _ => rel.to_string(),
-            }
-        }
-    }
-
-    impl Remote for Cached {
-        fn list(&self) -> Result<Vec<Item>> {
-            self.inner.list()
-        }
-        fn list_dir(&self, rel: &str) -> Result<Vec<Item>> {
-            let real = self.real(rel);
-            Ok(self
-                .inner
-                .list_dir(&real)?
-                .into_iter()
-                .map(|mut i| {
-                    i.path = format!("{rel}{}", &i.path[real.len()..]);
-                    i
-                })
-                .collect())
-        }
-        fn stat(&self, rel: &str) -> Result<Option<Item>> {
-            Ok(self.inner.stat(&self.real(rel))?.map(|mut i| {
-                i.path = rel.into();
-                i
-            }))
-        }
-        fn upload(&self, root: &Path, rel: &str) -> Result<()> {
-            self.inner.upload(root, rel)
-        }
-        fn download(&self, rel: &str, dest: &Path) -> Result<()> {
-            self.downloads.fetch_add(1, Relaxed);
-            self.inner.download(&self.real(rel), dest)
-        }
-        fn delete(&self, rel: &str) -> Result<()> {
-            self.inner.delete(rel)
-        }
-        fn forget_cache(&self) {
-            *self.stale.lock().unwrap() = None;
-        }
-        fn same_content(&self, root: &Path, rel: &str, remote: &Item) -> bool {
-            self.inner.same_content(root, rel, remote)
-        }
-    }
-
-    #[test]
-    fn a_folder_moved_in_the_cloud_is_not_downloaded_again_through_its_old_path() {
-        let f = Fixture::new("stale-cache");
-        for i in 0..12 {
-            write(f.local(&format!("d/f{i}.txt")), &"x".repeat(i + 1), 100);
-        }
-        let mut e = Engine::new(
-            f.engine.root.clone(),
-            Cached {
-                inner: DirRemote(f.engine.remote.0.clone()),
-                stale: Default::default(),
-                downloads: AtomicUsize::new(0),
-            },
-            Db::memory().unwrap(),
-        );
-        assert!(e.full_scan().errors.is_empty());
-        // Moved in the cloud, and the transport still answers for `d`.
-        fs::create_dir_all(f.remote("b")).unwrap();
-        fs::rename(f.remote("d"), f.remote("b/d")).unwrap();
-        *e.remote.stale.lock().unwrap() = Some(("d".into(), "b/d".into()));
-        let r = e.full_scan();
-        assert!(r.errors.is_empty() && r.aborted.is_none(), "{r:?}");
-        assert!(f.local("b/d/f3.txt").exists());
-        // The echo of our own rename: the old paths, asked about one by one or as a folder.
-        let old: Vec<String> = (0..12).map(|i| format!("d/f{i}.txt")).collect();
-        let r = e.sync_paths(&old);
-        assert!(r.errors.is_empty(), "{r:?}");
-        assert!(!f.local("d").exists(), "the old folder came back");
-        assert_eq!(e.remote.downloads.load(Relaxed), 0);
-    }
-
-    #[test]
-    fn a_folder_emptied_by_a_move_or_a_delete_is_removed_in_the_cloud() {
-        let mut f = Fixture::new("empty-dirs");
-        write(f.local("a/b/one.txt"), "one", 100);
-        write(f.local("a/b/two!.txt"), "two", 100);
-        write(f.local("a/keep.txt"), "keep!", 100);
-        write(f.local("z/last.txt"), "last", 100);
-        for i in 0..4 {
-            write(f.local(&format!("pad{i}.txt")), &"p".repeat(i + 10), 100);
-        }
-        assert!(f.engine.full_scan().errors.is_empty());
-        // A local rename of a folder: its files move, and the old cloud folder must not stay behind.
-        fs::rename(f.local("a/b"), f.local("c")).unwrap();
-        // A delete of the only file of a folder.
-        fs::remove_file(f.local("z/last.txt")).unwrap();
-        let r = f.engine.full_scan();
-        assert!(r.errors.is_empty() && r.aborted.is_none(), "{r:?}");
-        assert!(f.remote("c/one.txt").exists());
-        assert!(!f.remote("a/b").exists(), "the emptied folder stays in the cloud");
-        assert!(!f.remote("z").exists(), "the emptied folder stays in the cloud");
-        // `a` still holds a file: it must stay.
-        assert!(f.remote("a/keep.txt").exists());
-    }
-
-    #[test]
-    fn both_edited_keeps_both_copies() {
-        let mut f = Fixture::new("conflict");
-        write(f.local("r.txt"), "base", 1000);
-        f.engine.full_scan();
-        write(f.local("r.txt"), "mine", 20);
-        write(f.remote("r.txt"), "theirs!", 10);
-        let r = f.engine.full_scan();
-        assert!(r.errors.is_empty(), "{r:?}");
-        assert_eq!(r.conflicts, ["r.txt"]);
-        assert_eq!(fs::read_to_string(f.local("r.txt")).unwrap(), "theirs!");
-        let name = conflict_name("r.txt", &today(), 1);
-        assert_eq!(fs::read_to_string(f.local(&name)).unwrap(), "mine");
-        assert_eq!(
-            fs::read_to_string(f.remote(&name)).unwrap(),
-            "mine",
-            "the local copy is uploaded too"
-        );
-    }
-
-    /// A cloud whose downloads all fail.
-    struct NoDown(DirRemote);
-
-    impl Remote for NoDown {
-        fn list(&self) -> Result<Vec<Item>> {
-            self.0.list()
-        }
-        fn stat(&self, rel: &str) -> Result<Option<Item>> {
-            self.0.stat(rel)
-        }
-        fn upload(&self, root: &Path, rel: &str) -> Result<()> {
-            self.0.upload(root, rel)
-        }
-        fn download(&self, _rel: &str, _dest: &Path) -> Result<()> {
-            Err("connection lost".into())
-        }
-        fn delete(&self, rel: &str) -> Result<()> {
-            self.0.delete(rel)
-        }
-    }
-
-    #[test]
-    fn a_conflict_whose_download_fails_still_keeps_the_local_edit() {
-        let f = Fixture::new("conflict-fail");
-        write(f.local("r.txt"), "mine", 20);
-        write(f.remote("r.txt"), "theirs!", 10);
-        let mut e = Engine::new(
-            f.engine.root.clone(),
-            NoDown(DirRemote(f.engine.remote.0.clone())),
-            Db::memory().unwrap(),
-        );
-        let r = e.full_scan();
-        assert!(!r.errors.is_empty(), "the failed download is reported");
-        let aside = conflict_name("r.txt", &today(), 1);
-        assert_eq!(
-            fs::read_to_string(f.local(&aside)).unwrap(),
-            "mine",
-            "the edit is only renamed"
-        );
-        assert_eq!(fs::read_to_string(f.remote("r.txt")).unwrap(), "theirs!");
-        assert!(e.db.base("r.txt").unwrap().is_none(), "nothing was recorded as synced");
-    }
-
-    fn trashed(f: &Fixture, rel: &str) -> Option<String> {
-        let stamps = fs::read_dir(f.local(".fastsync/trash")).ok()?;
-        stamps
-            .flatten()
-            .find_map(|s| fs::read_to_string(s.path().join(rel)).ok())
-    }
-
-    #[test]
-    fn a_name_that_is_not_valid_text_is_reported_not_silently_skipped() {
-        use std::os::unix::ffi::OsStrExt;
-        let f = Fixture::new("badname");
-        write(f.local("ok.txt"), "x", 10);
-        fs::write(f.engine.root.join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt")), "y").unwrap();
-        let (files, bad) = scan(&f.engine.root, &[], &Rules::default());
-        assert!(files.contains_key("ok.txt") && files.len() == 1);
-        assert_eq!(bad.len(), 1, "{bad:?}");
-        assert!(bad[0].starts_with("caf"));
-        // It blocks nothing real: the other file still syncs.
-        let mut f = f;
-        let r = f.engine.full_scan();
-        assert!(f.remote("ok.txt").exists(), "{r:?}");
-    }
-
-    #[test]
-    fn the_same_path_trashed_twice_in_a_second_keeps_both_copies() {
-        let f = Fixture::new("trash-twice");
-        for text in ["first", "second"] {
-            write(f.local("a.txt"), text, 10);
-            f.engine.trash("a.txt").unwrap();
-        }
-        // Same batch (renamed copy) or two batches if the clock ticked: two files either way.
-        assert_eq!(trash_usage(&f.engine.root), (2, 11));
-    }
-
-    #[test]
-    fn the_trash_is_counted_and_emptied() {
-        let mut f = Fixture::new("trash-usage");
-        assert_eq!(trash_usage(&f.engine.root), (0, 0));
-        assert!(empty_trash(&f.engine.root).is_ok(), "no trash yet is fine");
-        write(f.local("gone/x.txt"), "12345", 100);
-        f.engine.full_scan();
-        fs::remove_file(f.remote("gone/x.txt")).unwrap();
-        f.engine.sync_paths(&["gone/x.txt".into()]);
-        assert_eq!(trash_usage(&f.engine.root), (1, 5));
-        empty_trash(&f.engine.root).unwrap();
-        assert_eq!(trash_usage(&f.engine.root), (0, 0));
-        assert!(!f.local(".fastsync/trash").exists());
-        assert!(empty_trash(&f.engine.root).is_ok());
-    }
-
-    #[test]
-    fn old_trash_batches_are_purged_and_the_rest_stays() {
-        let f = Fixture::new("purge");
-        let (root, now) = (f.engine.root.clone(), now_secs());
-        let day = 86_400;
-        write(
-            f.local(&format!(".fastsync/trash/{}/old.txt", now - 91 * day)),
-            "old",
-            100,
-        );
-        write(
-            f.local(&format!(".fastsync/trash/{}/edge.txt", now - 90 * day)),
-            "edge",
-            100,
-        );
-        write(f.local(&format!(".fastsync/trash/{}/new.txt", now - day)), "new", 100);
-        write(f.local(".fastsync/trash/junk/keep.txt"), "not ours", 100);
-        assert!(purge_trash(&root, 0).is_ok());
-        assert_eq!(trash_usage(&root).0, 4, "0 keeps everything");
-        crate::trash::purge_trash_at(&root, 90, now).unwrap();
-        // 91 and exactly 90 days old go; a day old and a folder with a non-numeric name stay.
-        assert_eq!(trash_usage(&root).0, 2);
-        assert!(f.local(".fastsync/trash/junk/keep.txt").exists());
-        assert!(purge_trash(&root.join("missing"), 90).is_ok());
-    }
-
-    #[test]
-    fn download_only_mirrors_the_cloud_and_never_writes_to_it() {
-        let mut f = Fixture::new("mirror");
-        f.engine.download_only = true;
-        write(f.remote("a.txt"), "cloud a", 100);
-        write(f.remote("b.txt"), "cloud b", 100);
-        write(f.local("only-here.txt"), "mine", 100);
-        let r = f.engine.full_scan();
-        assert!(r.errors.is_empty() && r.aborted.is_none(), "{r:?}");
-        assert_eq!(fs::read_to_string(f.local("a.txt")).unwrap(), "cloud a");
-        // A local-only file is not uploaded: it goes to the trash.
-        assert!(!f.remote("only-here.txt").exists());
-        assert!(!f.local("only-here.txt").exists());
-        assert_eq!(trashed(&f, "only-here.txt").as_deref(), Some("mine"));
-        // A local edit loses to the cloud copy and is kept in the trash.
-        write(f.local("a.txt"), "edited here", 10);
-        let r = f.engine.sync_paths(&["a.txt".into()]);
-        assert!(r.errors.is_empty(), "{r:?}");
-        assert_eq!(fs::read_to_string(f.local("a.txt")).unwrap(), "cloud a");
-        assert_eq!(fs::read_to_string(f.remote("a.txt")).unwrap(), "cloud a");
-        assert_eq!(trashed(&f, "a.txt").as_deref(), Some("edited here"));
-        // A file deleted here comes back.
-        fs::remove_file(f.local("b.txt")).unwrap();
-        f.engine.sync_paths(&["b.txt".into()]);
-        assert_eq!(fs::read_to_string(f.local("b.txt")).unwrap(), "cloud b");
-        assert!(f.remote("b.txt").exists());
-        // The cloud's own changes and deletes reach the disk.
-        write(f.remote("a.txt"), "cloud a v2", 5);
-        fs::remove_file(f.remote("b.txt")).unwrap();
-        f.engine.full_scan();
-        assert_eq!(fs::read_to_string(f.local("a.txt")).unwrap(), "cloud a v2");
-        assert!(!f.local("b.txt").exists());
-        assert_eq!(trashed(&f, "b.txt").as_deref(), Some("cloud b"));
-    }
-
-    #[test]
-    fn download_only_guard_stops_a_new_account_pointed_at_a_full_folder() {
-        let mut f = Fixture::new("mirror-guard");
-        f.engine.download_only = true;
-        write(f.remote("c.txt"), "c", 100);
-        for i in 0..12 {
-            write(f.local(&format!("mine{i}.txt")), "x", 100);
-        }
-        let r = f.engine.full_scan();
-        assert!(r.aborted.is_some(), "{r:?}");
-        assert!(f.local("mine0.txt").exists());
-        assert!(!f.local("c.txt").exists());
-    }
-
-    #[test]
-    fn the_delete_guard_stops_a_run_that_empties_the_folder() {
-        let mut f = Fixture::new("guard");
-        for i in 0..12 {
-            write(f.local(&format!("f{i}.txt")), "x", 100);
-        }
-        f.engine.full_scan();
-        // An unmounted remote looks like "everything was deleted".
-        for i in 0..12 {
-            fs::remove_file(f.remote(&format!("f{i}.txt"))).unwrap();
-        }
-        let r = f.engine.full_scan();
-        assert!(r.aborted.is_some());
-        assert!(f.local("f0.txt").exists());
-        assert_eq!(f.engine.db.all().unwrap().len(), 12);
-    }
-
-    /// 12 synced files, then `gone` of them removed from the cloud (the guard trips, nothing is deleted yet).
-    fn cloud_loses(name: &str, gone: usize) -> Fixture {
-        let mut f = Fixture::new(name);
-        for i in 0..12 {
-            write(f.local(&format!("f{i}.txt")), "x", 100);
-        }
-        f.engine.full_scan();
-        for i in 0..gone {
-            fs::remove_file(f.remote(&format!("f{i}.txt"))).unwrap();
-        }
-        assert!(f.engine.full_scan().aborted.is_some());
-        f
-    }
-
-    #[test]
-    fn restore_puts_files_the_cloud_lost_back_up() {
-        let mut f = cloud_loses("restore-up", 12);
-        f.engine.restore = true;
-        let r = f.engine.full_scan();
-        assert!(
-            r.aborted.is_none() && r.errors.is_empty() && r.transferred == 12,
-            "{r:?}"
-        );
-        assert!((0..12).all(|i| f.remote(&format!("f{i}.txt")).exists() && f.local(&format!("f{i}.txt")).exists()));
-        assert_eq!(f.engine.db.count().unwrap(), 12);
-    }
-
-    #[test]
-    fn restore_brings_files_deleted_here_back_down() {
-        let mut f = Fixture::new("restore-down");
-        for i in 0..12 {
-            write(f.local(&format!("f{i}.txt")), "x", 100);
-        }
-        f.engine.full_scan();
-        for i in 0..12 {
-            fs::remove_file(f.local(&format!("f{i}.txt"))).unwrap();
-        }
-        assert!(f.engine.full_scan().aborted.is_some());
-        f.engine.restore = true;
-        let r = f.engine.full_scan();
-        assert!(r.aborted.is_none() && r.transferred == 12, "{r:?}");
-        assert!((0..12).all(|i| f.local(&format!("f{i}.txt")).exists() && f.remote(&format!("f{i}.txt")).exists()));
-    }
-
-    #[test]
-    fn restore_never_uploads_from_a_mirror() {
-        let mut f = Fixture::new("restore-mirror");
-        f.engine.download_only = true;
-        write(f.remote("c.txt"), "c", 100);
-        for i in 0..12 {
-            write(f.local(&format!("mine{i}.txt")), "x", 100);
-        }
-        f.engine.restore = true;
-        let r = f.engine.full_scan();
-        assert!(r.aborted.is_some(), "restore must not change what a mirror does: {r:?}");
-        assert!(!f.remote("mine0.txt").exists());
-    }
-
-    #[test]
-    fn confirmed_deletes_are_capped_at_the_count_the_card_showed() {
-        let mut f = cloud_loses("confirm-cap", 8);
-        // The card said 8; by the time the user presses Delete, 2 more are gone from the cloud.
-        fs::remove_file(f.remote("f8.txt")).unwrap();
-        fs::remove_file(f.remote("f9.txt")).unwrap();
-        f.engine.confirmed_deletes = Some(8);
-        let r = f.engine.full_scan();
-        assert_eq!(r.aborted.as_ref().map(|a| a.0), Some(10), "{r:?}");
-        assert!(f.local("f0.txt").exists(), "nothing was deleted");
-        // The same count passes, whatever share of the known files it is.
-        f.engine.confirmed_deletes = Some(10);
-        let r = f.engine.full_scan();
-        assert!(r.aborted.is_none() && r.errors.is_empty(), "{r:?}");
-        assert!(!f.local("f0.txt").exists() && f.local("f10.txt").exists());
-    }
-
-    #[test]
-    fn offline_edits_are_found_by_the_local_walk() {
-        let mut f = Fixture::new("walk");
-        write(f.local("a.txt"), "a", 100);
-        write(f.local("b.txt"), "b", 100);
-        f.engine.full_scan();
-        assert!(f.engine.local_changes().is_empty());
-        write(f.local("a.txt"), "changed", 5);
-        fs::remove_file(f.local("b.txt")).unwrap();
-        write(f.local("c.txt"), "c", 5);
-        assert_eq!(f.engine.local_changes(), ["a.txt", "b.txt", "c.txt"]);
-    }
-
-    #[test]
-    fn a_symlinked_folder_is_never_followed_in_either_direction() {
-        let mut f = Fixture::new("symlink");
-        let outside = f.base.join("outside");
-        write(outside.join("secret.txt"), "secret", 100);
-        std::os::unix::fs::symlink(&outside, f.local("link")).unwrap();
-        write(f.remote("link/from-cloud.txt"), "cloud", 100);
-        // Up: neither the link nor a path behind it may reach the cloud.
-        let r = f.engine.sync_paths(&["link".into(), "link/secret.txt".into()]);
-        assert_eq!(r.transferred, 0);
-        assert!(!f.remote("link/secret.txt").exists());
-        // Down: a remote file under the link must not be written through it.
-        let r = f.engine.full_scan();
-        assert!(r.errors.iter().any(|e| e.contains("symlink")), "{r:?}");
-        assert!(!outside.join("from-cloud.txt").exists());
-        assert_eq!(fs::read_to_string(outside.join("secret.txt")).unwrap(), "secret");
-    }
-
-    #[test]
-    fn unchecked_folders_match_their_whole_subtree_only() {
-        let list = vec!["Photos".to_string(), "a/b".to_string()];
-        assert!(excluded("Photos", &list) && excluded("Photos/2020/x.jpg", &list) && excluded("a/b/c", &list));
-        assert!(!excluded("Photos2/x", &list) && !excluded("a/bc", &list) && !excluded("a", &list));
-        // Unchecking a parent absorbs its children; checking a folder brings back only that entry.
-        assert_eq!(toggle_excluded(&list, "a", false), ["Photos", "a"]);
-        assert_eq!(toggle_excluded(&list, "a/b", true), ["Photos"]);
-        assert_eq!(toggle_excluded(&list, "Photos", false), ["a/b", "Photos"]);
-    }
-
-    #[test]
-    fn unchecking_a_synced_folder_trashes_the_local_copy_and_keeps_the_cloud_one() {
-        let mut f = Fixture::new("uncheck");
-        write(f.local("keep.txt"), "k", 100);
-        write(f.local("Photos/a.jpg"), "a", 100);
-        write(f.local("Photos/edited.jpg"), "old", 100);
-        f.engine.full_scan();
-        write(f.local("Photos/edited.jpg"), "my edit", 5);
-        f.engine.excluded = vec!["Photos".into()];
-        let r = f.engine.full_scan();
-        assert!(r.errors.is_empty() && r.aborted.is_none(), "{r:?}");
-        assert!(!f.local("Photos/a.jpg").exists());
-        let stamp = fs::read_dir(f.local(".fastsync/trash"))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        assert_eq!(fs::read_to_string(stamp.join("Photos/a.jpg")).unwrap(), "a");
-        assert!(f.remote("Photos/a.jpg").exists(), "the cloud copy is never deleted");
-        assert_eq!(fs::read_to_string(f.local("Photos/edited.jpg")).unwrap(), "my edit");
-        assert_eq!(f.engine.db.base("Photos/a.jpg").unwrap(), None);
-        assert!(f.engine.db.base("keep.txt").unwrap().is_some());
-    }
-
-    #[test]
-    fn unchecked_folders_are_neither_uploaded_nor_downloaded_and_come_back_when_checked() {
-        let mut f = Fixture::new("excluded");
-        f.engine.excluded = vec!["skip".into()];
-        write(f.local("skip/up.txt"), "u", 100);
-        write(f.remote("skip/down.txt"), "d", 100);
-        write(f.remote("ok.txt"), "o", 100);
-        f.engine.full_scan();
-        assert!(!f.remote("skip/up.txt").exists() && !f.local("skip/down.txt").exists());
-        assert!(f.local("ok.txt").exists());
-        let r = f.engine.sync_paths(&["skip/up.txt".into(), "skip".into()]);
-        assert_eq!(r.transferred, 0);
-        assert!(f.engine.local_changes().iter().all(|p| !p.starts_with("skip")));
-        f.engine.excluded.clear();
-        f.engine.full_scan();
-        assert!(f.remote("skip/up.txt").exists() && f.local("skip/down.txt").exists());
-    }
-
-    #[test]
-    fn ignored_files_are_neither_uploaded_nor_downloaded() {
-        let mut f = Fixture::new("ignore-new");
-        f.engine.ignore = Rules::parse("*.log\nbuild/");
-        write(f.local("a.log"), "l", 100);
-        write(f.local("build/o.bin"), "b", 100);
-        write(f.local("ok.txt"), "o", 100);
-        write(f.remote("down.log"), "d", 100);
-        f.engine.full_scan();
-        assert!(f.remote("ok.txt").exists());
-        assert!(!f.remote("a.log").exists() && !f.remote("build/o.bin").exists() && !f.local("down.log").exists());
-        assert!(f.engine.local_changes().is_empty());
-        assert_eq!(f.engine.sync_paths(&["a.log".into()]).transferred, 0);
-    }
-
-    #[test]
-    fn a_new_rule_removes_the_cloud_copy_and_keeps_the_local_one() {
-        let mut f = Fixture::new("ignore-synced");
-        write(f.local("a.log"), "l", 100);
-        f.engine.full_scan();
-        assert!(f.remote("a.log").exists());
-        f.engine.ignore = Rules::parse("*.log");
-        let r = f.engine.full_scan();
-        assert!(r.errors.is_empty(), "{:?}", r.errors);
-        assert!(!f.remote("a.log").exists() && f.local("a.log").exists());
-        assert!(f.engine.db.base("a.log").unwrap().is_none());
-        // Gone from the rules: it is a new local file again and goes back up.
-        f.engine.ignore = Rules::default();
-        f.engine.full_scan();
-        assert!(f.remote("a.log").exists());
-    }
-
-    #[test]
-    fn a_folder_hidden_by_a_rule_is_not_walked_but_still_handled_like_ignored_files() {
-        let mut f = Fixture::new("ignore-dir");
-        write(f.local("build/o.bin"), "l", 100);
-        write(f.local("src/a.rs"), "s", 100);
-        let rules = Rules::parse("build/");
-        let (files, _) = scan(&f.engine.root, &[], &rules);
-        assert_eq!(files.keys().collect::<Vec<_>>(), ["src/a.rs"], "build/ is not entered");
-        // Synced before the rule: the cloud copy goes, the local file stays, and the walk does not call it deleted.
-        f.engine.full_scan();
-        assert!(f.remote("build/o.bin").exists());
-        f.engine.ignore = rules;
-        let r = f.engine.full_scan();
-        assert!(r.errors.is_empty(), "{:?}", r.errors);
-        assert!(!f.remote("build/o.bin").exists() && f.local("build/o.bin").exists());
-        assert!(f.remote("src/a.rs").exists());
-        assert!(f.engine.local_changes().is_empty());
-        // A folder event inside the hidden folder (an `npm install`) neither walks it nor uploads anything.
-        write(f.local("build/new/x.bin"), "n", 100);
-        let r = f.engine.sync_paths(&["build/new".to_string()]);
-        assert!(r.errors.is_empty() && r.transferred == 0, "{r:?}");
-        assert!(!f.remote("build/new/x.bin").exists());
-    }
-
-    #[test]
-    fn download_only_forgets_an_ignored_file_without_touching_either_side() {
-        let mut f = Fixture::new("ignore-down");
-        f.engine.download_only = true;
-        write(f.remote("a.log"), "l", 100);
-        f.engine.full_scan();
-        f.engine.ignore = Rules::parse("*.log");
-        f.engine.full_scan();
-        assert!(f.remote("a.log").exists() && f.local("a.log").exists());
-        assert!(f.engine.db.base("a.log").unwrap().is_none());
-    }
-
-    #[test]
-    fn a_rule_matching_everything_trips_the_delete_guard() {
-        let mut f = Fixture::new("ignore-guard");
-        for i in 0..12 {
-            write(f.local(&format!("f{i}.txt")), "x", 100);
-        }
-        f.engine.full_scan();
-        f.engine.ignore = Rules::parse("*");
-        let r = f.engine.full_scan();
-        let (deletes, _, sample) = r.aborted.expect("stopped");
-        assert!(
-            deletes == 12 && sample.len() == SAMPLE && sample[0] == "f0.txt",
-            "{sample:?}"
-        );
-        assert!(f.remote("f0.txt").exists());
-    }
-
-    #[test]
-    fn names_that_escape_the_folder_or_are_temporary_are_refused() {
-        for bad in [
-            "../x",
-            "a/../../x",
-            "/etc/passwd",
-            "",
-            "a//b",
-            "x.partial",
-            ".fastsync/tmp",
-            "Um teste/My Paper doc.paper",
-        ] {
-            assert!(!safe_rel(bad), "{bad}");
-        }
-        assert!(safe_rel("dir/file.txt") && safe_rel("..hidden"));
-    }
-
-    #[test]
-    fn native_client_files_are_ignored() {
-        for name in [
-            ".dropbox",
-            ".dropbox.cache",
-            ".dropbox.attr",
-            ".tmp.drivedownload",
-            ".tmp.driveupload",
-            ".debris",
-            ".DS_Store",
-            "Thumbs.db",
-            "Desktop.ini",
-            "Icon\r",
-            "~$report.docx",
-        ] {
-            assert!(
-                ignored(name) && !safe_rel(name) && !safe_rel(&format!("a/{name}/x")),
-                "{name}"
-            );
-        }
-        for name in ["rules.dropboxignore", ".megaignore", "a~$b.txt", "dropbox.txt"] {
-            assert!(!ignored(name), "{name}");
-        }
-    }
-}
+mod tests;

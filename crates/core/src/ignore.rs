@@ -18,7 +18,8 @@ impl Rules {
     /// The gitignore subset: comments, `!`, trailing `/`, leading or inner `/` anchors, `*`, `?`, `[a-z]`, `**`.
     pub fn parse(text: &str) -> Self {
         let mut rules = Vec::new();
-        for line in text.lines() {
+        // Windows editors may save a BOM, which would otherwise stick to the first rule and make it match nothing.
+        for line in text.trim_start_matches('\u{feff}').lines() {
             // Trailing spaces are dropped unless escaped; `\ ` is rare enough to leave out.
             let mut s = line.trim_end();
             if s.is_empty() || s.starts_with('#') {
@@ -168,6 +169,11 @@ mod tests {
 
     fn m(rules: &str, path: &str) -> bool {
         Rules::parse(rules).matches(path)
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_disable_the_first_rule() {
+        assert!(m("\u{feff}*.log\r\nbuild/\r\n", "x/a.log") && m("\u{feff}*.log\r\nbuild/\r\n", "build/o"));
     }
 
     #[test]

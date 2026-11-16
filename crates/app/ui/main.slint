@@ -54,6 +54,19 @@ export global Tr {
     public pure function log-last-ok(when: string) -> string { return @tr("Last file synced: {}", when); }
     public pure function log-last-bad(when: string) -> string { return @tr("Last problem: {}", when); }
     public pure function log-scan-full(changed: int, failed: int, secs: string) -> string { return @tr("Full check: {} changed, {} failed, {} s", changed, failed, secs); }
+    public pure function log-scan-why(code: string) -> string {
+        if code == "reset" { return @tr("first check or the cloud's change list restarted"); }
+        if code == "feed" { return @tr("a folder changed in the cloud"); }
+        if code == "tick" { return @tr("scheduled"); }
+        if code == "now" { return @tr("Sync now"); }
+        if code == "decision" { return @tr("your answer to a stopped sync"); }
+        if code == "rules" { return @tr("ignore rules or folders changed"); }
+        if code == "retry" { return @tr("retry after an error"); }
+        if code == "rescan" { return @tr("started or rescanned"); }
+        if code == "moves" { return @tr("possible move or many changes"); }
+        if code == "resume" { return @tr("resumed after a pause"); }
+        return code;
+    }
     public pure function log-scan-paths(changed: int, failed: int, secs: string) -> string { return @tr("Quick check: {} changed, {} failed, {} s", changed, failed, secs); }
 }
 
@@ -1095,6 +1108,12 @@ component AccountCard inherits Rectangle {
             color: Family.muted;
             font-size: Family.caption;
             avail: root.width - 24px;
+        }
+        // `deletes` holds the count of problems here; only shown when there are several (so no singular form).
+        if root.acct.state == 3 && root.acct.deletes > 1: Text {
+            text: @tr("{} problems in total, see the activity log", root.acct.deletes);
+            color: Family.muted;
+            font-size: Family.caption;
         }
         if root.acct.state == 4: HintText {
             text: @tr("{} of {} files would be deleted. Nothing syncs until you choose.", root.acct.deletes, root.acct.known);

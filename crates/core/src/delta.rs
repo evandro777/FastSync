@@ -275,7 +275,8 @@ impl RemoteChanges for Drive {
         let (mut token, mut out) = (cursor.to_string(), Vec::new());
         loop {
             let url = format!(
-                "{DRIVE}/changes?pageToken={token}&pageSize=1000&includeRemoved=true&fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(name,parents,mimeType,trashed))"
+                "{DRIVE}/changes?pageToken={}&pageSize=1000&includeRemoved=true&fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(name,parents,mimeType,trashed))",
+                crate::web::enc(&token)
             );
             let (st, v) = self.http.get(&url)?;
             if st == 410 || st == 404 {
@@ -373,6 +374,10 @@ impl RemoteChanges for OneDrive {
     fn poll(&mut self, cursor: &str) -> Result<Poll> {
         let (mut url, mut out) = (cursor.to_string(), Vec::new());
         loop {
+            // The bearer token goes to this address: only ever Graph's own host (its links need not echo our path).
+            if !url.starts_with("https://graph.microsoft.com/") {
+                return Ok(Poll::Reset);
+            }
             let (st, v) = self.http.get(&url)?;
             if st == 410 {
                 return Ok(Poll::Reset);
@@ -425,9 +430,19 @@ pub fn onedrive_items(v: &Value) -> Vec<Change> {
 #[derive(Debug, Default, PartialEq)]
 pub struct Impact {
     pub paths: Vec<String>,
-    /// A folder was created, moved or renamed: its children's paths changed without being reported.
+    /// Cloud folders whose contents the feed did not report (a new or moved Dropbox folder): the engine lists just
+    /// these, which is one request, instead of the whole cloud, which is minutes. Every folder FastSync uploads into
+    /// comes back through the feed this way.
+    pub dirs: Vec<String>,
+    /// A folder was created, moved or renamed and only the whole cloud can tell what changed (Drive and OneDrive
+    /// report ids, so the new paths are unknown), or a big batch of deletions that may be half of a move.
     pub full_scan: bool,
 }
+
+/// Deletions in one batch that make the engine look at the whole cloud: a folder renamed in the cloud can arrive as its
+/// deletions first and the new name in a later batch, which only a full scan sees at once and pairs as a move. A
+/// smaller batch goes by path: at worst a split move of fewer files is trashed here and downloaded again.
+const SPLIT_MOVE_MIN: usize = 50;
 
 /// `dirs` maps folder id -> path inside the synced folder; `root` is the synced folder's own id; `path_of_id`
 /// finds the path of a file we already synced (deletions and moves only carry the id).
@@ -437,20 +452,20 @@ pub fn impact(
     root: Option<&str>,
     path_of_id: impl Fn(&str) -> Option<String>,
 ) -> Impact {
-    // A folder renamed in the cloud arrives as its deletions, the new name possibly in a later batch: only a full
-    // scan sees both sides at once and can pair them as a move. shortcut: a small burst still goes by path.
+    // shortcut: a smaller batch of deletions goes by path (see `SPLIT_MOVE_MIN`); raise the cost of a split move
+    // only if folders of more than 50 files are often renamed in the cloud and the re-download shows.
     let mut out = Impact {
-        full_scan: changes.iter().filter(|c| c.removed).count() >= 5,
+        full_scan: changes.iter().filter(|c| c.removed).count() >= SPLIT_MOVE_MIN,
         ..Default::default()
     };
     for c in changes {
         if let Some(p) = &c.path {
-            // A new or moved Dropbox folder: what is inside it is not listed, so look at everything.
+            // A new or moved Dropbox folder: what is inside it is not reported, so that folder is listed (and the
+            // folder itself looked at, for the files already here).
             if c.is_dir && !c.removed {
-                out.full_scan = true;
-            } else {
-                out.paths.push(p.clone());
+                out.dirs.push(p.clone());
             }
+            out.paths.push(p.clone());
             continue;
         }
         let parent = if Some(c.parent.as_str()) == root {
@@ -491,6 +506,8 @@ pub fn impact(
     }
     out.paths.sort();
     out.paths.dedup();
+    out.dirs.sort();
+    out.dirs.dedup();
     out
 }
 
@@ -622,6 +639,7 @@ mod tests {
             i,
             Impact {
                 paths: vec!["a.txt".into(), "docs/b.txt".into()],
+                dirs: vec![],
                 full_scan: false
             }
         );
@@ -659,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn dropbox_folder_entries_trigger_a_scan_and_deletions_do_not() {
+    fn a_dropbox_folder_is_listed_alone_and_only_a_big_batch_of_deletions_scans_everything() {
         let file = Change {
             path: Some("a/b.txt".into()),
             ..Default::default()
@@ -679,6 +697,27 @@ mod tests {
             impact(&[file, gone], &HashMap::new(), None, none).paths,
             ["a", "a/b.txt"]
         );
-        assert!(impact(&[dir], &HashMap::new(), None, none).full_scan);
+        // A new or moved folder: just it is listed, not the whole cloud (its own upload comes back this way too).
+        let i = impact(&[dir], &HashMap::new(), None, none);
+        assert!(!i.full_scan);
+        assert_eq!((i.dirs, i.paths), (vec!["a".to_string()], vec!["a".to_string()]));
+        // A deleted folder is a path to look at, never a folder to list.
+        let gone_again = Change {
+            path: Some("a".into()),
+            removed: true,
+            ..Default::default()
+        };
+        assert!(impact(&[gone_again], &HashMap::new(), None, none).dirs.is_empty());
+        let deleted = |n: usize| -> Vec<Change> {
+            (0..n)
+                .map(|i| Change {
+                    path: Some(format!("d/{i}")),
+                    removed: true,
+                    ..Default::default()
+                })
+                .collect()
+        };
+        assert!(!impact(&deleted(SPLIT_MOVE_MIN - 1), &HashMap::new(), None, none).full_scan);
+        assert!(impact(&deleted(SPLIT_MOVE_MIN), &HashMap::new(), None, none).full_scan);
     }
 }

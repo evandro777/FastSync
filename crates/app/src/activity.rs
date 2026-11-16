@@ -69,7 +69,8 @@ fn row(tr: &Tr, e: &LogEntry) -> LogRow {
         let mut n = e.msg.split(' ').map(|v| v.parse::<i32>().unwrap_or(0));
         let (changed, failed) = (n.next().unwrap_or(0), n.next().unwrap_or(0));
         let secs = format!("{:.1}", e.size.unwrap_or(0) as f64 / 1000.0);
-        let title = if e.path == "full" {
+        let meta = e.path.strip_prefix("full:").map(|w| tr.invoke_log_scan_why(w.into()));
+        let title = if e.path.starts_with("full") {
             tr.invoke_log_scan_full(changed, failed, secs.into())
         } else {
             tr.invoke_log_scan_paths(changed, failed, secs.into())
@@ -77,7 +78,7 @@ fn row(tr: &Tr, e: &LogEntry) -> LogRow {
         return LogRow {
             kind,
             title,
-            meta: "".into(),
+            meta: meta.unwrap_or_default(),
             when: when.into(),
             detail: "".into(),
             path: "".into(),
@@ -239,7 +240,8 @@ pub fn fixture(ui: &Main, mode: usize) {
             Some(3_100_220),
             "Photos/holiday/IMG_2042.jpg",
         ),
-        e(26, "scan", "full", Some(2100), "2 0"),
+        e(26, "scan", "full:feed", Some(2100), "2 0"),
+        e(40, "scan", "full:reset", Some(9400), "0 0"),
         e(
             3 * 3600,
             "error",

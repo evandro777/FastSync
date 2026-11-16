@@ -34,6 +34,8 @@ pub enum Status {
     Stopped(usize, usize, Vec<String>),
     /// A technical message from rclone, the OS or the provider.
     Error(String),
+    /// A run with several problems: the first message and the count (the UI words the count, so it translates).
+    Problems(String, usize),
 }
 
 enum Event {
@@ -46,8 +48,13 @@ enum Event {
     Root(Option<String>),
     /// Compare the local folder with the DB (offline edits, missed inotify events).
     Walk,
-    /// A full comparison asked for (start-up, a retry, a rescan).
+    /// A full comparison asked for (start-up, a rescan, a feed that was reset).
     Full,
+    /// A retry came due (`Retry::take_due` says what it runs): only wakes the loop.
+    Retry,
+    /// The feed answers again after failing. Its cursor did not move meanwhile, so nothing was missed: no scan, just
+    /// a walk that clears the old message.
+    Recovered,
     /// The `SCAN_EVERY` timer of a provider without a feed. Ticks pile up while a long run works, so one is only
     /// taken when the last full scan ended long enough ago (`scan_due`): else a listing slower than the interval
     /// would start again the moment it ended, for ever.
@@ -170,33 +177,158 @@ fn retry_after(fails: u32) -> Duration {
     (RETRY_AFTER * (1 << fails.saturating_sub(1).min(5))).min(RETRY_MAX)
 }
 
-/// When the next full retry is due after failed runs. A failed cloud change leaves nothing to find it again (the feed's
-/// paths are dropped, the local walk only sees local edits), so the retry must survive clean runs of other paths: only
-/// a clean full scan ends it, and the feed's cursor is not saved before that.
+/// More failed paths than this are as good as a full scan: the list is dropped and the retry becomes one.
+const RETRY_PATHS_MAX: usize = 5000;
+
+/// What a due retry runs.
+#[derive(Debug, PartialEq)]
+enum Due {
+    /// Something only a whole comparison can retry went wrong (the cloud listing, the state DB).
+    Full,
+    /// The paths whose own action failed: one lookup and one transfer each, no cloud listing (minutes on a big cloud).
+    Paths(Vec<String>),
+}
+
+/// What failed and when to try again. A failed cloud change leaves nothing to find it again (the feed's paths are
+/// dropped, the local walk only sees local edits), so the failed paths are remembered here, and in the DB (`retry`)
+/// so a restart still has them: that is what lets the feed's cursor be saved while a file keeps failing, and what
+/// keeps one unreadable file from costing a listing of the whole cloud every time.
 #[derive(Default)]
 struct Retry {
     fails: u32,
+    /// Back-off for files that changed under their transfer (`Report::later`), apart from real failures.
+    later_fails: u32,
     at: Option<Instant>,
+    /// Only a full scan retries this, until a clean one has run.
+    full: bool,
+    /// Paths to look at again by themselves (`Report::failed` and `Report::later`).
+    paths: BTreeSet<String>,
+    /// The text last written to the DB, so an idle loop writes nothing.
+    saved: Option<String>,
 }
 
 impl Retry {
-    fn pending(&self) -> bool {
-        self.at.is_some()
+    /// What the last run left behind. Whatever is there is due at once: it was waiting when the app closed.
+    fn load(db: &Db) -> Self {
+        let mut r = Self::default();
+        let Ok(Some(text)) = db.meta("retry") else {
+            return r;
+        };
+        // A value that cannot be read is a full scan, the safe side.
+        match serde_json::from_str::<(bool, BTreeSet<String>)>(&text) {
+            Ok((full, paths)) => (r.full, r.paths) = (full, paths),
+            Err(_) => r.full = true,
+        }
+        r.saved = Some(text);
+        r.at = Some(Instant::now());
+        r
+    }
+    /// False when the DB could not take it: the caller then keeps the feed's cursor back, or a restart would lose the
+    /// failed paths the cursor moved past.
+    fn save(&mut self, db: &Db) -> bool {
+        if !self.full && self.paths.is_empty() {
+            if self.saved.is_none() {
+                return true;
+            }
+            let ok = db.del_meta("retry").is_ok();
+            if ok {
+                self.saved = None;
+            }
+            return ok;
+        }
+        let Ok(text) = serde_json::to_string(&(self.full, &self.paths)) else {
+            return false;
+        };
+        if self.saved.as_deref() == Some(&text) {
+            return true;
+        }
+        let ok = db.set_meta("retry", &text).is_ok();
+        if ok {
+            self.saved = Some(text);
+        }
+        ok
     }
     fn wait(&self, now: Instant) -> Option<Duration> {
         self.at.map(|t| t.saturating_duration_since(now))
     }
-    /// True once, when the retry is due: the caller then runs a full scan (which sets it again if it fails).
-    fn take_due(&mut self, now: Instant) -> bool {
-        self.at.is_some_and(|t| now >= t) && self.at.take().is_some()
+    /// What is due now, once. The run's `record` sets it again if it fails.
+    fn take_due(&mut self, now: Instant) -> Option<Due> {
+        if !self.at.is_some_and(|t| now >= t) {
+            return None;
+        }
+        self.at = None;
+        Some(if self.full {
+            Due::Full
+        } else {
+            Due::Paths(self.paths.iter().cloned().collect())
+        })
     }
-    fn after_run(&mut self, failed: bool, was_full: bool, now: Instant) {
-        if failed {
+    /// Takes in a finished run: `ran` the paths it looked at, `did_full` a whole comparison. A clean full scan ends
+    /// everything; a run of some paths only the failures among them, so a retry survives clean runs of other paths.
+    fn record(&mut self, r: &Report, ran: &[String], did_full: bool, now: Instant) {
+        let global = r.has_global_failure();
+        if did_full && !global {
+            // Everything was compared again: what failed is now exactly `r.failed`.
+            (self.full, self.paths) = (false, BTreeSet::new());
+        } else {
+            for p in ran {
+                self.paths.remove(p);
+            }
+        }
+        self.full |= global;
+        self.paths.extend(r.failed.iter().chain(&r.later).cloned());
+        if self.paths.len() > RETRY_PATHS_MAX {
+            (self.full, self.paths) = (true, BTreeSet::new());
+        }
+        let failed = global || !r.failed.is_empty();
+        if !self.full && self.paths.is_empty() {
+            (self.fails, self.later_fails, self.at) = (0, 0, None);
+        } else if failed {
             self.fails = self.fails.saturating_add(1);
             self.at = Some(now + retry_after(self.fails));
-        } else if was_full {
-            *self = Self::default();
+        } else if !r.later.is_empty() {
+            // A file that changed under its transfer is no failure, but one that keeps changing (a database, a VM
+            // image) would otherwise be uploaded in part every minute for ever: 1, 2, 4 ... 30 minutes. Never later
+            // than a retry already waiting for something that really failed.
+            self.later_fails = self.later_fails.saturating_add(1);
+            let t = now + retry_after(self.later_fails);
+            self.at = Some(self.at.map_or(t, |a| a.min(t)));
+        } else if self.at.is_none() {
+            self.at = Some(now + RETRY_AFTER);
         }
+    }
+    /// What the loop does after a run: takes it in, and a stopped run's decision that is still unconfirmed makes the
+    /// retry a full scan (the paths that failed in it do not carry the decision out).
+    fn finish_run(&mut self, r: &Report, ran: &[String], did_full: bool, decision_pending: bool, now: Instant) {
+        self.record(r, ran, did_full, now);
+        if decision_pending {
+            self.escalate(now);
+        }
+    }
+    /// Makes the retry a full scan: a stopped run's decision (delete or restore) is only carried out and cleared by a
+    /// clean whole comparison, not by the paths that failed in it.
+    fn escalate(&mut self, now: Instant) {
+        (self.full, self.paths) = (true, BTreeSet::new());
+        if self.at.is_none() {
+            self.fails = self.fails.max(1);
+            self.at = Some(now + retry_after(self.fails));
+        }
+    }
+    /// Writes what the run left (the failed paths) and then, only if that worked and the run may confirm it, the feed's
+    /// cursor; true when the cursor was written. The order is the point: a failed change is in `retry` (and in the DB),
+    /// so the cursor can move past it, and a crash between the two writes replays the feed from the old cursor instead
+    /// of losing it. A `retry` the DB could not take keeps the cursor back: the failed paths would be safe nowhere.
+    fn persist(&mut self, db: &Db, r: &Report, cursor: Option<&str>) -> bool {
+        let remembered = self.save(db);
+        match cursor {
+            Some(c) if remembered && self.may_confirm(r) => db.set_meta("cursor", c).is_ok(),
+            _ => false,
+        }
+    }
+    /// True when the run may confirm the feed's cursor: nothing needs a full scan, and what failed is remembered (and
+    /// saved before the cursor), so a restart need not read the whole cloud again to find it.
+    fn may_confirm(&self, r: &Report) -> bool {
+        r.aborted.is_none() && !r.cancelled && !r.has_global_failure() && !self.full
     }
 }
 
@@ -267,7 +399,7 @@ fn work(
     let db = Db::open(&dir.join("state.db")).map_err(|e| e.to_string())?;
     // A folder that vanished after files were synced (an unmounted drive) must not be recreated empty: that looks
     // exactly like "the user deleted everything".
-    if !root.exists() && db.all().is_ok_and(|v| !v.is_empty()) {
+    if !root.exists() && db.count().is_ok_and(|n| n > 0) {
         return Err(format!("{}: folder not found (unmounted?)", root.display()));
     }
     std::fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
@@ -373,15 +505,20 @@ fn work(
     }
     // `pending`: paths from inotify; `feed_paths`: paths from the cloud's feed (see `Engine::paths_to_sync`).
     let (mut pending, mut feed_paths) = (BTreeSet::new(), BTreeSet::new());
+    // Cloud folders the feed reported without their contents (a new or moved Dropbox folder): listed alone by the run.
+    let mut feed_dirs: BTreeSet<String> = BTreeSet::new();
     let (mut full, mut walk) = (excluded_changed, false);
+    // Why the next full scan runs (the first cause wins), written to the log as `full:<why>`.
+    // The start-up scan (also after Edit, which restarts the runner) is the one `excluded_changed` asks for.
+    let mut why: &'static str = "rescan";
     // The first loop turn waits for an event: this one makes it run the scan.
     if excluded_changed {
         let _ = tx.send(Event::Full);
     }
     let mut excluded_pending = excluded_changed;
     let mut new_cursor: Option<String> = None;
-    // Runs in a row that ended with errors: each one waits longer before the retry.
-    let mut retry = Retry::default();
+    // What failed in the runs so far (and in the last session): retried by itself, each failing run waits longer.
+    let mut retry = Retry::load(&engine.db);
     // Files kept twice since the last alert, and when the alert is due (checked on every turn, so a steady trickle of
     // events cannot hold it back for ever).
     let mut conflicts: Vec<String> = Vec::new();
@@ -406,7 +543,7 @@ fn work(
             Ok(e) => vec![e],
             // The alert timer, not the retry one: nothing to scan, the top of the loop announces.
             Err(RecvTimeoutError::Timeout) if !conflicts.is_empty() && Instant::now() >= alert_at => continue,
-            Err(RecvTimeoutError::Timeout) => vec![Event::Full],
+            Err(RecvTimeoutError::Timeout) => vec![Event::Retry],
             Err(RecvTimeoutError::Disconnected) => break,
         };
         // A burst (an editor saving, a folder copied in) is handled as one run: wait until it goes quiet.
@@ -426,12 +563,15 @@ fn work(
                     let i = delta::impact(&changes, &dirs, root_id.as_deref(), |id| {
                         db.path_of_id(id).ok().flatten()
                     });
-                    full |= i.full_scan;
+                    if i.full_scan {
+                        mark(&mut full, &mut why, "feed");
+                    }
                     feed_paths.extend(i.paths);
+                    feed_dirs.extend(i.dirs);
                     new_cursor = Some(cur);
                 }
                 Event::Reset(cur) => {
-                    full = true;
+                    mark(&mut full, &mut why, "reset");
                     new_cursor = Some(cur);
                 }
                 Event::Root(id) => root_id = id,
@@ -444,14 +584,20 @@ fn work(
                         last_walk = Some(Instant::now());
                     }
                 }
-                Event::Full => full = true,
-                Event::Tick => full |= scan_due(last_full_end.map(|t| t.elapsed())),
-                Event::SyncNow => full = true,
+                Event::Full => mark(&mut full, &mut why, "rescan"),
+                Event::Retry => {}
+                Event::Recovered => walk = true,
+                Event::Tick => {
+                    if scan_due(last_full_end.map(|t| t.elapsed())) {
+                        mark(&mut full, &mut why, "tick");
+                    }
+                }
+                Event::SyncNow => mark(&mut full, &mut why, "now"),
                 Event::Resolve(d) => {
                     // Only a held account has anything to resolve, and a mirror cannot put files back in the cloud.
                     if held.is_some() && !(d == Decision::Restore && acct.download_only) {
                         resolution = Some(d);
-                        full = true;
+                        mark(&mut full, &mut why, "decision");
                     }
                 }
                 Event::Pause(p) => {
@@ -494,11 +640,17 @@ fn work(
             engine.ignore = Rules::parse(&now);
             excluded_key = format!("{}\n\0\n{now}", acct.excluded.join("\n"));
             rules_text = now;
-            (full, excluded_pending) = (true, true);
+            mark(&mut full, &mut why, "rules");
+            excluded_pending = true;
         }
         // Taken here, not in the run: a paused or held account must not spin on a retry that is already due (the full
-        // scan flag stays set until it can run).
-        full |= retry.take_due(Instant::now());
+        // scan flag and the queued paths stay until it can run). The paths join the feed's: never dropped as an echo of
+        // our own write, which a failed cloud change (the local copy untouched) would be.
+        match retry.take_due(Instant::now()) {
+            Some(Due::Full) => mark(&mut full, &mut why, "retry"),
+            Some(Due::Paths(p)) => feed_paths.extend(p),
+            None => {}
+        }
         if paused {
             continue;
         }
@@ -507,6 +659,7 @@ fn work(
         if held.is_some() && resolution.is_none() {
             pending.clear();
             feed_paths.clear();
+            feed_dirs.clear();
             continue;
         }
         if !(full || walk || !pending.is_empty() || !feed_paths.is_empty()) {
@@ -519,34 +672,42 @@ fn work(
         engine.restore = resolution == Some(Decision::Restore);
         let progress = engine.progress.clone();
         let over = AtomicBool::new(false);
-        let (began, was_full) = (Instant::now(), full);
-        let report = std::thread::scope(|s| {
+        let began = Instant::now();
+        // The report, the paths and cloud folders the run looked at (none for a full scan) and whether it compared
+        // everything.
+        let (report, ran, ran_dirs, did_full) = std::thread::scope(|s| {
             s.spawn(|| ticker(&rc, &acct.id, &progress, &*on_status, &over));
             // Raised when this closure ends, however it ends: `scope` joins the ticker before it lets a panic out.
             let _end = EndRun(&over);
             if full {
                 on_status(syncing());
-                engine.full_scan()
+                (engine.full_scan(), Vec::new(), Vec::new(), true)
             } else {
                 let paths = engine.paths_to_sync(
                     std::mem::take(&mut pending).into_iter().collect(),
                     std::mem::take(&mut feed_paths).into_iter().collect(),
                     walk,
                 );
+                let dirs: Vec<String> = std::mem::take(&mut feed_dirs).into_iter().collect();
                 if paths.is_empty() {
                     // The 2-minute walk that finds nothing must not flash "Syncing".
-                    Report::default()
+                    (Report::default(), paths, dirs, false)
                 } else {
                     on_status(syncing());
-                    let r = engine.sync_paths(&paths);
+                    let r = engine.sync_paths_in(&paths, &dirs);
                     // A folder renamed in the cloud can arrive as its deletions first and the new name in a later
                     // batch: a stop here may be a move only a full scan (which pairs them) can see.
-                    if r.aborted.is_some() { engine.full_scan() } else { r }
+                    if r.aborted.is_some() || r.wants_full {
+                        (engine.full_scan(), paths, dirs, true)
+                    } else {
+                        (r, paths, dirs, false)
+                    }
                 }
             }
         });
         pending.clear();
         feed_paths.clear();
+        feed_dirs.clear();
         conflicts.extend(report.conflicts.iter().cloned());
         // Any run while an alert waits (more files arriving) pushes it back: one alert for the whole burst.
         if !conflicts.is_empty() {
@@ -554,29 +715,45 @@ fn work(
         }
         // A run that did nothing (the 2-minute walk) leaves no trace, or it would flood the log. The `scan` row holds
         // values only (path = mode, size = milliseconds, msg = "transfers problems"); the dialog words it.
-        if report.transferred > 0 || !report.errors.is_empty() {
+        // A full scan is always logged with its cause, except the quiet 5-minute tick of providers without a feed.
+        let cause = if full { why } else { "moves" };
+        if report.transferred > 0 || !report.errors.is_empty() || (did_full && cause != "tick") {
             engine.db.log(
                 "scan",
-                if was_full { "full" } else { "paths" },
+                &if did_full {
+                    format!("full:{cause}")
+                } else {
+                    "paths".to_string()
+                },
                 Some(began.elapsed().as_millis() as u64),
                 &format!("{} {}", report.transferred, report.errors.len()),
             );
         }
         engine.db.trim_log();
         // Cut short by Pause or Stop: the event that did it is next in the queue. Nothing is confirmed (no cursor, no
-        // "up to date", no decision carried out), and a full scan reads everything again when the account goes on.
+        // "up to date", no decision carried out). A full scan is read again in full when the account goes on; a run of
+        // some paths only needs those paths again, not a listing of the whole cloud.
         if report.cancelled {
-            (full, walk) = (true, false);
+            let (again_full, again) = after_cancel(did_full, ran);
+            if again_full {
+                mark(&mut full, &mut why, "resume");
+            }
+            if !again_full {
+                feed_paths.extend(again);
+                feed_dirs.extend(ran_dirs);
+            }
+            walk = false;
             (engine.confirmed_deletes, engine.restore) = (None, false);
             continue;
         }
-        // Only a clean full scan counts: after an error or a stop the next start must scan again.
-        if full && excluded_pending && clean(&report) {
+        // Only a whole scan with nothing global wrong counts: after a stop, a cut or a failed listing the next start
+        // must scan again. A file that failed does not hold it back: it is retried by its path.
+        if full && excluded_pending && settled(&report) {
             let _ = engine.db.set_meta("excluded", &excluded_key);
             excluded_pending = false;
         }
         (full, walk) = (false, false);
-        if was_full {
+        if did_full {
             last_full_end = Some(Instant::now());
         }
         (engine.confirmed_deletes, engine.restore) = (None, false);
@@ -589,20 +766,18 @@ fn work(
             };
             h.save(&engine.db);
             (held, resolution) = (Some(h), None);
-        } else if clean(&report) && resolution.take().is_some() {
-            // The decision was carried out. After errors it stays, and the retry carries it out again.
+        } else if did_full && clean(&report) && resolution.take().is_some() {
+            // The decision was carried out, by a whole comparison (a run of some paths proves nothing about the rest).
             let _ = engine.db.del_meta("held");
             held = None;
         }
-        retry.after_run(!report.errors.is_empty(), was_full, Instant::now());
-        // Only after a clean run with no retry waiting: a change that failed to sync must be read again after a
-        // restart, even when a later run of other paths was clean. The retry (a full scan) covers it while the app
-        // stays up, and the cursor is saved once that scan is clean.
-        if clean(&report)
-            && !retry.pending()
-            && let Some(c) = new_cursor.take()
-        {
-            let _ = engine.db.set_meta("cursor", &c);
+        if report.aborted.is_none() {
+            // A stopped run's decision is not carried out by the paths that failed in it: only a clean full scan
+            // does that, so with one pending the retry is a full scan.
+            retry.finish_run(&report, &ran, did_full, resolution.is_some(), Instant::now());
+        }
+        if retry.persist(&engine.db, &report, new_cursor.as_deref()) {
+            new_cursor = None;
         }
         on_status(summary(&report));
     }
@@ -613,13 +788,14 @@ fn summary(r: &Report) -> Status {
     if let Some((deletes, known, paths)) = &r.aborted {
         return Status::Stopped(*deletes, *known, paths.clone());
     }
-    match r.errors.first() {
-        Some(e) => Status::Error(format!(
-            "{} ({} problems)",
-            e.chars().take(140).collect::<String>(),
-            r.errors.len()
-        )),
-        None => Status::Idle(now_secs()),
+    let Some(e) = r.errors.first() else {
+        return Status::Idle(now_secs());
+    };
+    let e = e.chars().take(140).collect::<String>();
+    if r.errors.len() > 1 {
+        Status::Problems(e, r.errors.len())
+    } else {
+        Status::Error(e)
     }
 }
 
@@ -704,11 +880,33 @@ impl Drop for EndRun<'_> {
     }
 }
 
-/// True when a run finished with nothing wrong and nothing cut short: only then may it confirm anything (save the
-/// feed cursor or the unchecked-folders key, clear a held decision). After an error, a stop or a Pause, the next scan
-/// must read it all again.
+/// What a cut-short run leaves to do: `(scan everything, paths to look at again)`. A cut-off full scan starts over; a
+/// run of some paths only needs those paths again, not a listing of the whole cloud.
+/// Asks for a full scan; the first cause stays the one the log shows.
+fn mark(full: &mut bool, why: &mut &'static str, cause: &'static str) {
+    if !*full {
+        *why = cause;
+    }
+    *full = true;
+}
+
+fn after_cancel(did_full: bool, ran: Vec<String>) -> (bool, Vec<String>) {
+    if did_full { (true, Vec::new()) } else { (false, ran) }
+}
+
+/// True when a full scan may confirm the unchecked-folders key: it was whole (not stopped or cut short) and nothing
+/// that is not about one file went wrong. A file that failed is retried by its path, and the failures that matter to
+/// this key (a folder that could not be trashed) are not about one file, so one stuck file cannot keep it open and
+/// cost a listing of the whole cloud at every restart.
+fn settled(r: &Report) -> bool {
+    !r.has_global_failure() && r.aborted.is_none() && !r.cancelled
+}
+
+/// True when a run finished with nothing wrong and nothing cut short: only then may it clear a held decision. After an error, a stop or a Pause, the next scan must read it all again. A skipped
+/// path (two names that differ only by case) is a state of the tree, not a failure: it is looked at again by every
+/// full scan, and counting it here would keep a permanent clash from ever confirming anything.
 fn clean(r: &Report) -> bool {
-    r.errors.is_empty() && r.aborted.is_none() && !r.cancelled
+    r.errors.len() <= r.skipped && r.aborted.is_none() && !r.cancelled
 }
 
 /// Runs the provider's feed: long polls (Dropbox) or polls every 30 s, and hands the changes to the worker.
@@ -756,9 +954,10 @@ fn poller(mut feed: Box<dyn delta::RemoteChanges>, cursor: Option<String>, tx: S
             };
             match step {
                 Ok(ev) => {
-                    // Back after an error: the card still shows the old message, and a full comparison both
-                    // catches what was missed meanwhile and clears it.
-                    let ev = ev.or_else(|| failures.take().map(|_| Event::Full));
+                    // Back after an error: the card still shows the old message. The cursor did not move while the
+                    // feed failed, so nothing was missed and no scan is needed (a listing of the whole cloud takes
+                    // minutes after any network blip): a local walk is enough to clear the message.
+                    let ev = ev.or_else(|| failures.take().map(|_| Event::Recovered));
                     failures = None;
                     if let Some(ev) = ev
                         && tx.send(ev).is_err()
@@ -783,6 +982,19 @@ fn poller(mut feed: Box<dyn delta::RemoteChanges>, cursor: Option<String>, tx: S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_cause_of_a_full_scan_is_the_one_logged() {
+        let (mut full, mut why) = (false, "rescan");
+        mark(&mut full, &mut why, "now");
+        mark(&mut full, &mut why, "feed");
+        assert!(full);
+        assert_eq!(why, "now");
+        // A scan that ran resets `full`: the next cause counts again.
+        full = false;
+        mark(&mut full, &mut why, "feed");
+        assert_eq!(why, "feed");
+    }
 
     #[test]
     fn a_held_run_survives_the_db_and_a_bad_value_still_holds() {
@@ -825,23 +1037,229 @@ mod tests {
         assert_eq!((secs(6), secs(7), secs(1000)), (1800, 1800, 1800));
     }
 
+    /// A run whose given paths failed, and one that failed in a way only a full scan can retry (a listing).
+    fn failed(paths: &[&str]) -> Report {
+        let mut r = Report::default();
+        for p in paths {
+            r.fail(p, "boom");
+        }
+        r
+    }
+    fn global() -> Report {
+        let mut r = Report::default();
+        r.errors.push("listing the cloud failed".into());
+        r
+    }
+    fn s(p: &[&str]) -> Vec<String> {
+        p.iter().map(|p| p.to_string()).collect()
+    }
+
     #[test]
-    fn a_clean_run_of_other_paths_does_not_cancel_the_retry_of_a_failed_one() {
+    fn a_failed_path_is_retried_alone_and_a_clean_run_of_other_paths_does_not_cancel_it() {
         let (mut r, t0) = (Retry::default(), Instant::now());
-        r.after_run(true, false, t0);
-        assert!(r.pending());
+        let secs = Duration::from_secs;
+        r.record(&failed(&["a"]), &s(&["a"]), false, t0);
+        assert!(!r.full, "one failed file is no reason to list the cloud");
+        assert!(
+            r.may_confirm(&failed(&["a"])),
+            "the cursor moves on: the path is remembered"
+        );
         // Another change arrives and syncs fine before the retry is due.
-        r.after_run(false, false, t0 + Duration::from_secs(10));
-        assert!(r.pending(), "the failed change would be lost");
-        assert!(!r.take_due(t0 + Duration::from_secs(30)));
-        // Due: taken once, and a clean full scan ends it.
-        assert!(r.take_due(t0 + Duration::from_secs(61)));
-        assert!(!r.take_due(t0 + Duration::from_secs(62)));
-        r.after_run(true, true, t0 + Duration::from_secs(62));
-        assert_eq!(r.wait(t0 + Duration::from_secs(62)), Some(Duration::from_secs(120)));
-        r.after_run(false, true, t0 + Duration::from_secs(200));
-        assert!(!r.pending());
+        r.record(&Report::default(), &s(&["b"]), false, t0 + secs(10));
+        assert_eq!(r.take_due(t0 + secs(30)), None);
+        // Due: taken once, and it names just the failed path.
+        assert_eq!(r.take_due(t0 + secs(61)), Some(Due::Paths(s(&["a"]))));
+        assert_eq!(r.take_due(t0 + secs(62)), None);
+        // It fails again: a longer wait, still no full scan.
+        r.record(&failed(&["a"]), &s(&["a"]), false, t0 + secs(62));
+        assert_eq!(r.wait(t0 + secs(62)), Some(secs(120)));
+        assert!(!r.full);
+        // It works: nothing is left.
+        r.record(&Report::default(), &s(&["a"]), false, t0 + secs(200));
+        assert!(r.wait(t0 + secs(200)).is_none() && r.paths.is_empty());
         assert_eq!(r.fails, 0);
+    }
+
+    #[test]
+    fn what_only_a_full_scan_can_retry_holds_the_cursor_until_one_is_clean() {
+        let (mut r, t0) = (Retry::default(), Instant::now());
+        let secs = Duration::from_secs;
+        r.record(&global(), &[], true, t0);
+        assert!(r.full && !r.may_confirm(&global()));
+        assert_eq!(r.take_due(t0 + secs(61)), Some(Due::Full));
+        // A clean run of some paths in between ends nothing, and may not confirm the cursor.
+        r.record(&Report::default(), &s(&["x"]), false, t0 + secs(70));
+        assert!(r.full && !r.may_confirm(&Report::default()));
+        // A clean full scan does, and forgets the paths it compared again.
+        r.paths.insert("old".into());
+        r.record(&failed(&["c"]), &[], true, t0 + secs(100));
+        assert!(!r.full);
+        assert_eq!(
+            r.paths.iter().collect::<Vec<_>>(),
+            ["c"],
+            "what failed is what the scan says failed"
+        );
+        r.record(&Report::default(), &[], true, t0 + secs(200));
+        assert!(r.paths.is_empty() && r.wait(t0 + secs(200)).is_none());
+        assert!(r.may_confirm(&Report::default()));
+    }
+
+    #[test]
+    fn a_file_that_changed_under_its_transfer_is_retried_soon_without_backing_off() {
+        let (mut r, t0) = (Retry::default(), Instant::now());
+        let mut rep = Report::default();
+        rep.later.push("log.txt".into());
+        r.record(&rep, &s(&["log.txt"]), false, t0);
+        assert_eq!(r.fails, 0, "an edit is no failure");
+        assert_eq!(r.wait(t0), Some(RETRY_AFTER));
+        assert_eq!(r.take_due(t0 + RETRY_AFTER), Some(Due::Paths(s(&["log.txt"]))));
+        // It changed again under the retry: a database or an image never stops, so the wait doubles, up to 30 minutes.
+        let t1 = t0 + RETRY_AFTER;
+        r.record(&rep, &s(&["log.txt"]), false, t1);
+        assert_eq!(r.wait(t1), Some(RETRY_AFTER * 2));
+        let mut t = t1;
+        for _ in 0..10 {
+            t += RETRY_MAX;
+            assert!(r.take_due(t).is_some());
+            r.record(&rep, &s(&["log.txt"]), false, t);
+        }
+        assert_eq!(r.wait(t), Some(RETRY_MAX));
+        assert_eq!(r.fails, 0);
+        // Another file that really failed is not held back by it.
+        let mut both = failed(&["a"]);
+        both.later.push("log.txt".into());
+        r.record(&both, &s(&["a", "log.txt"]), false, t);
+        assert_eq!(r.wait(t), Some(retry_after(1)));
+        // Once it settles, the back-off starts over.
+        r.record(&Report::default(), &s(&["a", "log.txt"]), false, t);
+        assert!(r.wait(t).is_none() && r.later_fails == 0);
+    }
+
+    #[test]
+    fn what_the_loop_does_after_a_run_follows_these_rules() {
+        let (mut r, t0) = (Retry::default(), Instant::now());
+        // A failed file: retried alone, the cursor may move on (it is remembered).
+        r.finish_run(&failed(&["a"]), &s(&["a"]), false, false, t0);
+        assert!(!r.full && r.may_confirm(&failed(&["a"])));
+        // A decision still unconfirmed after errors: the retry is a full scan.
+        r.finish_run(&failed(&["a"]), &[], true, true, t0);
+        assert!(r.full && r.paths.is_empty());
+        assert_eq!(r.take_due(t0 + Duration::from_secs(121)), Some(Due::Full));
+        // A cut-off run: a full scan starts over, a run of some paths only looks at those again.
+        assert_eq!(after_cancel(true, s(&["x"])), (true, vec![]));
+        assert_eq!(after_cancel(false, s(&["x", "y"])), (false, s(&["x", "y"])));
+        // The unchecked-folders key is confirmed by a whole scan whose failures are all about single files...
+        assert!(settled(&failed(&["a"])));
+        assert!(settled(&Report::default()));
+        // ...never by one that stopped, was cut short, or failed in a way that is not about one file.
+        assert!(!settled(&global()));
+        let cut = Report {
+            cancelled: true,
+            ..Default::default()
+        };
+        assert!(!settled(&cut));
+        let stopped = Report {
+            aborted: Some((1, 10, Vec::new())),
+            ..Default::default()
+        };
+        assert!(!settled(&stopped));
+    }
+
+    #[test]
+    fn too_many_failed_paths_become_a_full_scan() {
+        let (mut r, t0) = (Retry::default(), Instant::now());
+        let mut rep = Report::default();
+        for i in 0..=RETRY_PATHS_MAX {
+            rep.fail(&format!("p{i}"), "x");
+        }
+        r.record(&rep, &[], false, t0);
+        assert!(r.full && r.paths.is_empty());
+    }
+
+    #[test]
+    fn a_decision_that_failed_is_carried_out_by_a_full_scan_not_by_paths() {
+        // Also what a changed unchecked-folders list or rules file needs: its full scan failed on one file, and the key
+        // is only confirmed by a clean full scan, so the retry must be one.
+        let (mut r, t0) = (Retry::default(), Instant::now());
+        r.record(&failed(&["a"]), &[], true, t0);
+        assert!(
+            !r.full,
+            "without a decision or key to confirm a failed file is retried alone"
+        );
+        r.escalate(t0);
+        assert!(r.full && r.paths.is_empty());
+        assert_eq!(r.take_due(t0 + RETRY_AFTER), Some(Due::Full));
+        r.record(&Report::default(), &[], true, t0 + RETRY_AFTER);
+        assert!(!r.full && r.wait(t0 + RETRY_AFTER).is_none());
+    }
+
+    #[test]
+    fn the_cursor_is_written_after_the_failed_paths_and_never_without_them() {
+        let (t0, cur) = (Instant::now(), Some("cursor-2"));
+        // A failed file: the list is saved, then the cursor moves on.
+        let db = Db::memory().unwrap();
+        let mut r = Retry::default();
+        r.finish_run(&failed(&["a"]), &s(&["a"]), false, false, t0);
+        assert!(r.persist(&db, &failed(&["a"]), cur));
+        assert_eq!(db.meta("cursor").unwrap().as_deref(), Some("cursor-2"));
+        assert!(db.meta("retry").unwrap().is_some_and(|t| t.contains("\"a\"")));
+        // The DB takes the cursor but refuses the failed paths: the cursor must stay where it was.
+        let db = Db::memory().unwrap();
+        db.set_meta("cursor", "cursor-1").unwrap();
+        db.refuse_meta_key("retry");
+        let mut r = Retry::default();
+        r.finish_run(&failed(&["a"]), &s(&["a"]), false, false, t0);
+        assert!(!r.persist(&db, &failed(&["a"]), cur));
+        assert_eq!(db.meta("cursor").unwrap().as_deref(), Some("cursor-1"));
+        // A failed listing needs a full scan: the cursor stays back whatever was saved.
+        let db = Db::memory().unwrap();
+        let mut r = Retry::default();
+        r.finish_run(&global(), &[], true, false, t0);
+        assert!(!r.persist(&db, &global(), cur) && db.meta("cursor").unwrap().is_none());
+        // Nothing to remember and a clean run: the cursor moves.
+        let db = Db::memory().unwrap();
+        let mut r = Retry::default();
+        r.finish_run(&Report::default(), &[], false, false, t0);
+        assert!(r.persist(&db, &Report::default(), cur));
+        // No cursor to confirm (the feed had nothing): nothing is written.
+        assert!(!r.persist(&db, &Report::default(), None));
+    }
+
+    #[test]
+    fn a_db_that_cannot_take_the_failed_paths_keeps_the_cursor_back() {
+        let db = Db::memory().unwrap();
+        let (mut r, t0) = (Retry::default(), Instant::now());
+        r.record(&failed(&["a"]), &[], false, t0);
+        assert!(r.save(&db));
+        // A DB that refuses the write: the meta table is gone.
+        db.break_meta();
+        r.record(&failed(&["a", "b"]), &[], false, t0);
+        assert!(!r.save(&db), "the caller must not save the cursor then");
+    }
+
+    #[test]
+    fn the_failed_paths_survive_a_restart_and_an_unreadable_value_means_a_full_scan() {
+        let db = Db::memory().unwrap();
+        let (mut r, t0) = (Retry::default(), Instant::now());
+        r.save(&db);
+        assert!(
+            db.meta("retry").unwrap().is_none(),
+            "nothing to remember, nothing written"
+        );
+        r.record(&failed(&["a/b.txt", "odd\nname"]), &[], false, t0);
+        r.save(&db);
+        let mut back = Retry::load(&db);
+        assert!(!back.full);
+        assert_eq!(
+            back.take_due(Instant::now()),
+            Some(Due::Paths(s(&["a/b.txt", "odd\nname"])))
+        );
+        // Healed: the value goes away.
+        back.record(&Report::default(), &s(&["a/b.txt", "odd\nname"]), false, t0);
+        back.save(&db);
+        assert!(db.meta("retry").unwrap().is_none());
+        db.set_meta("retry", "not json").unwrap();
+        assert_eq!(Retry::load(&db).take_due(Instant::now()), Some(Due::Full));
     }
 
     #[test]
@@ -871,8 +1289,21 @@ mod tests {
             clean(&r)
         };
         assert!(!with(|r| r.errors.push("x".into())));
+        assert!(
+            !with(|r| r.fail("a", "boom")),
+            "a failed file leaves the key and a decision unconfirmed"
+        );
         assert!(!with(|r| r.aborted = Some((1, 10, Vec::new()))));
         assert!(!with(|r| r.cancelled = true), "a Pause must never save the cursor");
+        // A permanent name clash must not keep a rules change or a held decision from ever being confirmed.
+        assert!(with(|r| r.skip("A.txt", "clash")));
+        assert!(!with(|r| {
+            r.skip("A.txt", "clash");
+            r.errors.push("listing".into());
+        }));
+        let mut only_skips = Report::default();
+        only_skips.skip("A.txt", "clash");
+        assert!(Retry::default().may_confirm(&only_skips), "and the cursor moves on");
     }
 
     #[test]

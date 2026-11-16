@@ -74,12 +74,15 @@ pub fn account_dir(id: &str) -> Option<PathBuf> {
     data_dir().map(|d| d.join("accounts").join(id))
 }
 
-/// A fresh id (`a` + 8 hex digits). Letters and digits only: it is an rclone remote name and a folder name.
-pub fn new_id() -> String {
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos() ^ (d.as_secs() as u32).rotate_left(11));
-    format!("a{n:08x}")
+/// A fresh id (`a` + 8 random hex digits) that no account in `taken` has. Letters and digits only: it is an rclone
+/// remote name and a folder name, and a repeat would share another account's login and database.
+pub fn new_id(taken: &[Account]) -> String {
+    loop {
+        let id = format!("a{}", &crate::rclone::random_hex()[..8]);
+        if !taken.iter().any(|a| a.id == id) {
+            return id;
+        }
+    }
 }
 
 /// `~/Name` for a new account's default local folder.
@@ -132,6 +135,17 @@ mod tests {
         assert_eq!(find("/h/Drop"), None);
         assert_eq!(find("/h/Drop/../etc/passwd"), None);
         assert_eq!(find("/h/Other/y"), None);
+    }
+
+    #[test]
+    fn a_new_id_is_a_letter_and_hex_and_never_one_in_use() {
+        let id = new_id(&[]);
+        assert!(id.len() == 9 && id.starts_with('a') && id[1..].bytes().all(|b| b.is_ascii_hexdigit()));
+        let taken = [Account {
+            id: id.clone(),
+            ..Account::default()
+        }];
+        assert_ne!(new_id(&taken), id);
     }
 
     #[test]

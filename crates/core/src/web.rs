@@ -9,7 +9,7 @@ use crate::{
 };
 
 /// Percent-encodes one URL path or query part: everything but unreserved characters.
-fn enc(s: &str) -> String {
+pub(crate) fn enc(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),

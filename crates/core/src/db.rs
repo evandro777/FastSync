@@ -14,6 +14,24 @@ impl Db {
         Self::init(Connection::open(path)?)
     }
 
+    /// A DB that refuses to write one meta key (and takes the others): for tests of what the runner does when it cannot
+    /// remember one thing but could another.
+    #[cfg(test)]
+    pub(crate) fn refuse_meta_key(&self, key: &str) {
+        self.0
+            .execute_batch(&format!(
+                "CREATE TRIGGER refuse_{key} BEFORE INSERT ON meta WHEN NEW.k='{key}' \
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;"
+            ))
+            .unwrap();
+    }
+
+    /// A DB that refuses every `set_meta`: for tests of what the runner does when it cannot remember something.
+    #[cfg(test)]
+    pub(crate) fn break_meta(&self) {
+        self.0.execute_batch("DROP TABLE meta").unwrap();
+    }
+
     pub fn memory() -> Result<Self> {
         Self::init(Connection::open_in_memory()?)
     }
@@ -27,6 +45,7 @@ impl Db {
                path TEXT PRIMARY KEY, l_size INT, l_mtime INT, r_size INT, r_mtime INT, r_id TEXT NOT NULL DEFAULT '');
              CREATE INDEX IF NOT EXISTS files_rid ON files(r_id);
              CREATE INDEX IF NOT EXISTS files_lsize ON files(l_size);
+             CREATE INDEX IF NOT EXISTS files_lpath ON files(lower(path));
              CREATE TABLE IF NOT EXISTS dirs(id TEXT PRIMARY KEY, path TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
              CREATE TABLE IF NOT EXISTS log(
@@ -72,6 +91,14 @@ impl Db {
     pub fn all(&self) -> Result<Vec<(String, Base)>> {
         let mut st = self.0.prepare("SELECT l_size,l_mtime,r_size,r_mtime,path FROM files")?;
         st.query_map([], |r| Ok((r.get(4)?, row_base(r)?)))?.collect()
+    }
+
+    /// The known paths that are `lower` (already lower-cased, ASCII) once SQLite lower-cases them: the names that differ
+    /// from a path only by case, from an index, so a watcher run does not read every row. SQLite's `lower` leaves
+    /// non-ASCII letters alone, so those namesakes are found by the caller's own folder listing only.
+    pub fn paths_ci(&self, lower: &str) -> Result<Vec<String>> {
+        let mut st = self.0.prepare("SELECT path FROM files WHERE lower(path)=?")?;
+        st.query_map([lower], |r| r.get(0))?.collect()
     }
 
     /// The known files whose local copy had exactly `size` bytes: sources for a local copy instead of a download.
@@ -184,6 +211,14 @@ impl Db {
     }
 }
 
+/// Today's date (`2026-11-16`) on the user's clock: SQLite knows the local time zone, so no extra dependency.
+pub fn local_date() -> Option<String> {
+    Connection::open_in_memory()
+        .ok()?
+        .query_row("SELECT date('now','localtime')", [], |r| r.get(0))
+        .ok()
+}
+
 /// How long the activity log keeps an entry, and the most rows it keeps.
 pub const LOG_DAYS: i64 = 30;
 pub const LOG_ROWS: i64 = 2000;
@@ -260,6 +295,27 @@ mod tests {
     }
 
     #[test]
+    fn paths_ci_finds_the_other_spellings_from_the_index() {
+        let db = Db::memory().unwrap();
+        for p in ["Docs/A.txt", "docs/a.txt", "Docs/b.txt", "top"] {
+            db.set(p, &base(1), "").unwrap();
+        }
+        let mut got = db.paths_ci("docs/a.txt").unwrap();
+        got.sort();
+        assert_eq!(got, ["Docs/A.txt", "docs/a.txt"]);
+        assert!(db.paths_ci("nothing").unwrap().is_empty());
+        // The lookup goes through the index, not a scan of every row.
+        let plan: String =
+            db.0.query_row(
+                "EXPLAIN QUERY PLAN SELECT path FROM files WHERE lower(path)='x'",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("files_lpath"), "{plan}");
+    }
+
+    #[test]
     fn count_in_counts_one_level_only() {
         let db = Db::memory().unwrap();
         for p in ["top", "dir/a", "dir/b", "dir/sub/c", "dir2/x"] {
@@ -317,6 +373,15 @@ mod tests {
         assert_eq!((all[0].kind.as_str(), all[0].msg.as_str()), ("error", "boom"));
         assert_eq!(all[1].size, Some(3));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_local_date_reads_like_a_date() {
+        let d = local_date().unwrap();
+        assert!(
+            d.len() == 10 && d.as_bytes()[4] == b'-' && d.as_bytes()[7] == b'-',
+            "{d}"
+        );
     }
 
     #[test]

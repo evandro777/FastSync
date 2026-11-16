@@ -155,6 +155,75 @@ fn many_new_files_in_a_new_cloud_folder_upload_through_rclone() {
     let _ = fs::remove_dir_all(&base);
 }
 
+/// A folder renamed here is one `sync/move` of the folder in the cloud (the same folder there, not new files), and a
+/// local copy of a synced file reaches the cloud with the right bytes and a clean second pass.
+#[test]
+fn a_renamed_folder_and_a_local_copy_go_through_rclone() {
+    if !available() {
+        eprintln!("skipped: rclone not found");
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let base = std::env::temp_dir().join(format!("fastsync-rc-dir-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let (local, remote) = (base.join("local"), base.join("remote"));
+    fs::create_dir_all(&local).unwrap();
+    fs::create_dir_all(&remote).unwrap();
+    fs::write(base.join("rclone.conf"), "").unwrap();
+    let rc = Arc::new(Rclone::start(&base.join("rclone.conf")).expect("rclone rcd starts"));
+    let mut engine = Engine::new(
+        local.clone(),
+        RcloneRemote {
+            rc,
+            fs: remote.to_string_lossy().to_string(),
+            exclude: vec![],
+            dropbox: false,
+        },
+        Db::memory().unwrap(),
+    );
+    for (p, text) in [
+        ("Teste/a.txt", "aa"),
+        ("Teste/deep/b.txt", "bbb"),
+        ("Teste/deep/er/c.txt", "cccc"),
+    ] {
+        fs::create_dir_all(local.join(p).parent().unwrap()).unwrap();
+        fs::write(local.join(p), text).unwrap();
+    }
+    let r = engine.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    let ino = fs::metadata(remote.join("Teste")).unwrap().ino();
+
+    fs::rename(local.join("Teste"), local.join("Teste with apps")).unwrap();
+    let r = engine.full_scan();
+    assert!(r.errors.is_empty() && r.aborted.is_none(), "{r:?}");
+    assert_eq!(r.transferred, 3);
+    assert!(!remote.join("Teste").exists());
+    assert_eq!(
+        fs::metadata(remote.join("Teste with apps")).unwrap().ino(),
+        ino,
+        "the folder itself was renamed"
+    );
+    assert_eq!(
+        fs::read_to_string(remote.join("Teste with apps/deep/er/c.txt")).unwrap(),
+        "cccc"
+    );
+    assert_eq!(engine.full_scan().transferred, 0);
+
+    // A copy of a synced file, big enough to be looked at: the same bytes in the cloud, nothing left to do.
+    let big = "y".repeat((1 << 20) + 5);
+    fs::write(local.join("big.bin"), &big).unwrap();
+    assert!(engine.full_scan().errors.is_empty());
+    fs::copy(local.join("big.bin"), local.join("Teste with apps/copy.bin")).unwrap();
+    let r = engine.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(
+        fs::read_to_string(remote.join("Teste with apps/copy.bin")).unwrap(),
+        big
+    );
+    assert_eq!(engine.full_scan().transferred, 0);
+    let _ = fs::remove_dir_all(&base);
+}
+
 /// The listing split per top-level folder (parallel, with a count) is the same list as one recursive call: root
 /// files, nested folders and the excluded vault included, and it counts every top-level folder.
 #[test]

@@ -70,7 +70,13 @@ pub fn write_atomic(path: &Path, data: impl AsRef<[u8]>) -> io::Result<()> {
         create_private_dir(dir)?;
     }
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.tmp", std::process::id()));
+    // The counter keeps two threads of this process that save the same file from sharing one temp file.
+    static SAVES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let tmp = path.with_file_name(name);
     // Synced before the rename: after a power cut the new name must not point at an empty file.
     write_private(&tmp, data)
@@ -78,7 +84,12 @@ pub fn write_atomic(path: &Path, data: impl AsRef<[u8]>) -> io::Result<()> {
         .and_then(|()| fs::rename(&tmp, path))
         .inspect_err(|_| {
             let _ = fs::remove_file(&tmp);
-        })
+        })?;
+    // The rename itself lives in the folder: best effort, a failure here only risks the old file after a power cut.
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        let _ = fs::File::open(dir).and_then(|d| d.sync_all());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

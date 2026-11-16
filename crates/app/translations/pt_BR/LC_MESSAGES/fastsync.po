@@ -231,6 +231,10 @@ msgctxt "Tr"
 msgid "Last file synced: {}"
 msgstr "Último arquivo sincronizado: {}"
 
+msgctxt "AccountCard"
+msgid "{} problems in total, see the activity log"
+msgstr "{} problemas no total, veja o registro de atividades"
+
 msgctxt "Tr"
 msgid "Last problem: {}"
 msgstr "Último problema: {}"
@@ -238,6 +242,42 @@ msgstr "Último problema: {}"
 msgctxt "Tr"
 msgid "Full check: {} changed, {} failed, {} s"
 msgstr "Verificação completa: {} alterados, {} com falha, {} s"
+
+msgctxt "Tr"
+msgid "first check or the cloud's change list restarted"
+msgstr "primeira verificação ou a lista de mudanças da nuvem reiniciou"
+
+msgctxt "Tr"
+msgid "a folder changed in the cloud"
+msgstr "uma pasta mudou na nuvem"
+
+msgctxt "Tr"
+msgid "scheduled"
+msgstr "agendada"
+
+msgctxt "Tr"
+msgid "your answer to a stopped sync"
+msgstr "sua resposta a uma sincronização parada"
+
+msgctxt "Tr"
+msgid "ignore rules or folders changed"
+msgstr "regras de exclusão ou pastas mudaram"
+
+msgctxt "Tr"
+msgid "retry after an error"
+msgstr "nova tentativa após um erro"
+
+msgctxt "Tr"
+msgid "started or rescanned"
+msgstr "início ou nova verificação"
+
+msgctxt "Tr"
+msgid "possible move or many changes"
+msgstr "possível movimentação ou muitas mudanças"
+
+msgctxt "Tr"
+msgid "resumed after a pause"
+msgstr "retomada após uma pausa"
 
 msgctxt "Tr"
 msgid "Quick check: {} changed, {} failed, {} s"

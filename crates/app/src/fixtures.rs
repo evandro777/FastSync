@@ -130,12 +130,16 @@ pub fn apply(ui: &Main, mode: usize) {
             "1.0 TB",
             100,
         ),
-        row(
-            "MEGA",
-            "/home/user/MEGA",
-            3,
-            "reports/2026/q3-budget-final-FINAL-v7.xlsx: couldn't upload: quota exceeded (the account has no free space left)",
-        ),
+        // Several problems: `deletes` carries the count, and the card words it.
+        AccountRow {
+            deletes: 3,
+            ..row(
+                "MEGA",
+                "/home/user/MEGA",
+                3,
+                "reports/2026/q3-budget-final-FINAL-v7.xlsx: couldn't upload: quota exceeded (the account has no free space left)",
+            )
+        },
         row(
             "Dropbox",
             "/home/user/Work",
