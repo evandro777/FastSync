@@ -31,8 +31,39 @@ pub struct Rclone {
     base: String,
     auth: String,
     child: std::sync::Mutex<Child>,
+    /// What `revive` needs to start the same rclone again: same port and password, so every holder of this handle
+    /// (one per account runner) keeps working.
+    config: PathBuf,
+    port: u16,
+    pass: String,
+    /// Set by `shutdown`: a quit must not bring rclone back.
+    closed: std::sync::atomic::AtomicBool,
+    /// How many times rclone was started again (lets a failed call tell "it was restarted since" from "still the
+    /// same process").
+    restarts: std::sync::atomic::AtomicU32,
     /// The rclone job of the browser login in progress (see `call_job`), so a cancel can stop it.
     login_job: std::sync::Mutex<Option<i64>>,
+}
+
+/// Starts `rclone rcd` on `127.0.0.1:port`.
+fn spawn_rcd(config: &Path, port: u16, pass: &str) -> Result<Child> {
+    let mut cmd = Command::new(binary());
+    // The password goes through the environment: argv is readable by every local user in /proc/<pid>/cmdline.
+    // (If rclone ignored these, `config/*` calls would be refused as unauthenticated, not silently open.)
+    cmd.env("RCLONE_RC_USER", "fastsync")
+        .env("RCLONE_RC_PASS", pass)
+        .args(["rcd", "--rc-addr", &format!("127.0.0.1:{port}")])
+        .arg("--config")
+        .arg(config)
+        .args(["--log-level", if crate::debug::enabled() { "INFO" } else { "ERROR" }])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(if crate::debug::enabled() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        });
+    cmd.spawn().map_err(|e| format!("cannot start rclone: {e}"))
 }
 
 /// `rclone` from `$FASTSYNC_RCLONE` (a dev override), else from `PATH` (the Flatpak puts it in /app/bin).
@@ -71,43 +102,23 @@ impl Rclone {
             .map_err(|e| e.to_string())?
             .port();
         let pass = random_hex();
-        let mut cmd = Command::new(binary());
-        // The password goes through the environment: argv is readable by every local user in /proc/<pid>/cmdline.
-        // (If rclone ignored these, `config/*` calls would be refused as unauthenticated, not silently open.)
-        cmd.env("RCLONE_RC_USER", "fastsync")
-            .env("RCLONE_RC_PASS", &pass)
-            .args(["rcd", "--rc-addr", &format!("127.0.0.1:{port}")])
-            .arg("--config")
-            .arg(config)
-            .args(["--log-level", "ERROR"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let child = cmd.spawn().map_err(|e| format!("cannot start rclone: {e}"))?;
+        let child = spawn_rcd(config, port, &pass)?;
         let agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
         let me = Self {
             agent,
             base: format!("http://127.0.0.1:{port}/"),
             auth: format!("Basic {}", base64(format!("fastsync:{pass}").as_bytes())),
             child: std::sync::Mutex::new(child),
+            config: config.to_path_buf(),
+            port,
+            pass,
+            closed: std::sync::atomic::AtomicBool::new(false),
+            restarts: std::sync::atomic::AtomicU32::new(0),
             login_job: std::sync::Mutex::new(None),
         };
-        let start = Instant::now();
         // Dropping `me` on failure kills the child.
-        // The port was free a moment ago, not reserved: whoever answers must be the child we started, or the login
-        // data would go to another program.
         let ours = u64::from(me.child.lock().map_err(|e| e.to_string())?.id());
-        loop {
-            match me.call("core/pid", json!({})) {
-                Ok(v) if v["pid"].as_u64() == Some(ours) => break,
-                Ok(_) => return Err("another program answers on rclone's port".into()),
-                Err(_) => {}
-            }
-            if start.elapsed() > Duration::from_secs(10) {
-                return Err("rclone did not start".into());
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        me.wait_ready(ours)?;
         // Older rclone lacks what login relies on (1.76: the extra "shared client_id" question), so refuse it here
         // instead of failing mid-login.
         let v = me.call("core/version", json!({}))?;
@@ -122,9 +133,88 @@ impl Rclone {
         Ok(me)
     }
 
+    /// Waits until the rclone with process id `ours` answers. The port was free a moment ago, not reserved: whoever
+    /// answers must be the child we started, or the login data would go to another program.
+    fn wait_ready(&self, ours: u64) -> Result<()> {
+        let start = Instant::now();
+        loop {
+            // A quit waits for the lock this runs under: do not keep it for the whole start-up.
+            if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("closed".into());
+            }
+            match self
+                .post("core/pid", &json!({}), None)
+                .and_then(|mut r| r.body_mut().read_json::<Value>().map_err(|e| e.to_string()))
+            {
+                Ok(v) if v["pid"].as_u64() == Some(ours) => return Ok(()),
+                Ok(_) => return Err("another program answers on rclone's port".into()),
+                Err(_) => {}
+            }
+            if start.elapsed() > Duration::from_secs(10) {
+                return Err("rclone did not start".into());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Starts rclone again when it has exited (killed by the system on a huge listing, or crashed): without it every
+    /// account would fail until the app was restarted. `seen` is the `restarts` count from before the failed call.
+    /// True when a new rclone is up (started here, or by another thread since `seen`): the call may be repeated.
+    /// False when rclone is still the same running process, so the failure was something else.
+    fn revive(&self, seen: u32) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.closed.load(Relaxed) {
+            return false;
+        }
+        let Ok(mut child) = self.child.lock() else { return false };
+        // Another thread restarted it while this one waited for the lock (it holds the lock until rclone answers).
+        if self.restarts.load(Relaxed) != seen {
+            return true;
+        }
+        if matches!(child.try_wait(), Ok(None)) {
+            return false;
+        }
+        let Ok(new) = spawn_rcd(&self.config, self.port, &self.pass) else {
+            return false;
+        };
+        let ours = u64::from(new.id());
+        *child = new;
+        self.restarts.fetch_add(1, Relaxed);
+        // The old login job died with the old process.
+        if let Ok(mut j) = self.login_job.lock() {
+            *j = None;
+        }
+        self.wait_ready(ours).is_ok()
+    }
+
     fn send(&self, method: &str, body: &Value) -> Result<ureq::http::Response<ureq::Body>> {
+        self.send_within(method, body, None)
+    }
+
+    /// `send` with a time limit for the whole call. Most calls have none (a listing of a big cloud takes minutes);
+    /// only the ones a run waits on for no good reason (`speed`) get one.
+    fn send_within(
+        &self,
+        method: &str,
+        body: &Value,
+        limit: Option<Duration>,
+    ) -> Result<ureq::http::Response<ureq::Body>> {
+        let seen = self.restarts.load(std::sync::atomic::Ordering::Relaxed);
+        let first = self.post(method, body, limit);
+        // A failed call with a dead rclone behind it: start it again and ask once more. The caller's own retry
+        // logic still sees an error when that fails too.
+        if first.is_err() && self.revive(seen) {
+            return self.post(method, body, limit);
+        }
+        first
+    }
+
+    fn post(&self, method: &str, body: &Value, limit: Option<Duration>) -> Result<ureq::http::Response<ureq::Body>> {
         self.agent
             .post(&format!("{}{method}", self.base))
+            .config()
+            .timeout_global(limit)
+            .build()
             .header("Authorization", &self.auth)
             // Exactly `application/json`: with ureq's `; charset=utf-8` rclone ignores the body ("Didn't find key").
             .header("Content-Type", "application/json")
@@ -199,18 +289,17 @@ impl Rclone {
         Ok(parse_item(&v["item"]))
     }
 
-    /// The `kind` hash of a local file, computed by rclone (it reads the whole file).
-    pub fn local_hash(&self, dir: &str, rel: &str, kind: &str) -> Option<String> {
-        let v = self
-            .call(
-                "operations/stat",
-                json!({"fs": dir, "remote": rel, "opt": {"noMimeType": true, "showHash": true, "hashTypes": [kind]}}),
-            )
-            .ok()?;
-        v["item"]["Hashes"][kind]
+    /// The `kind` hash of a local file, computed by rclone (it reads the whole file). `Err` = the call failed (an
+    /// unreadable or vanished file, rclone busy): the answer is unknown, not "different".
+    pub fn local_hash(&self, dir: &str, rel: &str, kind: &str) -> Result<Option<String>> {
+        let v = self.call(
+            "operations/stat",
+            json!({"fs": dir, "remote": rel, "opt": {"noMimeType": true, "showHash": true, "hashTypes": [kind]}}),
+        )?;
+        Ok(v["item"]["Hashes"][kind]
             .as_str()
             .filter(|h| !h.is_empty())
-            .map(str::to_lowercase)
+            .map(str::to_lowercase))
     }
 
     /// `group` (the account id) keeps `speed` per account: `core/stats` otherwise adds every account together.
@@ -239,11 +328,14 @@ impl Rclone {
     }
 
     /// Bytes per second of the transfers running in `group` right now (None when rclone does not say).
+    /// Limited to 5 s: the runner's ticker asks every second inside the run's thread scope, so a rclone that stopped
+    /// answering would otherwise keep a finished run from ever returning (the card stuck on "Syncing").
     pub fn speed(&self, group: &str) -> Option<f64> {
-        self.call("core/stats", json!({"group": group}))
-            .ok()?
-            .get("speed")?
-            .as_f64()
+        let mut resp = self
+            .send_within("core/stats", &json!({"group": group}), Some(Duration::from_secs(5)))
+            .ok()?;
+        let v: Value = resp.body_mut().read_json().ok()?;
+        v.get("speed")?.as_f64()
     }
 
     /// Creates the folder `fs:remote` with its parents; fine when it exists already.
@@ -502,57 +594,125 @@ impl RcloneRemote {
     }
 }
 
+/// Folders above this depth (the root is 0) are listed one level at a time by `walk_cloud`.
+const SPLIT_DEPTH: usize = 3;
+
+/// The whole cloud through `list_one(folder, recursive)` as a queue of folders worked off `PARALLEL` at a time: the
+/// top `SPLIT_DEPTH` levels one level per call (their subfolders join the queue, so the total grows as they are
+/// found), deeper folders as one recursive call each. One recursive call over a 100k-file Dropbox answers only at the
+/// very end (minutes, nothing to show), and splitting only the top level left the two biggest folders as two long
+/// calls stuck at "24 of 26". `on_progress(done, found)` after every folder; `cancelled()` is asked before each one
+/// and ends the walk with `Err("cancelled")`.
+///
+/// Any failed folder fails the whole listing, as one call did: a shorter list would read as "deleted in the cloud".
+/// `Ok(None)` = a folder holds two subfolders of one name (Drive): a path reaches only one of them, so the caller
+/// must list the old single way.
+fn walk_cloud(
+    list_one: &(dyn Fn(&str, bool) -> Result<Vec<Item>> + Sync),
+    on_progress: &(dyn Fn(usize, usize) + Sync),
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<Vec<Item>>> {
+    use std::{collections::HashSet, sync::Condvar};
+    #[derive(Default)]
+    struct Walk {
+        queue: std::collections::VecDeque<(String, usize)>,
+        /// Folders being listed right now: they may still add to the queue.
+        active: usize,
+        found: usize,
+        done: usize,
+        items: Vec<Item>,
+        error: Option<String>,
+        clash: bool,
+    }
+    let walk = std::sync::Mutex::new(Walk {
+        queue: [(String::new(), 0)].into(),
+        found: 1,
+        ..Default::default()
+    });
+    let wake = Condvar::new();
+    on_progress(0, 1);
+    std::thread::scope(|s| {
+        for _ in 0..crate::engine::PARALLEL {
+            s.spawn(|| {
+                loop {
+                    let Ok(mut w) = walk.lock() else { return };
+                    // Between folders (a call under way finishes): an error, never `Ok` with what was found so far.
+                    if w.error.is_none() && cancelled() {
+                        w.error = Some("cancelled".into());
+                    }
+                    let (dir, depth) = loop {
+                        if w.error.is_some() || w.clash || (w.queue.is_empty() && w.active == 0) {
+                            wake.notify_all();
+                            return;
+                        }
+                        if let Some(job) = w.queue.pop_front() {
+                            w.active += 1;
+                            break job;
+                        }
+                        w = match wake.wait(w) {
+                            Ok(w) => w,
+                            Err(_) => return,
+                        };
+                    };
+                    drop(w);
+                    let split = depth < SPLIT_DEPTH;
+                    let listed = list_one(&dir, !split);
+                    let Ok(mut w) = walk.lock() else { return };
+                    w.active -= 1;
+                    match listed {
+                        Ok(v) => {
+                            if split {
+                                let subs: Vec<&str> = v.iter().filter(|i| i.is_dir).map(|i| i.path.as_str()).collect();
+                                if subs.iter().collect::<HashSet<_>>().len() != subs.len() {
+                                    w.clash = true;
+                                }
+                                w.found += subs.len();
+                                w.queue.extend(subs.into_iter().map(|p| (p.to_string(), depth + 1)));
+                            }
+                            w.items.extend(v);
+                            w.done += 1;
+                            let (done, found) = (w.done, w.found);
+                            drop(w);
+                            on_progress(done, found);
+                        }
+                        Err(e) => {
+                            let what = if dir.is_empty() { e } else { format!("{dir}: {e}") };
+                            w.error.get_or_insert(what);
+                        }
+                    }
+                    wake.notify_all();
+                }
+            });
+        }
+    });
+    let w = walk.into_inner().map_err(|e| e.to_string())?;
+    match w.error {
+        Some(e) => Err(e),
+        None if w.clash => Ok(None),
+        None => Ok(Some(w.items)),
+    }
+}
+
 impl crate::engine::Remote for RcloneRemote {
     fn list(&self) -> Result<Vec<Item>> {
         self.rc.list(&self.fs, "", &self.exclude, true)
     }
-    /// The root's own files and folders first, then every top-level folder as a recursive listing of its own, a few at
-    /// a time: one recursive call over a 100k-file Dropbox answers only at the very end (minutes, nothing to show),
-    /// and its pages are read one after the other. Any failed part fails the whole listing, as before: a shorter list
-    /// would read as "deleted in the cloud".
-    fn list_progress(&self, on_progress: &(dyn Fn(usize, usize) + Sync)) -> Result<Vec<Item>> {
-        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-        let mut items = self.rc.list(&self.fs, "", &self.exclude, false)?;
-        let dirs: Vec<String> = items.iter().filter(|i| i.is_dir).map(|i| i.path.clone()).collect();
-        // Drive allows two root folders with one name, and a path reaches only one of them: the old single walk it is.
-        if dirs.iter().collect::<std::collections::HashSet<_>>().len() != dirs.len() {
-            return self.list();
+    /// The cloud as a queue of folders worked off a few at a time: the top `SPLIT_DEPTH` levels one level per call
+    /// (their subfolders join the queue, so the total grows as they are found), deeper folders as one recursive call
+    /// each. One recursive call over a 100k-file Dropbox answers only at the very end (minutes, nothing to show), and
+    /// splitting only the top level left the two biggest folders as two long calls at "24 of 26". Any failed part
+    /// fails the whole listing, as before: a shorter list would read as "deleted in the cloud".
+    fn list_progress(
+        &self,
+        on_progress: &(dyn Fn(usize, usize) + Sync),
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<Item>> {
+        let one = |dir: &str, recursive| self.rc.list(&self.fs, dir, &self.exclude, recursive);
+        match walk_cloud(&one, on_progress, cancelled)? {
+            Some(items) => Ok(items),
+            // The old single walk, which rclone resolves folder by folder itself.
+            None => self.list(),
         }
-        on_progress(0, dirs.len());
-        let (next, done) = (AtomicUsize::new(0), AtomicUsize::new(0));
-        let parts = std::sync::Mutex::new(Vec::new());
-        let failed = std::sync::Mutex::new(None);
-        std::thread::scope(|s| {
-            for _ in 0..crate::engine::PARALLEL.min(dirs.len()) {
-                s.spawn(|| {
-                    while failed.lock().is_ok_and(|f| f.is_none()) {
-                        let Some(dir) = dirs.get(next.fetch_add(1, Relaxed)) else {
-                            break;
-                        };
-                        match self.rc.list(&self.fs, dir, &self.exclude, true) {
-                            Ok(v) => {
-                                if let Ok(mut p) = parts.lock() {
-                                    p.push(v);
-                                }
-                                on_progress(done.fetch_add(1, Relaxed) + 1, dirs.len());
-                            }
-                            Err(e) => {
-                                if let Ok(mut f) = failed.lock() {
-                                    f.get_or_insert(format!("{dir}: {e}"));
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        if let Some(e) = failed.into_inner().map_err(|e| e.to_string())? {
-            return Err(e);
-        }
-        for p in parts.into_inner().map_err(|e| e.to_string())? {
-            items.extend(p);
-        }
-        Ok(items)
     }
     fn list_dir(&self, rel: &str) -> Result<Vec<Item>> {
         self.rc.list(&self.fs, rel, &self.exclude, false)
@@ -606,12 +766,17 @@ impl crate::engine::Remote for RcloneRemote {
         }
     }
     fn same_content(&self, local_root: &Path, rel: &str, remote: &Item) -> bool {
+        self.compare(local_root, rel, remote).unwrap_or(false)
+    }
+    fn compare(&self, local_root: &Path, rel: &str, remote: &Item) -> Result<bool> {
+        // A service with no hash (MEGA) is a known "cannot tell": false, not an error.
         let Some((kind, want)) = &remote.hash else {
-            return false;
+            return Ok(false);
         };
-        self.rc
-            .local_hash(&local_root.to_string_lossy(), rel, kind)
-            .is_some_and(|got| &got == want)
+        Ok(self
+            .rc
+            .local_hash(&local_root.to_string_lossy(), rel, kind)?
+            .is_some_and(|got| &got == want))
     }
 }
 
@@ -624,6 +789,7 @@ impl Drop for Rclone {
 impl Rclone {
     /// Stops rclone. Called on quit too: statics are never dropped, so an exit would leave it running.
     pub fn shutdown(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut c) = self.child.lock() {
             let _ = c.kill();
             let _ = c.wait();
@@ -865,6 +1031,122 @@ fn base64(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rclone_that_died_is_started_again_and_a_closed_one_stays_down() {
+        if !available() {
+            eprintln!("skipped: rclone not found");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("fastsync-revive-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("rclone.conf");
+        std::fs::write(&conf, "").unwrap();
+        let rc = Rclone::start(&conf).expect("rclone rcd starts");
+        {
+            let mut c = rc.child.lock().unwrap();
+            c.kill().unwrap();
+            c.wait().unwrap();
+        }
+        assert!(rc.call("core/version", json!({})).is_ok(), "the call restarts rclone");
+        assert_eq!(rc.restarts.load(std::sync::atomic::Ordering::Relaxed), 1);
+        rc.shutdown();
+        assert!(
+            rc.call("core/version", json!({})).is_err(),
+            "a quit does not bring it back"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cloud as `(path, is_dir)`: `list_one` answers like `operations/list` (paths from the root).
+    fn fake_cloud(
+        entries: &'static [(&'static str, bool)],
+        fail_on: Option<&'static str>,
+    ) -> impl Fn(&str, bool) -> Result<Vec<Item>> + Sync {
+        move |dir, recursive| {
+            if fail_on == Some(dir) {
+                return Err("boom".into());
+            }
+            let under = |p: &str| match p.rsplit_once('/') {
+                _ if dir.is_empty() => recursive || !p.contains('/'),
+                Some((parent, _)) => recursive && p.starts_with(&format!("{dir}/")) || parent == dir,
+                None => false,
+            };
+            Ok(entries
+                .iter()
+                .filter(|(p, _)| under(p))
+                .map(|(p, d)| Item {
+                    path: (*p).into(),
+                    size: 1,
+                    mtime: 0,
+                    is_dir: *d,
+                    id: String::new(),
+                    hash: None,
+                })
+                .collect())
+        }
+    }
+
+    const DEEP: &[(&str, bool)] = &[
+        ("root.txt", false),
+        ("a", true),
+        ("a/b", true),
+        ("a/b/c", true),
+        ("a/b/c/d", true),
+        ("a/b/c/d/f.txt", false),
+        ("a/b/c/d/e", true),
+        ("a/b/c/d/e/g.txt", false),
+        ("x", true),
+        ("x/h.txt", false),
+    ];
+
+    #[test]
+    fn the_walk_lists_every_path_once_and_its_progress_meets_its_total() {
+        let seen = std::sync::Mutex::new(Vec::new());
+        let items = walk_cloud(
+            &fake_cloud(DEEP, None),
+            &|d, t| seen.lock().unwrap().push((d, t)),
+            &|| false,
+        )
+        .unwrap()
+        .unwrap();
+        let mut paths: Vec<&str> = items.iter().map(|i| i.path.as_str()).collect();
+        paths.sort();
+        let mut want: Vec<&str> = DEEP.iter().map(|(p, _)| *p).collect();
+        want.sort();
+        assert_eq!(paths, want);
+        // The root, a, a/b, x one level at a time; a/b/c (depth 3) in one recursive call.
+        assert_eq!(seen.lock().unwrap().last(), Some(&(5, 5)));
+    }
+
+    #[test]
+    fn one_failed_folder_fails_the_whole_listing() {
+        let err = walk_cloud(&fake_cloud(DEEP, Some("a/b")), &|_, _| {}, &|| false).unwrap_err();
+        assert_eq!(err, "a/b: boom");
+        let err = walk_cloud(&fake_cloud(DEEP, Some("")), &|_, _| {}, &|| false).unwrap_err();
+        assert_eq!(err, "boom", "a root failure keeps its own message");
+    }
+
+    #[test]
+    fn a_cancel_between_folders_fails_the_listing_instead_of_returning_a_part() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let cancel = AtomicBool::new(false);
+        // Pause is pressed once the first folder (the root) has been listed.
+        let r = walk_cloud(&fake_cloud(DEEP, None), &|d, _| cancel.store(d >= 1, Relaxed), &|| {
+            cancel.load(Relaxed)
+        });
+        assert_eq!(r.unwrap_err(), "cancelled");
+    }
+
+    #[test]
+    fn two_sibling_folders_with_one_name_send_the_caller_to_the_single_walk() {
+        const TWINS: &[(&str, bool)] = &[("a", true), ("a", true), ("f.txt", false)];
+        assert!(
+            walk_cloud(&fake_cloud(TWINS, None), &|_, _| {}, &|| false)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn quota_reads_used_and_an_optional_total() {

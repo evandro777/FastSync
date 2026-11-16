@@ -260,7 +260,13 @@ impl RemoteChanges for Drive {
             if let Some(next) = v["nextPageToken"].as_str() {
                 token = next.to_string();
             } else {
-                return Ok(Poll::Changes(out, s(&v["newStartPageToken"])));
+                // An answer without the next cursor must not become one: an empty page token fails for good.
+                let next = s(&v["newStartPageToken"]);
+                return Ok(if next.is_empty() {
+                    Poll::Reset
+                } else {
+                    Poll::Changes(out, next)
+                });
             }
         }
     }
@@ -350,7 +356,12 @@ impl RemoteChanges for OneDrive {
             if let Some(next) = v["@odata.nextLink"].as_str() {
                 url = next.to_string();
             } else {
-                return Ok(Poll::Changes(out, s(&v["@odata.deltaLink"])));
+                let next = s(&v["@odata.deltaLink"]);
+                return Ok(if next.is_empty() {
+                    Poll::Reset
+                } else {
+                    Poll::Changes(out, next)
+                });
             }
         }
     }

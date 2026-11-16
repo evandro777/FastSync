@@ -340,10 +340,38 @@ fn refresh(ui: &Main) {
     // Nemo's share action shows only inside the synced folders: it follows the account list (a string compare when
     // nothing changed).
     nemo::install(&roots);
-    ui.set_accounts(ModelRc::new(VecModel::from(rows)));
+    // One model for good, changed row by row: a new model each second (every status of a running sync) would recreate
+    // every card, and a click or a text selection spanning that moment would be lost.
+    let model = ROWS.with(Rc::clone);
+    sync_rows(&model, rows);
+    let model = ModelRc::from(model);
+    if ui.get_accounts() != model {
+        ui.set_accounts(model);
+    }
     ui.set_rclone_missing(missing);
     if let Some(t) = tray {
         t.update(|t| (t.overall, t.folders) = overall);
+    }
+}
+
+thread_local! {
+    /// The account cards' model (UI thread only): `refresh` keeps it and only changes what differs.
+    static ROWS: Rc<VecModel<AccountRow>> = Rc::default();
+}
+
+/// Makes `model` hold `rows`, touching only the rows that differ (and adding or dropping at the end).
+fn sync_rows(model: &VecModel<AccountRow>, rows: Vec<AccountRow>) {
+    use slint::Model;
+    let old = model.row_count();
+    for (i, row) in rows.iter().enumerate() {
+        if i >= old {
+            model.push(row.clone());
+        } else if model.row_data(i).as_ref() != Some(row) {
+            model.set_row_data(i, row.clone());
+        }
+    }
+    while model.row_count() > rows.len() {
+        model.remove(model.row_count() - 1);
     }
 }
 
@@ -559,21 +587,21 @@ fn check_local(ui: &Main, local: &str, except: &str) -> Result<(), String> {
     if state()
         .accounts
         .iter()
-        .any(|a| a.id == except && a.local != local && overlaps(&a.local, local))
+        .any(|a| a.id == except && a.local != local && clashes(&a.local, local))
     {
         return Err(tr.invoke_error_nested().into());
     }
     if state()
         .accounts
         .iter()
-        .any(|a| a.id != except && overlaps(&a.local, local))
+        .any(|a| a.id != except && clashes(&a.local, local))
     {
         return Err(tr.invoke_error_taken().into());
     }
     let home = std::env::var("HOME").unwrap_or_default();
     let data = fastsync_core::settings::data_dir().unwrap_or_default();
     // A symlink is judged by where it leads (`~/Sync` -> `~` would upload the whole home folder).
-    let real = std::fs::canonicalize(local).map_or_else(|_| local.to_string(), |p| p.to_string_lossy().into_owned());
+    let real = real_path(local);
     if bad_folder(local, &home, &data) || bad_folder(&real, &home, &data) {
         return Err(tr.invoke_error_bad_folder().into());
     }
@@ -815,6 +843,31 @@ fn overlaps(a: &str, b: &str) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
+/// `overlaps` for the typed paths, and for where they really lead: `~/link` -> an account's folder passes the text
+/// check, and two engines on one folder would delete each other's files (a delete in one cloud trashes the local file,
+/// which the other account then deletes in its own cloud).
+fn clashes(a: &str, b: &str) -> bool {
+    overlaps(a, b) || overlaps(&real_path(a), &real_path(b))
+}
+
+/// Where a path leads, also when it does not exist yet (Add types a new folder): the nearest existing parent is
+/// resolved and the rest appended, so `~/link/New` with `link` -> another account's folder is seen for what it is.
+fn real_path(p: &str) -> String {
+    let (mut cur, mut rest) = (Path::new(p), std::path::PathBuf::new());
+    loop {
+        if let Ok(real) = std::fs::canonicalize(cur) {
+            return real.join(&rest).to_string_lossy().into_owned();
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest = Path::new(name).join(&rest);
+                cur = parent;
+            }
+            _ => return p.to_string(),
+        }
+    }
+}
+
 /// The command for `--share <file>` or `--web <file>` (the file manager's actions): `share <abs path>` or
 /// `web <abs path>`. A newline in the path would split the one-line command sent to a running instance.
 fn file_command() -> Option<String> {
@@ -978,6 +1031,9 @@ fn share(path: String, weak: slint::Weak<Main>) {
 fn main() {
     if std::env::args().skip(1).any(|a| a == "-V" || a == "--version") {
         return println!("fastsync {}", env!("CARGO_PKG_VERSION"));
+    }
+    if std::env::args().skip(1).any(|a| a == "--debug") {
+        fastsync_core::debug::enable();
     }
     let file_cmd = file_command();
     let command = file_cmd.clone().unwrap_or_else(|| "show".to_owned());
@@ -1184,13 +1240,19 @@ fn main() {
             };
             // Only the link is removed: the local files stay where they are. The token and the DB go.
             std::thread::spawn(move || {
-                // A run in progress goes on until it ends (`stop` is read between runs): wait for it, or it keeps
-                // moving files for a removed account, then its last status brings the emblem back.
+                // A run in progress ends at its next file or folder (`stop` raises the cancel flag): wait for it, or
+                // it keeps moving files for a removed account, then its last status brings the emblem back.
                 if let Some(r) = runner {
                     r.stop_and_wait();
                 }
                 state().status.remove(id.as_str());
                 emblem::set(&local, None);
+                // The trash of a removed account is no longer counted or aged by anything: drop what is already old.
+                // Only old batches: the same folder may already belong to a new account, which is writing into
+                // `.fastsync` (so neither `tmp` nor the folder itself is removed here).
+                if !local.is_empty() {
+                    let _ = purge_trash(Path::new(&local), TRASH_DAYS.load(std::sync::atomic::Ordering::SeqCst));
+                }
                 if let Some(rc) = rc {
                     rc.config_delete(&id);
                 }
@@ -1871,6 +1933,73 @@ fn locale_code(v: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_card_model_is_changed_in_place_and_ends_up_equal_to_the_rows() {
+        use slint::Model;
+        let row = |id: &str, done: i32| AccountRow {
+            id: id.into(),
+            done,
+            ..Default::default()
+        };
+        let model = VecModel::default();
+        let read = |m: &VecModel<AccountRow>| (0..m.row_count()).map(|i| m.row_data(i).unwrap()).collect::<Vec<_>>();
+        for rows in [
+            vec![row("a", 0), row("b", 0), row("c", 0)],
+            vec![row("a", 1), row("b", 0), row("c", 0)],
+            vec![row("a", 1)],
+            vec![],
+            vec![row("z", 5), row("y", 6)],
+        ] {
+            sync_rows(&model, rows.clone());
+            assert_eq!(read(&model), rows);
+        }
+    }
+
+    #[test]
+    fn a_symlink_to_another_accounts_folder_is_a_clash() {
+        let base = std::env::temp_dir().join(format!("fastsync-clash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (real, other) = (base.join("Dropbox"), base.join("Other"));
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        assert!(
+            !overlaps(&s(&real), &s(&base.join("link"))),
+            "the text check alone misses it"
+        );
+        assert!(clashes(&s(&real), &s(&base.join("link"))));
+        assert!(clashes(&s(&base.join("link")), &s(&real.join("sub"))));
+        // A folder that does not exist yet, under the link: Add creates it inside the other account's tree.
+        assert!(clashes(&s(&real), &s(&base.join("link/New/deeper"))));
+        assert!(!clashes(&s(&real), &s(&base.join("fresh/New"))));
+        assert!(!clashes(&s(&real), &s(&other)));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_card_shows_the_phase_of_a_first_scan_with_a_clock() {
+        use fastsync_core::engine::{Phase, Progress};
+        let at = |phase, done, total, secs| {
+            let p = Progress {
+                phase,
+                done,
+                total,
+                secs,
+                ..Default::default()
+            };
+            live(Some(&Status::Syncing(p, 0.0)))
+        };
+        assert_eq!(
+            at(Phase::ListCloud, 3, 12, 252),
+            (4, String::new(), 3, 12, "4:12".into())
+        );
+        assert_eq!(at(Phase::ScanLocal, 0, 0, 41), (5, String::new(), 0, 0, "0:41".into()));
+        assert_eq!(at(Phase::Compare, 40000, 104000, 543).0, 6);
+        // Idle and planning-less transfers stay empty, as before.
+        assert_eq!(at(Phase::Transfer, 0, 0, 0), Default::default());
+    }
 
     #[test]
     fn file_uris_are_percent_encoded() {

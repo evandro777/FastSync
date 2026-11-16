@@ -400,8 +400,8 @@ msgid "Remove account"
 msgstr "Remover conta"
 
 msgctxt "RemoveDialog"
-msgid "FastSync stops syncing this account and forgets its login. The files on this computer and in the cloud are not deleted."
-msgstr "O FastSync para de sincronizar esta conta e esquece o login. Os arquivos neste computador e na nuvem não são apagados."
+msgid "FastSync stops syncing this account and forgets its login. The files on this computer and in the cloud are not deleted. Whatever is left in the .fastsync/trash folder there stays; delete it by hand."
+msgstr "O FastSync para de sincronizar esta conta e esquece o login. Os arquivos neste computador e na nuvem não são apagados. O que sobrar na pasta .fastsync/trash continua lá; apague-a manualmente."
 
 msgctxt "RemoveDialog"
 msgid "Cancel"

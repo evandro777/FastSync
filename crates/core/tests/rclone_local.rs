@@ -168,7 +168,14 @@ fn a_listing_split_by_folder_equals_the_recursive_one() {
     let remote = base.join("remote");
     fs::create_dir_all(&remote).unwrap();
     fs::write(base.join("rclone.conf"), "").unwrap();
-    for (dir, files) in [("a", 3), ("b/deep/er", 2), ("c", 0), ("Personal Vault", 1)] {
+    for (dir, files) in [
+        ("a", 3),
+        ("b/deep/er", 2),
+        ("c", 0),
+        // Deeper than the split levels: the last folders go in one recursive call each.
+        ("d/e/f/g/h", 2),
+        ("Personal Vault", 1),
+    ] {
         fs::create_dir_all(remote.join(dir)).unwrap();
         for i in 0..files {
             fs::write(remote.join(dir).join(format!("f{i}.txt")), "x").unwrap();
@@ -182,15 +189,20 @@ fn a_listing_split_by_folder_equals_the_recursive_one() {
         exclude: fastsync_core::rclone::exclusions("onedrive"),
     };
     let seen = Mutex::new(Vec::new());
-    let mut split = r.list_progress(&|d, t| seen.lock().unwrap().push((d, t))).unwrap();
+    let mut split = r
+        .list_progress(&|d, t| seen.lock().unwrap().push((d, t)), &|| false)
+        .unwrap();
     let mut whole = r.list().unwrap();
     split.sort_by(|a, b| a.path.cmp(&b.path));
     whole.sort_by(|a, b| a.path.cmp(&b.path));
     assert_eq!(split, whole);
     assert!(split.iter().any(|i| i.path == "b/deep/er/f1.txt") && split.iter().all(|i| !i.path.contains("Vault")));
     let seen = seen.into_inner().unwrap();
-    assert_eq!(seen.first(), Some(&(0, 3)), "{seen:?}");
-    assert_eq!(seen.last(), Some(&(3, 3)), "{seen:?}");
+    assert_eq!(seen.first(), Some(&(0, 1)), "{seen:?}");
+    // The total grows as folders are found, and the end meets it: root, a, b, c, d, b/deep, d/e (one level per call)
+    // plus b/deep/er and d/e/f (depth 3: one recursive call each; the vault is filtered out).
+    assert_eq!(seen.last(), Some(&(9, 9)), "{seen:?}");
+    assert!(split.iter().any(|i| i.path == "d/e/f/g/h/f1.txt"));
     let _ = fs::remove_dir_all(&base);
 }
 

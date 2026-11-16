@@ -7,10 +7,7 @@ use std::{
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
-    sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering::Relaxed},
-    },
+    sync::atomic::{AtomicUsize, Ordering::Relaxed},
 };
 
 use crate::{
@@ -20,6 +17,8 @@ use crate::{
     rclone::{Item, now_secs},
 };
 
+mod pair;
+
 pub type Result<T> = std::result::Result<T, String>;
 
 /// The cloud side. Paths are relative to the synced folder and use `/`.
@@ -28,7 +27,13 @@ pub trait Remote: Send + Sync {
     fn list(&self) -> Result<Vec<Item>>;
     /// `list`, telling `on_progress(folders done, folders total)` as it goes. A remote that cannot split its listing
     /// just lists, and the card then shows the phase without a count.
-    fn list_progress(&self, _on_progress: &(dyn Fn(usize, usize) + Sync)) -> Result<Vec<Item>> {
+    /// `cancelled` is asked between folders: when it says true the listing fails (never a shorter list that reads as
+    /// "deleted in the cloud"), and the caller tells a cancel from a real error by its own flag.
+    fn list_progress(
+        &self,
+        _on_progress: &(dyn Fn(usize, usize) + Sync),
+        _cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<Item>> {
         self.list()
     }
     /// The files and folders directly in `rel` (`""` = the root), paths from the root: one request for many files.
@@ -58,6 +63,11 @@ pub trait Remote: Send + Sync {
     fn same_content(&self, _local_root: &Path, _rel: &str, _remote: &Item) -> bool {
         false
     }
+    /// `same_content` that can say "could not find out" (`Err`: the check itself failed) apart from "different".
+    /// Where a wrong "different" has a price (a conflict copy of identical bytes) the engine asks this one.
+    fn compare(&self, local_root: &Path, rel: &str, remote: &Item) -> Result<bool> {
+        Ok(self.same_content(local_root, rel, remote))
+    }
 }
 
 /// The engine's own folder inside the synced folder: temp downloads and the trash. Never synced.
@@ -71,6 +81,9 @@ pub struct Report {
     pub aborted: Option<(usize, usize, Vec<String>)>,
     /// Files that changed on both sides and were kept twice; the runner turns them into one alert per burst.
     pub conflicts: Vec<String>,
+    /// Pause or Stop ended the run early: what is left was not looked at, so this is neither "up to date" nor a
+    /// clean run (no feed cursor saved, nothing confirmed). The runner scans in full when it goes on.
+    pub cancelled: bool,
 }
 
 /// How many of the paths a stopped run would delete are named to the user (the card says "and N more").
@@ -156,11 +169,31 @@ pub struct Engine<R: Remote> {
     pub download_only: bool,
     /// Read by the runner's ticker while `run` works.
     pub progress: std::sync::Arc<std::sync::Mutex<Progress>>,
+    /// Set by Pause and Stop (from the UI thread) to end the run in progress: it finishes the transfers under way,
+    /// starts no new one and returns `Report.cancelled`. The runner clears it before every run.
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Editor and downloader leftovers that must never be uploaded.
+/// Editor and downloader leftovers, and the native clients' own state, that must never be synced. The native
+/// folders (Dropbox's `.dropbox.cache`, ...) are one machine's private cache: sharing them would corrupt the client
+/// that owns the folder, so this is built in and not a rule the user could delete.
 pub fn ignored(name: &str) -> bool {
-    name == HIDDEN
+    // Windows and macOS write these in mixed case (`Thumbs.db`, `.DS_Store`, `Desktop.ini`).
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        ".dropbox"
+            | ".dropbox.cache"
+            | ".dropbox.attr"
+            | ".tmp.drivedownload"
+            | ".tmp.driveupload"
+            | ".debris"
+            | ".ds_store"
+            | "thumbs.db"
+            | "desktop.ini"
+            | "icon\r"
+    ) || lower.starts_with("~$")
+        || name == HIDDEN
         || name.ends_with(".partial")
         || name.ends_with(".part")
         || name.ends_with(".crdownload")
@@ -171,72 +204,9 @@ pub fn ignored(name: &str) -> bool {
         || name.starts_with(".~lock.")
 }
 
-/// Where everything we replace or remove locally goes: `<root>/.fastsync/trash/<time>/<path>`.
-pub fn trash_dir(root: &Path) -> PathBuf {
-    root.join(HIDDEN).join("trash")
-}
-
-/// (files, bytes) in the trash. Never follows a symlink: a link counts as a file of its own size.
-pub fn trash_usage(root: &Path) -> (u64, u64) {
-    fn go(dir: &Path, total: &mut (u64, u64)) {
-        let Ok(entries) = fs::read_dir(dir) else { return };
-        for e in entries.flatten() {
-            let Ok(m) = fs::symlink_metadata(e.path()) else {
-                continue;
-            };
-            if m.is_dir() {
-                go(&e.path(), total);
-            } else {
-                total.0 += 1;
-                total.1 += m.len();
-            }
-        }
-    }
-    let mut total = (0, 0);
-    go(&trash_dir(root), &mut total);
-    total
-}
-
-/// Removes the trash for good. A missing folder is fine. `remove_dir_all` does not follow symlinks.
-pub fn empty_trash(root: &Path) -> std::io::Result<()> {
-    match fs::remove_dir_all(trash_dir(root)) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
-    }
-}
-
-/// Deletes the trash batches (`trash/<unix seconds>/…`, named when the files were trashed) at least `days` old.
-/// 0 keeps everything. A folder whose name is not a number is not ours and stays.
-pub fn purge_trash(root: &Path, days: u32) -> std::io::Result<()> {
-    purge_trash_at(root, days, now_secs())
-}
-
-fn purge_trash_at(root: &Path, days: u32, now: i64) -> std::io::Result<()> {
-    if days == 0 {
-        return Ok(());
-    }
-    let limit = now.saturating_sub(i64::from(days) * 86_400);
-    let entries = match fs::read_dir(trash_dir(root)) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    let mut first_error = None;
-    for e in entries.flatten() {
-        let Some(stamp) = e.file_name().to_str().and_then(|n| n.parse::<i64>().ok()) else {
-            continue;
-        };
-        if stamp > limit {
-            continue;
-        }
-        // One stuck batch must not keep the others from going.
-        match fs::remove_dir_all(e.path()) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => first_error = first_error.or(Some(e)),
-            _ => {}
-        }
-    }
-    first_error.map_or(Ok(()), Err)
-}
+/// Where the trash lives and how it is counted, emptied and aged (`trash.rs`); re-exported so `engine::` paths keep
+/// working.
+pub use crate::trash::{empty_trash, purge_trash, trash_dir, trash_usage};
 
 /// A remote name must stay inside the folder: a hostile `../../.bashrc` would otherwise write outside it.
 pub fn safe_rel(p: &str) -> bool {
@@ -311,7 +281,14 @@ enum Lookup {
 /// The cloud's answer for each path, as `(index in paths, answer)` in path order. One request per file took ~30-60 s
 /// for 84 new files, so a folder with more changed files than its listing has pages (~1000 entries each, estimated
 /// from the DB) is listed once instead; the rest is `stat`, `PARALLEL` at a time.
-fn lookup<R: Remote>(remote: &R, db: &Db, paths: &[String]) -> Vec<(usize, Result<Option<Item>>)> {
+/// `cancel` stops the workers before the next job: the answers then miss paths, which only matters to a run that is
+/// being cancelled anyway (`run` returns before it acts on a plan).
+fn lookup<R: Remote>(
+    remote: &R,
+    db: &Db,
+    paths: &[String],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Vec<(usize, Result<Option<Item>>)> {
     let mut by_dir: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (i, p) in paths.iter().enumerate() {
         by_dir
@@ -335,7 +312,9 @@ fn lookup<R: Remote>(remote: &R, db: &Db, paths: &[String]) -> Vec<(usize, Resul
             .map(|_| {
                 s.spawn(|| {
                     let mut got = Vec::new();
-                    while let Some(job) = jobs.get(next.fetch_add(1, Relaxed)) {
+                    while !cancel.load(Relaxed)
+                        && let Some(job) = jobs.get(next.fetch_add(1, Relaxed))
+                    {
                         match job {
                             Lookup::One(i) => got.push((*i, remote.stat(&paths[*i]))),
                             Lookup::Dir { dir, idx } => match remote.list_dir(dir) {
@@ -371,8 +350,18 @@ fn lookup<R: Remote>(remote: &R, db: &Db, paths: &[String]) -> Vec<(usize, Resul
     got
 }
 
-pub fn scan(root: &Path) -> (HashMap<String, Sig>, Vec<String>) {
-    fn go(dir: &Path, prefix: &str, out: &mut HashMap<String, Sig>, bad: &mut Vec<String>) {
+/// `skip`: the unchecked folders (paths from `root`). They are not entered at all: walking a 50k-file folder only to
+/// drop what it holds cost every full scan and every walk. `ignore`: a folder the rules hide is not entered either
+/// (a `node_modules/` of 100k files would otherwise be read and matched file by file on every walk); the callers
+/// treat a path missing from the result like an ignored one, because `run` applies the rules before anything else.
+pub fn scan(root: &Path, skip: &[String], ignore: &Rules) -> (HashMap<String, Sig>, Vec<String>) {
+    fn go(
+        dir: &Path,
+        prefix: &str,
+        (skip, ignore): (&[String], &Rules),
+        out: &mut HashMap<String, Sig>,
+        bad: &mut Vec<String>,
+    ) {
         let rd = match fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(_) => {
@@ -410,14 +399,16 @@ pub fn scan(root: &Path) -> (HashMap<String, Sig>, Vec<String>) {
                 continue;
             };
             if m.is_dir() {
-                go(&e.path(), &rel, out, bad);
-            } else if m.is_file() {
+                if !excluded(&rel, skip) && !ignore.matches_dir(&rel) {
+                    go(&e.path(), &rel, (skip, ignore), out, bad);
+                }
+            } else if m.is_file() && !excluded(&rel, skip) {
                 out.insert(rel, sig_of(&m));
             }
         }
     }
     let (mut out, mut bad) = (HashMap::new(), Vec::new());
-    go(root, "", &mut out, &mut bad);
+    go(root, "", (skip, ignore), &mut out, &mut bad);
     (out, bad)
 }
 
@@ -465,7 +456,12 @@ impl<R: Remote> Engine<R> {
             ignore: Rules::default(),
             download_only: false,
             progress: Default::default(),
+            cancel: Default::default(),
         }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Relaxed)
     }
 
     fn set_progress(&self, p: Progress) {
@@ -502,6 +498,7 @@ impl<R: Remote> Engine<R> {
     /// Lists both sides and compares everything. Used for the first sync, after a delta reset and for providers
     /// without a delta API.
     pub fn full_scan(&mut self) -> Report {
+        crate::debug::log(|| "scan     full scan".into());
         self.remote.forget_cache();
         let phase = |phase, done, total| {
             if let Ok(mut g) = self.progress.lock() {
@@ -514,7 +511,19 @@ impl<R: Remote> Engine<R> {
             }
         };
         phase(Phase::ListCloud, 0, 0);
-        let items = match self.remote.list_progress(&|d, t| phase(Phase::ListCloud, d, t)) {
+        let cancel = &self.cancel;
+        let listed = self
+            .remote
+            .list_progress(&|d, t| phase(Phase::ListCloud, d, t), &|| cancel.load(Relaxed));
+        // Checked before anything is trashed or planned: a cancelled listing is neither an error nor a result.
+        if self.cancelled() {
+            self.set_progress(Progress::default());
+            return Report {
+                cancelled: true,
+                ..Default::default()
+            };
+        }
+        let items = match listed {
             Ok(i) => i,
             Err(e) => {
                 self.set_progress(Progress::default());
@@ -549,8 +558,12 @@ impl<R: Remote> Engine<R> {
                 duplicate.insert(prev.path);
             }
         }
-        let (mut local, bad) = scan(&self.root);
-        local.retain(|p, _| !excluded(p, &self.excluded));
+        let (local, bad) = scan(&self.root, &self.excluded, &self.ignore);
+        if self.cancelled() {
+            self.set_progress(Progress::default());
+            report.cancelled = true;
+            return report;
+        }
         for b in &bad {
             self.db.log(
                 "error",
@@ -596,6 +609,7 @@ impl<R: Remote> Engine<R> {
 
     /// Compares only these paths (from inotify or a remote delta). A folder expands to the files in it.
     pub fn sync_paths(&mut self, paths: &[String]) -> Report {
+        crate::debug::log(|| format!("scan     {} changed path(s)", paths.len()));
         let mut report = Report::default();
         let mut all = BTreeSet::new();
         let mut bad: Vec<String> = Vec::new();
@@ -612,13 +626,19 @@ impl<R: Remote> Engine<R> {
             // `symlink_metadata`: a link to a folder is not a folder here, `is_dir()` would follow it.
             match fs::symlink_metadata(&abs) {
                 Ok(m) if m.is_dir() => {
-                    let (files, unreadable) = scan(&abs);
-                    all.extend(files.into_keys().map(|f| format!("{p}/{f}")));
-                    bad.extend(
-                        unreadable
-                            .into_iter()
-                            .map(|b| if b.is_empty() { p.clone() } else { format!("{p}/{b}") }),
-                    );
+                    // A folder the rules hide is not walked (`npm install` in an ignored `node_modules/` reports
+                    // a folder event per directory); what was synced there before the rule comes from `db.under`.
+                    if !self.ignore.matches_dir(p) {
+                        // Paths here are from `abs`, not the root, so the rules cannot judge them in `scan`: the
+                        // unchecked folders and `skippable` filter below.
+                        let (files, unreadable) = scan(&abs, &[], &Rules::default());
+                        all.extend(files.into_keys().map(|f| format!("{p}/{f}")));
+                        bad.extend(
+                            unreadable
+                                .into_iter()
+                                .map(|b| if b.is_empty() { p.clone() } else { format!("{p}/{b}") }),
+                        );
+                    }
                 }
                 // Anything but "not there" (permission denied, I/O error) says nothing about the file. A folder that
                 // became a file leaves the paths below it gone, not unreadable.
@@ -632,7 +652,7 @@ impl<R: Remote> Engine<R> {
         all.retain(|p| !excluded(p, &self.excluded) && !self.skippable(p) && !blocked(p, &bad));
         let all: Vec<String> = all.into_iter().collect();
         let mut work = VecDeque::new();
-        for (i, res) in lookup(&self.remote, &self.db, &all) {
+        for (i, res) in lookup(&self.remote, &self.db, &all, &self.cancel) {
             let p = all[i].clone();
             match res {
                 Ok(item) => work.push_back(Work {
@@ -678,15 +698,16 @@ impl<R: Remote> Engine<R> {
 
     /// Paths that changed locally since the DB was written: how edits made while the app was closed are found.
     pub fn local_changes(&self) -> Vec<String> {
-        let (mut local, bad) = scan(&self.root);
-        local.retain(|p, _| !excluded(p, &self.excluded) && !self.skippable(p));
+        let (mut local, bad) = scan(&self.root, &self.excluded, &self.ignore);
+        local.retain(|p, _| !self.skippable(p));
         // A map, not a scan per file: this runs every couple of minutes on trees of 100k files.
         let known: HashMap<String, Base> = self
             .db
             .all()
             .unwrap_or_default()
             .into_iter()
-            .filter(|(p, _)| !excluded(p, &self.excluded))
+            // Not walked any more, so not "missing": a file under a hidden folder was never edited or deleted here.
+            .filter(|(p, _)| !excluded(p, &self.excluded) && !self.ignore.matches(p))
             .collect();
         let mut out: BTreeSet<String> = local
             .iter()
@@ -701,184 +722,6 @@ impl<R: Remote> Engine<R> {
         out.into_iter().collect()
     }
 
-    /// Turns a delete plus a new path holding the same bytes into one move: a folder renamed in the cloud is renamed
-    /// here instead of trashed and downloaded again, a folder renamed here is moved in the cloud instead of
-    /// uploaded again. The proof is the service's own hash (`same_content`), so a service without one (MEGA) never
-    /// pairs and keeps today's copy + delete. A wrong guess is impossible: equal hashes are equal bytes.
-    /// shortcut: hashes one candidate at a time on this thread, at most `PAIR_TRIES` per new path; parallelise it
-    /// if renaming thousands of files with a slow `local_hash` proves too slow.
-    fn pair_moves(&self, plan: Vec<Planned>) -> Vec<Planned> {
-        // Old paths by size: only a delete that was safe to make anyway (we synced it, the local copy untouched; the
-        // cloud copy present and the local one gone) can become a move.
-        let mut olds: HashMap<u64, Vec<usize>> = HashMap::new();
-        for (i, (w, a, base)) in plan.iter().enumerate() {
-            let size = match (a, w.local, &w.remote, base) {
-                (Action::DeleteLocal, Some(l), _, Some(b)) if b.local == l => Some(l.size),
-                (Action::DeleteRemote, None, Some(r), _) => Some(r.size),
-                _ => None,
-            };
-            if let Some(s) = size {
-                olds.entry(s).or_default().push(i);
-            }
-        }
-        if olds.is_empty() {
-            return plan;
-        }
-        let name = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
-        let parent = |p: &str| p.rsplit_once('/').map_or(String::new(), |(d, _)| d.to_string());
-        let mut taken = vec![false; plan.len()];
-        let mut pairs: Vec<(usize, usize)> = Vec::new();
-        for (n, (w, a, _)) in plan.iter().enumerate() {
-            // The new path, and the size it must have.
-            let (size, local_move) = match (a, w.local, &w.remote) {
-                (Action::Download, None, Some(r)) => (r.size, true),
-                (Action::Upload, Some(l), None) => (l.size, false),
-                _ => continue,
-            };
-            let mut cands: Vec<usize> = olds
-                .get(&size)
-                .into_iter()
-                .flatten()
-                .copied()
-                .filter(|&o| {
-                    let (ow, oa, _) = &plan[o];
-                    !taken[o]
-                        && (*oa == Action::DeleteLocal) == local_move
-                        && (name(&ow.path) == name(&w.path) || parent(&ow.path) == parent(&w.path))
-                })
-                .collect();
-            // The same file name first: a folder rename keeps the names, so that is nearly always the match.
-            cands.sort_by_key(|&o| name(&plan[o].0.path) != name(&w.path));
-            for o in cands.into_iter().take(PAIR_TRIES) {
-                let ow = &plan[o].0;
-                let same = if local_move {
-                    // The old local file against the cloud's new item.
-                    w.remote
-                        .as_ref()
-                        .is_some_and(|r| self.remote.same_content(&self.root, &ow.path, r))
-                } else {
-                    // The new local file against the cloud's old item.
-                    ow.remote
-                        .as_ref()
-                        .is_some_and(|r| self.remote.same_content(&self.root, &w.path, r))
-                };
-                if same {
-                    taken[o] = true;
-                    pairs.push((o, n));
-                    break;
-                }
-            }
-        }
-        if pairs.is_empty() {
-            return plan;
-        }
-        let mut plan: Vec<Option<Planned>> = plan.into_iter().map(Some).collect();
-        for (o, n) in pairs {
-            let Some((old, old_action, _)) = plan[o].take() else {
-                continue;
-            };
-            if let Some((new, action, _)) = plan[n].as_mut() {
-                new.from = Some(Box::new(Moved {
-                    path: old.path,
-                    local: old.local,
-                    remote: old.remote,
-                }));
-                *action = if old_action == Action::DeleteLocal {
-                    Action::MoveLocal
-                } else {
-                    Action::MoveRemote
-                };
-            }
-        }
-        plan.into_iter().flatten().collect()
-    }
-
-    /// A new cloud file whose bytes already sit in another synced local file (a duplicate made in the cloud) is
-    /// copied from that file instead of downloaded. Same proof as a move (`same_content`), but the source stays: it
-    /// goes in `from` and `fetch` tries it first, falling back to the download on any doubt.
-    /// shortcut: hashes one candidate at a time on this thread, `PAIR_TRIES` per file; parallelise it if many big
-    /// duplicates arrive at once.
-    fn pair_copies(&self, plan: &mut [Planned]) {
-        let name = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
-        let parent = |p: &str| p.rsplit_once('/').map_or(String::new(), |(d, _)| d.to_string());
-        for (w, action, _) in plan.iter_mut() {
-            let (Action::Download, None, Some(r)) = (*action, w.local, &w.remote) else {
-                continue;
-            };
-            if r.size < COPY_MIN {
-                continue;
-            }
-            let Ok(mut cands) = self.db.paths_with_size(r.size) else {
-                continue;
-            };
-            // Only a file still exactly as synced, that the rules do not hide, and not through a symlinked folder.
-            cands.retain(|(p, s)| {
-                *p != w.path
-                    && !self.ignore.matches(p)
-                    && !under_symlink(&self.root, p)
-                    && local_sig(&self.root, p) == Some(*s)
-            });
-            cands.sort_by_key(|(p, _)| (name(p) != name(&w.path), parent(p) != parent(&w.path)));
-            for (p, s) in cands.into_iter().take(PAIR_TRIES) {
-                if self.remote.same_content(&self.root, &p, r) {
-                    w.from = Some(Box::new(Moved {
-                        path: p,
-                        local: Some(s),
-                        remote: None,
-                    }));
-                    break;
-                }
-            }
-        }
-    }
-
-    /// Two different stamps do not make two different files: an upload the app was closed during, or a file put in
-    /// the cloud by another tool (or a folder that already holds the same files, like a first sync onto an existing
-    /// copy), would otherwise be split into a conflict copy of itself. A `Conflict` of equal sizes whose bytes the
-    /// service's hash proves equal becomes `Adopt`. Each check reads a whole local file, so they run `PARALLEL` at a
-    /// time (and show their count).
-    fn adopt_identical(&self, plan: &mut [Planned]) {
-        let todo: Vec<usize> = (0..plan.len())
-            .filter(|&i| {
-                let (w, a, _) = &plan[i];
-                *a == Action::Conflict && matches!((w.local, &w.remote), (Some(l), Some(r)) if l.size == r.size)
-            })
-            .collect();
-        if todo.is_empty() {
-            return;
-        }
-        let (next, finished) = (AtomicUsize::new(0), AtomicUsize::new(0));
-        let same = Mutex::new(Vec::new());
-        // Plain references, not `self`: the engine holds the SQLite connection, which must stay on this thread.
-        let (remote, root, progress) = (&self.remote, &self.root, &self.progress);
-        let (view, total) = (&*plan, todo.len());
-        std::thread::scope(|s| {
-            for _ in 0..PARALLEL.min(total) {
-                s.spawn(|| {
-                    while let Some(&i) = todo.get(next.fetch_add(1, Relaxed)) {
-                        let (w, ..) = &view[i];
-                        if w.remote.as_ref().is_some_and(|r| remote.same_content(root, &w.path, r))
-                            && let Ok(mut v) = same.lock()
-                        {
-                            v.push(i);
-                        }
-                        if let Ok(mut g) = progress.lock() {
-                            *g = Progress {
-                                done: finished.fetch_add(1, Relaxed) + 1,
-                                total,
-                                phase: Phase::Compare,
-                                ..Default::default()
-                            };
-                        }
-                    }
-                });
-            }
-        });
-        for i in same.into_inner().unwrap_or_default() {
-            plan[i].1 = Action::Adopt;
-        }
-    }
-
     fn run(&mut self, mut work: VecDeque<Work>, mut report: Report) -> Report {
         let mut plan = Vec::new();
         // A mirror trashes local-only files, and a new account has no DB rows to measure the guard against: count
@@ -891,6 +734,12 @@ impl<R: Remote> Engine<R> {
         let (paths, cloud_seen) = (work.len(), work.iter().filter(|w| w.remote.is_some()).count());
         for (n, w) in work.drain(..).enumerate() {
             if n % 256 == 0 {
+                // A plan cut off here is dropped whole: the guard and the pairing never see half of one.
+                if self.cancelled() {
+                    self.set_progress(Progress::default());
+                    report.cancelled = true;
+                    return report;
+                }
                 self.set_progress(Progress {
                     done: n,
                     total: paths,
@@ -941,13 +790,25 @@ impl<R: Remote> Engine<R> {
                 a => a,
             };
             if action != Action::None {
+                crate::debug::log(|| {
+                    format!(
+                        "plan     {}: {action:?} (local {:?}, cloud {remote:?}, synced {base:?})",
+                        w.path, w.local
+                    )
+                });
                 plan.push((w, action, base));
             }
         }
-        self.adopt_identical(&mut plan);
+        self.adopt_identical(&mut plan, &mut report);
         // Before the guard: a rename is not a delete, whatever the folder's size.
         let mut plan = self.pair_moves(plan);
         self.pair_copies(&mut plan);
+        // Nothing was done yet: a cancel here costs nothing, and the guard must not judge a plan that was cut short.
+        if self.cancelled() {
+            self.set_progress(Progress::default());
+            report.cancelled = true;
+            return report;
+        }
         let deletes = plan
             .iter()
             .filter(|(_, a, _)| matches!(a, Action::DeleteLocal | Action::DeleteRemote))
@@ -1007,6 +868,9 @@ impl<R: Remote> Engine<R> {
         // Cloud paths that were deleted or moved away this run: their folders may be empty now.
         let mut gone: Vec<String> = Vec::new();
         while let Some((w, action, base)) = plan.pop_front() {
+            if self.cancelled() {
+                break;
+            }
             // Uploads and downloads wait on the cloud's latency, not on this machine: they run side by side below.
             // Everything else (deletes, conflicts, DB-only rows) stays one at a time, so folders are never removed
             // while a transfer fills them.
@@ -1060,6 +924,7 @@ impl<R: Remote> Engine<R> {
         self.run_transfers(transfers, done, total, &mut report, &mut gone);
         self.prune_cloud_dirs(&gone);
         self.set_progress(Progress::default());
+        report.cancelled = self.cancelled();
         report
     }
 
@@ -1099,14 +964,17 @@ impl<R: Remote> Engine<R> {
         let queue = std::sync::Mutex::new(VecDeque::from(jobs));
         let finished = AtomicUsize::new(done);
         let (remote, root, download_only) = (&self.remote, &self.root, self.download_only);
-        let (progress, db) = (&self.progress, &self.db);
+        let (progress, db, cancel) = (&self.progress, &self.db, &self.cancel);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::scope(|s| {
             for _ in 0..workers {
                 let tx = tx.clone();
                 let (queue, finished) = (&queue, &finished);
                 s.spawn(move || {
-                    while let Some((w, action)) = queue.lock().ok().and_then(|mut q| q.pop_front()) {
+                    // A cancel lets the transfers under way finish (a half-written file is worse) and takes no more.
+                    while !cancel.load(Relaxed)
+                        && let Some((w, action)) = queue.lock().ok().and_then(|mut q| q.pop_front())
+                    {
                         // Shows the file that started last; `done` counts the finished ones.
                         if let Ok(mut g) = progress.lock() {
                             *g = Progress {
@@ -1399,7 +1267,23 @@ fn fetch<R: Remote>(
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+    if expect_local.is_none() {
+        // Nothing was here a moment ago: a file that appeared since (saved by the user between the check above and
+        // here) must not be replaced, and `rename` would. A hard link fails when the name exists.
+        match fs::hard_link(&tmp, &dest) {
+            Ok(()) => {
+                let _ = fs::remove_file(&tmp);
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&tmp);
+                return Err("a file or link with this name appeared here, not replaced".into());
+            }
+            // A file system without hard links: the plain rename (the old, tiny window).
+            Err(_) => fs::rename(&tmp, &dest).map_err(|e| e.to_string())?,
+        }
+    } else {
+        fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+    }
     let l = local_sig(root, path).ok_or("downloaded file not found")?;
     Ok((
         Base {
@@ -1489,7 +1373,7 @@ mod tests {
 
     impl Remote for DirRemote {
         fn list(&self) -> Result<Vec<Item>> {
-            Ok(scan(&self.0)
+            Ok(scan(&self.0, &[], &Rules::default())
                 .0
                 .into_iter()
                 .map(|(p, s)| Item {
@@ -1905,6 +1789,62 @@ mod tests {
     }
 
     #[test]
+    fn a_run_cancelled_before_it_acts_does_nothing_and_says_so() {
+        let mut f = Fixture::new("cancel-early");
+        write(f.local("up.txt"), "u", 100);
+        write(f.remote("down.txt"), "d", 100);
+        f.engine.cancel.store(true, Relaxed);
+        let r = f.engine.full_scan();
+        assert!(r.cancelled && r.transferred == 0 && r.errors.is_empty(), "{r:?}");
+        assert!(!f.remote("up.txt").exists() && !f.local("down.txt").exists());
+        f.engine.cancel.store(false, Relaxed);
+        let r = f.engine.full_scan();
+        assert!(!r.cancelled && f.remote("up.txt").exists() && f.local("down.txt").exists());
+    }
+
+    #[test]
+    fn a_cancel_during_a_run_lets_the_action_under_way_finish_and_starts_no_transfer() {
+        let f = Fixture::new("cancel-mid");
+        let mut e = racy(&f);
+        write(f.local("c.txt"), "one", 100);
+        e.full_scan();
+        fs::remove_file(f.local("c.txt")).unwrap();
+        write(f.local("n.txt"), "mine", 50);
+        // The cloud delete of c runs first; the user presses Pause right then, before the upload of n starts.
+        let cancel = e.cancel.clone();
+        *e.remote.1.lock().unwrap() = Some(Box::new(move || cancel.store(true, Relaxed)));
+        let r = e.full_scan();
+        assert!(r.cancelled && r.errors.is_empty(), "{r:?}");
+        assert!(!f.remote("c.txt").exists(), "the delete under way finished");
+        assert!(!f.remote("n.txt").exists(), "no new transfer started");
+    }
+
+    #[test]
+    fn a_pause_during_a_big_copy_in_skips_the_cloud_lookups_and_acts_on_nothing() {
+        let (f, mut e, paths) = many_new_files("cancel-lookup", None);
+        e.cancel.store(true, Relaxed);
+        let r = e.sync_paths(&paths);
+        assert!(r.cancelled && r.transferred == 0 && r.errors.is_empty(), "{r:?}");
+        assert_eq!(
+            e.remote.lists.load(Relaxed) + e.remote.stats.load(Relaxed),
+            0,
+            "no cloud call at all"
+        );
+        assert!(!f.remote("a/f0.txt").exists());
+    }
+
+    #[test]
+    fn a_new_download_never_replaces_what_already_has_its_name() {
+        let mut f = Fixture::new("no-replace");
+        // A symlink is not a regular file, so the plan sees "nothing here"; the name is still taken.
+        std::os::unix::fs::symlink("/nowhere", f.local("s.txt")).unwrap();
+        write(f.remote("s.txt"), "cloud", 100);
+        let r = f.engine.full_scan();
+        assert_eq!(r.errors.len(), 1, "{r:?}");
+        assert!(fs::symlink_metadata(f.local("s.txt")).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
     fn a_local_edit_made_during_the_run_is_not_trashed() {
         let f = Fixture::new("race-local");
         let mut e = racy(&f);
@@ -2049,6 +1989,55 @@ mod tests {
         // Different bytes of the same size still split, so no edit is ever lost.
         assert!(names.iter().any(|n| n.starts_with("b (conflict")), "{names:?}");
         assert_eq!(f.engine.full_scan().transferred, 0, "and the next scan finds nothing");
+    }
+
+    /// A cloud whose byte check always fails, as when rclone cannot read the local file.
+    struct CannotCompare(DirRemote);
+
+    impl Remote for CannotCompare {
+        fn list(&self) -> Result<Vec<Item>> {
+            self.0.list()
+        }
+        fn stat(&self, rel: &str) -> Result<Option<Item>> {
+            self.0.stat(rel)
+        }
+        fn upload(&self, root: &Path, rel: &str) -> Result<()> {
+            self.0.upload(root, rel)
+        }
+        fn download(&self, rel: &str, dest: &Path) -> Result<()> {
+            self.0.download(rel, dest)
+        }
+        fn delete(&self, rel: &str) -> Result<()> {
+            self.0.delete(rel)
+        }
+        fn compare(&self, _: &Path, _: &str, _: &Item) -> Result<bool> {
+            Err("permission denied".into())
+        }
+    }
+
+    #[test]
+    fn a_failed_byte_check_skips_the_file_with_an_error_instead_of_splitting_it() {
+        let f = Fixture::new("cannot-compare");
+        let remote = CannotCompare(DirRemote(f.engine.remote.0.clone()));
+        let mut e = Engine::new(f.engine.root.clone(), remote, Db::memory().unwrap());
+        write(f.local("a.pdf"), "same bytes", 5000);
+        write(f.remote("a.pdf"), "same bytes", 100);
+        write(f.remote("new.txt"), "unrelated", 100);
+        let r = e.full_scan();
+        assert_eq!(r.errors.len(), 1, "{r:?}");
+        assert!(
+            r.errors[0].contains("a.pdf") && r.errors[0].contains("could not compare"),
+            "{r:?}"
+        );
+        let names: Vec<String> = fs::read_dir(&f.engine.root)
+            .unwrap()
+            .flatten()
+            .map(|d| d.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(!names.iter().any(|n| n.contains("conflict")), "{names:?}");
+        assert_eq!(fs::read_to_string(f.local("a.pdf")).unwrap(), "same bytes");
+        assert!(e.db.base("a.pdf").unwrap().is_none(), "not recorded as synced either");
+        assert!(f.local("new.txt").exists(), "the rest of the run goes on");
     }
 
     #[test]
@@ -2471,6 +2460,49 @@ mod tests {
         );
     }
 
+    /// A cloud whose downloads all fail.
+    struct NoDown(DirRemote);
+
+    impl Remote for NoDown {
+        fn list(&self) -> Result<Vec<Item>> {
+            self.0.list()
+        }
+        fn stat(&self, rel: &str) -> Result<Option<Item>> {
+            self.0.stat(rel)
+        }
+        fn upload(&self, root: &Path, rel: &str) -> Result<()> {
+            self.0.upload(root, rel)
+        }
+        fn download(&self, _rel: &str, _dest: &Path) -> Result<()> {
+            Err("connection lost".into())
+        }
+        fn delete(&self, rel: &str) -> Result<()> {
+            self.0.delete(rel)
+        }
+    }
+
+    #[test]
+    fn a_conflict_whose_download_fails_still_keeps_the_local_edit() {
+        let f = Fixture::new("conflict-fail");
+        write(f.local("r.txt"), "mine", 20);
+        write(f.remote("r.txt"), "theirs!", 10);
+        let mut e = Engine::new(
+            f.engine.root.clone(),
+            NoDown(DirRemote(f.engine.remote.0.clone())),
+            Db::memory().unwrap(),
+        );
+        let r = e.full_scan();
+        assert!(!r.errors.is_empty(), "the failed download is reported");
+        let aside = conflict_name("r.txt", &today(), 1);
+        assert_eq!(
+            fs::read_to_string(f.local(&aside)).unwrap(),
+            "mine",
+            "the edit is only renamed"
+        );
+        assert_eq!(fs::read_to_string(f.remote("r.txt")).unwrap(), "theirs!");
+        assert!(e.db.base("r.txt").unwrap().is_none(), "nothing was recorded as synced");
+    }
+
     fn trashed(f: &Fixture, rel: &str) -> Option<String> {
         let stamps = fs::read_dir(f.local(".fastsync/trash")).ok()?;
         stamps
@@ -2484,7 +2516,7 @@ mod tests {
         let f = Fixture::new("badname");
         write(f.local("ok.txt"), "x", 10);
         fs::write(f.engine.root.join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt")), "y").unwrap();
-        let (files, bad) = scan(&f.engine.root);
+        let (files, bad) = scan(&f.engine.root, &[], &Rules::default());
         assert!(files.contains_key("ok.txt") && files.len() == 1);
         assert_eq!(bad.len(), 1, "{bad:?}");
         assert!(bad[0].starts_with("caf"));
@@ -2540,7 +2572,7 @@ mod tests {
         write(f.local(".fastsync/trash/junk/keep.txt"), "not ours", 100);
         assert!(purge_trash(&root, 0).is_ok());
         assert_eq!(trash_usage(&root).0, 4, "0 keeps everything");
-        purge_trash_at(&root, 90, now).unwrap();
+        crate::trash::purge_trash_at(&root, 90, now).unwrap();
         // 91 and exactly 90 days old go; a day old and a folder with a non-numeric name stay.
         assert_eq!(trash_usage(&root).0, 2);
         assert!(f.local(".fastsync/trash/junk/keep.txt").exists());
@@ -2806,6 +2838,30 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_hidden_by_a_rule_is_not_walked_but_still_handled_like_ignored_files() {
+        let mut f = Fixture::new("ignore-dir");
+        write(f.local("build/o.bin"), "l", 100);
+        write(f.local("src/a.rs"), "s", 100);
+        let rules = Rules::parse("build/");
+        let (files, _) = scan(&f.engine.root, &[], &rules);
+        assert_eq!(files.keys().collect::<Vec<_>>(), ["src/a.rs"], "build/ is not entered");
+        // Synced before the rule: the cloud copy goes, the local file stays, and the walk does not call it deleted.
+        f.engine.full_scan();
+        assert!(f.remote("build/o.bin").exists());
+        f.engine.ignore = rules;
+        let r = f.engine.full_scan();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(!f.remote("build/o.bin").exists() && f.local("build/o.bin").exists());
+        assert!(f.remote("src/a.rs").exists());
+        assert!(f.engine.local_changes().is_empty());
+        // A folder event inside the hidden folder (an `npm install`) neither walks it nor uploads anything.
+        write(f.local("build/new/x.bin"), "n", 100);
+        let r = f.engine.sync_paths(&["build/new".to_string()]);
+        assert!(r.errors.is_empty() && r.transferred == 0, "{r:?}");
+        assert!(!f.remote("build/new/x.bin").exists());
+    }
+
+    #[test]
     fn download_only_forgets_an_ignored_file_without_touching_either_side() {
         let mut f = Fixture::new("ignore-down");
         f.engine.download_only = true;
@@ -2849,5 +2905,30 @@ mod tests {
             assert!(!safe_rel(bad), "{bad}");
         }
         assert!(safe_rel("dir/file.txt") && safe_rel("..hidden"));
+    }
+
+    #[test]
+    fn native_client_files_are_ignored() {
+        for name in [
+            ".dropbox",
+            ".dropbox.cache",
+            ".dropbox.attr",
+            ".tmp.drivedownload",
+            ".tmp.driveupload",
+            ".debris",
+            ".DS_Store",
+            "Thumbs.db",
+            "Desktop.ini",
+            "Icon\r",
+            "~$report.docx",
+        ] {
+            assert!(
+                ignored(name) && !safe_rel(name) && !safe_rel(&format!("a/{name}/x")),
+                "{name}"
+            );
+        }
+        for name in ["rules.dropboxignore", ".megaignore", "a~$b.txt", "dropbox.txt"] {
+            assert!(!ignored(name), "{name}");
+        }
     }
 }

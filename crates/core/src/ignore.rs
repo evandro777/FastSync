@@ -47,6 +47,15 @@ impl Rules {
 
     /// True when the file `path` (relative, `/`-separated) or a folder above it is ignored.
     pub fn matches(&self, path: &str) -> bool {
+        self.matches_as(path, false)
+    }
+
+    /// `matches` for a folder: a rule with a trailing `/` (`build/`) hides it too, so a walk can skip it whole.
+    pub fn matches_dir(&self, path: &str) -> bool {
+        self.matches_as(path, true)
+    }
+
+    fn matches_as(&self, path: &str, last_is_dir: bool) -> bool {
         if self.0.is_empty() || path == RULES {
             return false;
         }
@@ -54,7 +63,7 @@ impl Rules {
         let ends: Vec<usize> = path.match_indices('/').map(|(i, _)| i).collect();
         ends.iter()
             .map(|&i| (&path[..i], true))
-            .chain(std::iter::once((path, false)))
+            .chain(std::iter::once((path, last_is_dir)))
             .any(|(p, is_dir)| self.ignored_at(p, is_dir))
     }
 

@@ -343,7 +343,7 @@ component RemoveDialog inherits Dialog {
         Text { text: root.folder; color: Family.muted; font-size: Family.caption; overflow: elide; }
     }
     SelectableText {
-        text: @tr("FastSync stops syncing this account and forgets its login. The files on this computer and in the cloud are not deleted.");
+        text: @tr("FastSync stops syncing this account and forgets its login. The files on this computer and in the cloud are not deleted. Whatever is left in the .fastsync/trash folder there stays; delete it by hand.");
         avail: root.text-avail;
     }
     HorizontalLayout {

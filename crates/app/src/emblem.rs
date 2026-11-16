@@ -63,7 +63,20 @@ pub fn set(local: &str, emblem: Option<&str>) {
         Some(e) => cmd.args(["-t", "stringv", local, "metadata::emblems", e]),
         None => cmd.args(["-t", "unset", local, "metadata::emblems"]),
     };
-    let _ = cmd.output();
+    // On one thread of its own, fed in order: `gio` can sit on a D-Bus reply from the metadata service for a long
+    // time, and this is called from the sync worker, which would be stuck. A thread per call could finish out of
+    // order and leave an old emblem (syncing) over the newer one (idle).
+    static QUEUE: std::sync::OnceLock<std::sync::mpsc::Sender<std::process::Command>> = std::sync::OnceLock::new();
+    let tx = QUEUE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<std::process::Command>();
+        std::thread::spawn(move || {
+            for mut c in rx {
+                let _ = c.output();
+            }
+        });
+        tx
+    });
+    let _ = tx.send(cmd);
 }
 
 #[cfg(test)]

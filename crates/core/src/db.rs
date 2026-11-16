@@ -43,6 +43,7 @@ impl Db {
 
     /// One line of the activity log. Best effort: a log that cannot be written must never stop a sync.
     pub fn log(&self, kind: &str, path: &str, size: Option<u64>, msg: &str) {
+        crate::debug::log(|| format!("{kind:<8} {path} size={size:?} {msg}"));
         let _ = self.0.execute(
             "INSERT INTO log(ts,kind,path,size,msg) VALUES(?,?,?,?,?)",
             params![now(), kind, path, size.map(|s| s as i64), msg],

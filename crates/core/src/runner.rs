@@ -46,8 +46,12 @@ enum Event {
     Root(Option<String>),
     /// Compare the local folder with the DB (offline edits, missed inotify events).
     Walk,
-    /// Automatic full comparison (timers, providers without a feed).
+    /// A full comparison asked for (start-up, a retry, a rescan).
     Full,
+    /// The `SCAN_EVERY` timer of a provider without a feed. Ticks pile up while a long run works, so one is only
+    /// taken when the last full scan ended long enough ago (`scan_due`): else a listing slower than the interval
+    /// would start again the moment it ended, for ever.
+    Tick,
     /// The user pressed "Sync now".
     SyncNow,
     /// The user's answer to a stopped run.
@@ -96,6 +100,8 @@ impl Held {
 pub struct Runner {
     tx: Sender<Event>,
     handle: Option<std::thread::JoinHandle<()>>,
+    /// The engine's `cancel`: Pause and Stop set it at once, because the worker reads its events only between runs.
+    cancel: Arc<AtomicBool>,
 }
 
 impl Runner {
@@ -119,10 +125,16 @@ impl Runner {
     pub fn rescan(&self) {
         let _ = self.tx.send(Event::Full);
     }
+    /// Pausing also ends the run in progress (it finishes the transfers under way); the worker clears the flag again
+    /// when it reads the resume.
     pub fn pause(&self, on: bool) {
+        if on {
+            self.cancel.store(true, Ordering::Relaxed);
+        }
         let _ = self.tx.send(Event::Pause(on));
     }
     pub fn stop(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
         let _ = self.tx.send(Event::Stop);
     }
 }
@@ -141,6 +153,11 @@ pub static WALK_FALLBACK_MINUTES: AtomicU32 = AtomicU32::new(2);
 /// since the last. Half a tick of slack, or a 1-minute setting would drift to 2 on a timer that ticks a hair late.
 fn walk_due(since_last: Option<Duration>, minutes: u32) -> bool {
     since_last.is_none_or(|d| d + WALK_TICK / 2 >= Duration::from_secs(u64::from(minutes) * 60))
+}
+/// True when a timer tick should start a full scan: none yet, or the last one ended at least half the interval ago
+/// (a tick that waited behind a long run reads as "just ended" and is dropped; the next one is due).
+fn scan_due(since_end: Option<Duration>) -> bool {
+    since_end.is_none_or(|d| d >= SCAN_EVERY / 2)
 }
 const RETRY_AFTER: Duration = Duration::from_secs(60);
 const RETRY_MAX: Duration = Duration::from_secs(1800);
@@ -211,12 +228,13 @@ pub fn spawn(
 ) -> Runner {
     let (tx, rx) = channel();
     let on_status = Arc::new(on_status);
+    let cancel = Arc::new(AtomicBool::new(false));
     let handle = std::thread::spawn({
-        let tx = tx.clone();
+        let (tx, cancel) = (tx.clone(), cancel.clone());
         move || {
             // A panic would end this thread silently and leave the card on its last status for ever.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                work(acct, rc, tx, rx, on_status.clone(), &on_conflicts)
+                work(acct, rc, tx, rx, cancel, on_status.clone(), &on_conflicts)
             }));
             match result {
                 Ok(Err(e)) => on_status(Status::Error(e)),
@@ -230,6 +248,7 @@ pub fn spawn(
     Runner {
         tx,
         handle: Some(handle),
+        cancel,
     }
 }
 
@@ -238,6 +257,7 @@ fn work(
     rc: Arc<Rclone>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
+    cancel: Arc<AtomicBool>,
     on_status: Arc<dyn Fn(Status) + Send + Sync>,
     on_conflicts: &(dyn Fn(usize, String) + Send + Sync),
 ) -> Result<(), String> {
@@ -270,6 +290,7 @@ fn work(
     );
     engine.excluded = acct.excluded.clone();
     engine.download_only = acct.download_only;
+    engine.cancel = cancel.clone();
     // The unchecked list the last full scan was made with. When it differs (the user just saved the folder picker),
     // a full scan must run before anything else: it trashes what was unticked and brings back what was re-ticked.
     // A provider with a delta feed would otherwise wait for a cursor reset, and a re-ticked folder whose files the
@@ -280,6 +301,8 @@ fn work(
     let mut excluded_key = format!("{}\n\0\n{rules_text}", acct.excluded.join("\n"));
     let excluded_changed = engine.db.meta("excluded").ok().flatten().unwrap_or_default() != excluded_key;
     let stop = Arc::new(AtomicBool::new(false));
+    // Also raised when this worker ends by a panic, or the feed's poller would keep polling the provider for good.
+    let _stop_feed = StopOnDrop(stop.clone());
 
     // Local edits. If inotify cannot watch the tree (the watch limit), the walk timer runs more often.
     let watcher_tx = tx.clone();
@@ -309,13 +332,15 @@ fn work(
         if matches!(e.kind, notify::ErrorKind::MaxFilesWatch) {
             WATCH_LIMIT_HIT.store(true, Ordering::Relaxed);
         }
-        // Not fatal: the folder is then compared every 20 s instead.
+        // Not fatal: the folder is then compared every `walk_fallback_minutes` instead.
         engine.db.log("error", "", None, &format!("inotify: {e}"));
         on_status(Status::Error(format!("inotify: {e}")));
     }
     let watching_ok = watching.is_ok();
-    timer(tx.clone(), stop.clone(), WALK_TICK, || Event::Walk);
+    timer(tx.clone(), WALK_TICK, || Event::Walk);
     let mut last_walk: Option<Instant> = None;
+    // When the last full scan ended (any cause), for `scan_due`.
+    let mut last_full_end: Option<Instant> = None;
 
     // Remote edits: the provider's feed, or a periodic full scan.
     let kind = acct.kind.clone();
@@ -331,7 +356,7 @@ fn work(
             }
         }
         None => {
-            timer(tx.clone(), stop.clone(), SCAN_EVERY, || Event::Full);
+            timer(tx.clone(), SCAN_EVERY, || Event::Tick);
             let _ = tx.send(Event::Full);
         }
     }
@@ -419,6 +444,7 @@ fn work(
                     }
                 }
                 Event::Full => full = true,
+                Event::Tick => full |= scan_due(last_full_end.map(|t| t.elapsed())),
                 Event::SyncNow => full = true,
                 Event::Resolve(d) => {
                     // Only a held account has anything to resolve, and a mirror cannot put files back in the cloud.
@@ -429,6 +455,10 @@ fn work(
                 }
                 Event::Pause(p) => {
                     paused = p;
+                    // Only here, never before a run: a Pause pressed just as a run starts must still end it.
+                    if !p {
+                        cancel.store(false, Ordering::Relaxed);
+                    }
                     on_status(match (&held, p) {
                         (_, true) => Status::Paused,
                         (Some(h), false) => h.status(),
@@ -490,7 +520,9 @@ fn work(
         let (began, was_full) = (Instant::now(), full);
         let report = std::thread::scope(|s| {
             s.spawn(|| ticker(&rc, &acct.id, &progress, &*on_status, &over));
-            let report = if full {
+            // Raised when this closure ends, however it ends: `scope` joins the ticker before it lets a panic out.
+            let _end = EndRun(&over);
+            if full {
                 on_status(syncing());
                 engine.full_scan()
             } else {
@@ -509,9 +541,7 @@ fn work(
                     // batch: a stop here may be a move only a full scan (which pairs them) can see.
                     if r.aborted.is_some() { engine.full_scan() } else { r }
                 }
-            };
-            over.store(true, Ordering::Relaxed);
-            report
+            }
         });
         pending.clear();
         feed_paths.clear();
@@ -531,12 +561,22 @@ fn work(
             );
         }
         engine.db.trim_log();
+        // Cut short by Pause or Stop: the event that did it is next in the queue. Nothing is confirmed (no cursor, no
+        // "up to date", no decision carried out), and a full scan reads everything again when the account goes on.
+        if report.cancelled {
+            (full, walk) = (true, false);
+            (engine.confirmed_deletes, engine.restore) = (None, false);
+            continue;
+        }
         // Only a clean full scan counts: after an error or a stop the next start must scan again.
-        if full && excluded_pending && report.errors.is_empty() && report.aborted.is_none() {
+        if full && excluded_pending && clean(&report) {
             let _ = engine.db.set_meta("excluded", &excluded_key);
             excluded_pending = false;
         }
         (full, walk) = (false, false);
+        if was_full {
+            last_full_end = Some(Instant::now());
+        }
         (engine.confirmed_deletes, engine.restore) = (None, false);
         if let Some((deletes, known, paths)) = &report.aborted {
             // Written before the status goes out, so a quit right after the card shows it still finds it.
@@ -547,7 +587,7 @@ fn work(
             };
             h.save(&engine.db);
             (held, resolution) = (Some(h), None);
-        } else if report.errors.is_empty() && resolution.take().is_some() {
+        } else if clean(&report) && resolution.take().is_some() {
             // The decision was carried out. After errors it stays, and the retry carries it out again.
             let _ = engine.db.del_meta("held");
             held = None;
@@ -556,8 +596,7 @@ fn work(
         // Only after a clean run with no retry waiting: a change that failed to sync must be read again after a
         // restart, even when a later run of other paths was clean. The retry (a full scan) covers it while the app
         // stays up, and the cursor is saved once that scan is clean.
-        if report.errors.is_empty()
-            && report.aborted.is_none()
+        if clean(&report)
             && !retry.pending()
             && let Some(c) = new_cursor.take()
         {
@@ -596,7 +635,6 @@ fn rel(root: &Path, abs: &Path) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
-/// Sends `make()` every `every` until `stop` is set.
 fn syncing() -> Status {
     Status::Syncing(Progress::default(), 0.0)
 }
@@ -632,20 +670,43 @@ fn ticker(rc: &Rclone, group: &str, progress: &Mutex<Progress>, on_status: &dyn 
     }
 }
 
-fn timer(tx: Sender<Event>, stop: Arc<AtomicBool>, every: Duration, make: fn() -> Event) {
+/// One sleep per interval, not one per second: an idle account costs no wake-ups in between. The thread ends at its
+/// next tick after the worker is gone (the channel is closed), so a stopped account leaves one sleeping thread for at
+/// most `every`.
+fn timer(tx: Sender<Event>, every: Duration, make: fn() -> Event) {
     std::thread::spawn(move || {
-        let mut left = every;
-        while !stop.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_secs(1));
-            left = left.saturating_sub(Duration::from_secs(1));
-            if left.is_zero() {
-                left = every;
-                if tx.send(make()).is_err() {
-                    return;
-                }
+        loop {
+            std::thread::sleep(every);
+            if tx.send(make()).is_err() {
+                return;
             }
         }
     });
+}
+
+/// Stops the feed's poller when the worker ends, however it ends.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Tells the ticker the run is over when dropped, also while unwinding from a panic.
+struct EndRun<'a>(&'a AtomicBool);
+
+impl Drop for EndRun<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// True when a run finished with nothing wrong and nothing cut short: only then may it confirm anything (save the
+/// feed cursor or the unchecked-folders key, clear a held decision). After an error, a stop or a Pause, the next scan
+/// must read it all again.
+fn clean(r: &Report) -> bool {
+    r.errors.is_empty() && r.aborted.is_none() && !r.cancelled
 }
 
 /// Runs the provider's feed: long polls (Dropbox) or polls every 30 s, and hands the changes to the worker.
@@ -779,6 +840,67 @@ mod tests {
         r.after_run(false, true, t0 + Duration::from_secs(200));
         assert!(!r.pending());
         assert_eq!(r.fails, 0);
+    }
+
+    #[test]
+    fn a_panic_inside_the_run_still_ends_the_ticker() {
+        // `scope` joins the ticker before it lets a panic out: without the guard this test would never return.
+        let over = AtomicBool::new(false);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    while !over.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                });
+                let _end = EndRun(&over);
+                panic!("an engine bug");
+            })
+        }));
+        assert!(r.is_err() && over.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn only_a_clean_run_confirms_anything() {
+        assert!(clean(&Report::default()));
+        let with = |f: fn(&mut Report)| {
+            let mut r = Report::default();
+            f(&mut r);
+            clean(&r)
+        };
+        assert!(!with(|r| r.errors.push("x".into())));
+        assert!(!with(|r| r.aborted = Some((1, 10, Vec::new()))));
+        assert!(!with(|r| r.cancelled = true), "a Pause must never save the cursor");
+    }
+
+    #[test]
+    fn a_timer_tick_behind_a_long_scan_is_dropped_the_next_one_is_taken() {
+        let secs = Duration::from_secs;
+        assert!(scan_due(None), "no scan yet");
+        // A listing slower than the interval: the ticks queued meanwhile are read right after it ended.
+        assert!(!scan_due(Some(secs(0))));
+        assert!(!scan_due(Some(secs(149))));
+        assert!(scan_due(Some(secs(150))));
+        assert!(scan_due(Some(secs(300))));
+    }
+
+    #[test]
+    fn pause_and_stop_raise_the_cancel_flag_and_only_the_resume_lowers_it() {
+        // `spawn` needs rclone and an account: the handle alone shows what the buttons do.
+        let (tx, rx) = channel();
+        let r = Runner {
+            tx,
+            handle: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        r.pause(false);
+        assert!(!r.cancel.load(Ordering::Relaxed), "resume never cancels");
+        r.pause(true);
+        assert!(r.cancel.load(Ordering::Relaxed));
+        r.cancel.store(false, Ordering::Relaxed);
+        r.stop();
+        assert!(r.cancel.load(Ordering::Relaxed));
+        assert_eq!(rx.try_iter().count(), 3);
     }
 
     #[test]

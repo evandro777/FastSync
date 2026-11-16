@@ -27,16 +27,17 @@
   <launchable type="desktop-id">io.github.evandro777.FastSync.desktop</launchable>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="0.2.1" date="2026-11-15">
+    <release version="0.2.2" date="2026-11-16">
       <description>
-        <p>First release.</p>
+        <p>More reliable, and faster with ignore rules.</p>
         <ul>
-          <li>Two-way sync for Dropbox, Google Drive, OneDrive and MEGA, with several accounts at once.</li>
-          <li>Choose which cloud folders to sync, or mirror the cloud one way (download only).</li>
-          <li>A run that would delete too many files stops and asks first; removed files go to a trash folder.</li>
-          <li>Activity log, conflict notifications, storage use on each account card, ignore rules.</li>
-          <li>Nemo menu to copy a share link or open a file on the web, and a status badge on the synced folder.</li>
-          <li>Loading bar when first time setup</li>
+          <li>FastSync restarts its sync helper (rclone) if it ever stops, and one account's internal error no longer affects the others.</li>
+          <li>Pause now stops a sync that is already running.</li>
+          <li>Folders hidden by ignore rules are no longer scanned, which is much faster for things like node_modules.</li>
+          <li>Files from other sync clients (.dropbox, .DS_Store, Office lock files and similar) are never synced.</li>
+          <li>Identical files are no longer duplicated as conflicts when the check itself fails; it is retried instead.</li>
+          <li>Removing an account clears its old trash items; the rest stays in .fastsync/trash.</li>
+          <li>The first scan of a big cloud shows its progress.</li>
         </ul>
       </description>
     </release>
