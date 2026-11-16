@@ -560,6 +560,8 @@ pub struct RcloneRemote {
     pub fs: String,
     /// Filter rules for folders that cannot be listed (see `exclusions`).
     pub exclude: Vec<String>,
+    /// A Dropbox account: its symlinks (empty files whose target lives in the metadata) can be read, see `link_target`.
+    pub dropbox: bool,
 }
 
 /// Folders a service keeps in the tree but refuses to list. OneDrive Personal's locked "Personal Vault" fails with
@@ -696,6 +698,14 @@ fn walk_cloud(
 impl crate::engine::Remote for RcloneRemote {
     fn list(&self) -> Result<Vec<Item>> {
         self.rc.list(&self.fs, "", &self.exclude, true)
+    }
+    /// Only Dropbox: `fs` is `<account id>:` there (the root), the id names the login whose token is used.
+    fn link_target(&self, rel: &str) -> Result<Option<String>> {
+        if !self.dropbox {
+            return Ok(None);
+        }
+        let (rc, name) = (self.rc.clone(), self.fs.trim_end_matches(':').to_string());
+        crate::delta::dropbox_link_target(Box::new(move || rc.token(&name).map(|t| t.0)), rel)
     }
     /// The cloud as a queue of folders worked off a few at a time: the top `SPLIT_DEPTH` levels one level per call
     /// (their subfolders join the queue, so the total grows as they are found), deeper folders as one recursive call

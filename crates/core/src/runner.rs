@@ -285,6 +285,7 @@ fn work(
             rc: rc.clone(),
             fs,
             exclude: exclude_rules(&acct.kind, &acct.excluded),
+            dropbox: acct.kind == "dropbox",
         },
         db,
     );
@@ -464,8 +465,9 @@ fn work(
                         (Some(h), false) => h.status(),
                         (None, false) => syncing(),
                     });
-                    // What happened meanwhile is unknown (the feed keeps running, but be safe): compare all.
-                    full |= !p;
+                    // What happened meanwhile is already queued: the feed's paths, inotify's, a due retry. A walk (local
+                    // only, no cloud call) covers an inotify queue that overflowed. A run Pause cut short set `full`.
+                    walk |= !p;
                 }
                 Event::Stop => {
                     stop.store(true, Ordering::Relaxed);

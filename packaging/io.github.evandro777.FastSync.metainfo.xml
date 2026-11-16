@@ -27,7 +27,7 @@
   <launchable type="desktop-id">io.github.evandro777.FastSync.desktop</launchable>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="0.2.2" date="2026-11-16">
+    <release version="0.2.3" date="2026-11-16">
       <description>
         <p>More reliable, and faster with ignore rules.</p>
         <ul>
@@ -38,6 +38,7 @@
           <li>Identical files are no longer duplicated as conflicts when the check itself fails; it is retried instead.</li>
           <li>Removing an account clears its old trash items; the rest stays in .fastsync/trash.</li>
           <li>The first scan of a big cloud shows its progress.</li>
+          <li>Improve handle with symlinks.</li>
         </ul>
       </description>
     </release>

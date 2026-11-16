@@ -37,6 +37,7 @@ fn sync_through_rclone_both_ways() {
             rc,
             fs: fs_name,
             exclude,
+            dropbox: false,
         },
         Db::memory().unwrap(),
     );
@@ -139,6 +140,7 @@ fn many_new_files_in_a_new_cloud_folder_upload_through_rclone() {
             rc,
             fs: remote.to_string_lossy().to_string(),
             exclude: vec![],
+            dropbox: false,
         },
         Db::memory().unwrap(),
     );
@@ -187,6 +189,7 @@ fn a_listing_split_by_folder_equals_the_recursive_one() {
         rc,
         fs: remote.to_string_lossy().to_string(),
         exclude: fastsync_core::rclone::exclusions("onedrive"),
+        dropbox: false,
     };
     let seen = Mutex::new(Vec::new());
     let mut split = r

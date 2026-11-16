@@ -63,6 +63,11 @@ pub trait Remote: Send + Sync {
     fn same_content(&self, _local_root: &Path, _rel: &str, _remote: &Item) -> bool {
         false
     }
+    /// Where the cloud entry `rel` points when it is a symlink (Dropbox keeps the target in its metadata and the file
+    /// itself is empty), `None` for a plain file. An `Err` is "could not find out": the caller retries later.
+    fn link_target(&self, _rel: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
     /// `same_content` that can say "could not find out" (`Err`: the check itself failed) apart from "different".
     /// Where a wrong "different" has a price (a conflict copy of identical bytes) the engine asks this one.
     fn compare(&self, local_root: &Path, rel: &str, remote: &Item) -> Result<bool> {
@@ -763,6 +768,12 @@ impl<R: Remote> Engine<R> {
                     (Some(_), _) => Action::Forget,
                     _ => Action::None,
                 }
+            } else if w.local.is_none() && fs::symlink_metadata(self.root.join(&w.path)).is_ok() {
+                // `scan` never lists links, so "no local file" here may be a link holding the name (the official
+                // Dropbox client leaves an empty file in the cloud for each). Links are never uploaded, so there is
+                // nothing to download, upload or delete: planning it only made the download fail on every retry.
+                // (`make_link` is what creates a link from a cloud one.)
+                Action::None
             } else if self.download_only {
                 decide_down(w.local, remote, base)
             } else {
@@ -989,7 +1000,13 @@ impl<R: Remote> Engine<R> {
                                 ..Default::default()
                             };
                         }
-                        let result = transfer(remote, root, download_only, &w, action);
+                        let result = match make_link(remote, root, download_only, &w, action) {
+                            Ok(Some(done)) => Ok(done),
+                            Ok(None) => {
+                                transfer(remote, root, download_only, &w, action).map(|(b, id)| Done::Row(b, id))
+                            }
+                            Err(e) => Err(e),
+                        };
                         if tx.send((w, action, result)).is_err() {
                             break;
                         }
@@ -1000,21 +1017,29 @@ impl<R: Remote> Engine<R> {
             for (w, action, result) in rx {
                 // The new row first: a crash in between leaves two rows (the old one reads as gone on both sides and
                 // is forgotten next run), never none.
-                let saved = result.and_then(|(b, id)| {
-                    db.set(&w.path, &b, &id).map_err(|e| e.to_string())?;
-                    // A download's `from` is the file it was copied from: that one stays.
-                    match &w.from {
-                        Some(f) if action != Action::Download => db.forget(&f.path).map_err(|e| e.to_string()),
-                        _ => Ok(()),
+                // `Ok(false)`: nothing was done and nothing is logged.
+                let saved = result.and_then(|done| match done {
+                    Done::Row(b, id) => {
+                        db.set(&w.path, &b, &id).map_err(|e| e.to_string())?;
+                        // A download's `from` is the file it was copied from: that one stays.
+                        match &w.from {
+                            Some(f) if action != Action::Download => {
+                                db.forget(&f.path).map_err(|e| e.to_string()).map(|()| true)
+                            }
+                            _ => Ok(true),
+                        }
                     }
+                    Done::Link => Ok(true),
+                    Done::Skipped => Ok(false),
                 });
                 match saved {
-                    Ok(()) => {
+                    Ok(true) => {
                         log_done(db, &w, action, report);
                         if let (Action::MoveRemote, Some(f)) = (action, &w.from) {
                             gone.push(f.path.clone());
                         }
                     }
+                    Ok(false) => {}
                     Err(e) => log_failed(db, &w, &e, report),
                 }
                 finished.fetch_add(1, Relaxed);
@@ -1229,6 +1254,76 @@ fn transfer<R: Remote>(
             ))
         }
         _ => Err("not a transfer".into()),
+    }
+}
+
+/// What a finished transfer leaves to record.
+enum Done {
+    /// The row to write: how both sides look now, the remote id.
+    Row(Base, String),
+    /// A symlink was made. No row: `local_sig` does not see links, so a row would read as "deleted here" later.
+    Link,
+    /// A cloud link we refuse to make (see `safe_link_target`): nothing done, nothing wrong.
+    Skipped,
+}
+
+/// True when a link at `rel` pointing at `target` stays inside the synced folder, judged by the names alone: relative,
+/// never above the root, no NUL. Anything else (an absolute path, `../..` out of the folder) is not made, so a cloud
+/// entry cannot aim a later write at `~/.ssh`. A folder on the way that is itself a link is `refuse`'s to catch.
+fn safe_link_target(rel: &str, target: &str) -> bool {
+    if target.is_empty() || target.len() > 4096 || target.contains('\0') || target.starts_with('/') {
+        return false;
+    }
+    // Folders between the root and the link.
+    let mut depth = rel.split('/').count() as i64 - 1;
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => depth += 1,
+        }
+    }
+    true
+}
+
+/// A new empty cloud file may be a symlink the official Dropbox client stored: its target is in the metadata, not the
+/// bytes. Makes the link instead of an empty file, never over a name that is taken. `Ok(None)`: a plain file, download
+/// it as usual. An `Err` (the metadata call failed) is retried, so a hiccup never turns a link into an empty file.
+fn make_link<R: Remote>(
+    remote: &R,
+    root: &Path,
+    download_only: bool,
+    w: &Work,
+    action: Action,
+) -> Result<Option<Done>> {
+    let Some(r) = &w.remote else { return Ok(None) };
+    if action != Action::Download || w.local.is_some() || w.from.is_some() || r.size != 0 || r.is_dir {
+        return Ok(None);
+    }
+    refuse(root, download_only, &w.path, action)?;
+    let Some(target) = remote.link_target(&w.path)? else {
+        return Ok(None);
+    };
+    if !safe_link_target(&w.path, &target) {
+        crate::debug::log(|| format!("link     {}: target {target:?} not made (outside the folder)", w.path));
+        return Ok(Some(Done::Skipped));
+    }
+    let dest = root.join(&w.path);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // Fails when the name exists, so a file or link that appeared since the plan is never replaced.
+    match std::os::unix::fs::symlink(&target, &dest) {
+        Ok(()) => Ok(Some(Done::Link)),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            Err("a file or link with this name appeared here, not replaced".into())
+        }
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -1551,6 +1646,127 @@ mod tests {
         }
     }
 
+    /// A cloud whose empty files `links` says are symlinks (as Dropbox's metadata does); `fail`: the lookup errors.
+    struct Links {
+        inner: DirRemote,
+        links: Vec<(&'static str, &'static str)>,
+        fail: bool,
+    }
+    impl Remote for Links {
+        fn list(&self) -> Result<Vec<Item>> {
+            self.inner.list()
+        }
+        fn stat(&self, rel: &str) -> Result<Option<Item>> {
+            self.inner.stat(rel)
+        }
+        fn upload(&self, root: &Path, rel: &str) -> Result<()> {
+            self.inner.upload(root, rel)
+        }
+        fn download(&self, rel: &str, dest: &Path) -> Result<()> {
+            self.inner.download(rel, dest)
+        }
+        fn delete(&self, rel: &str) -> Result<()> {
+            self.inner.delete(rel)
+        }
+        fn link_target(&self, rel: &str) -> Result<Option<String>> {
+            if self.fail {
+                return Err("dropbox metadata: HTTP 429".into());
+            }
+            Ok(self.links.iter().find(|(p, _)| *p == rel).map(|(_, t)| t.to_string()))
+        }
+    }
+
+    fn with_links(f: &Fixture, links: Vec<(&'static str, &'static str)>, fail: bool) -> Engine<Links> {
+        Engine::new(
+            f.engine.root.clone(),
+            Links {
+                inner: DirRemote(f.remote("")),
+                links,
+                fail,
+            },
+            Db::memory().unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_cloud_symlink_becomes_a_link_here_and_stays_one() {
+        let f = Fixture::new("link-made");
+        write(f.remote("bin/vite"), "", 100);
+        let mut e = with_links(&f, vec![("bin/vite", "../vite/bin/vite.js")], false);
+        let r = e.full_scan();
+        assert!(r.errors.is_empty() && r.transferred == 1, "{r:?}");
+        let link = f.local("bin/vite");
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("../vite/bin/vite.js"));
+        // No row (it could not describe a link), and the next scan leaves everything alone: nothing deleted, nothing
+        // downloaded over the link.
+        assert!(e.db.base("bin/vite").unwrap().is_none());
+        let r = e.full_scan();
+        assert!(
+            r.errors.is_empty() && r.transferred == 0 && r.aborted.is_none(),
+            "{r:?}"
+        );
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(f.remote("bin/vite").exists(), "the cloud entry stays");
+    }
+
+    #[test]
+    fn a_cloud_symlink_that_leaves_the_folder_is_not_made_and_is_not_an_error() {
+        let f = Fixture::new("link-unsafe");
+        for p in ["abs", "up", "deep/up"] {
+            write(f.remote(p), "", 100);
+        }
+        let mut e = with_links(
+            &f,
+            vec![("abs", "/home/other/Dropbox/x"), ("up", "../x"), ("deep/up", "../../x")],
+            false,
+        );
+        let r = e.full_scan();
+        assert!(r.errors.is_empty() && r.transferred == 0, "{r:?}");
+        for p in ["abs", "up", "deep/up"] {
+            assert!(fs::symlink_metadata(f.local(p)).is_err(), "{p} must not exist");
+        }
+    }
+
+    #[test]
+    fn a_failed_link_lookup_is_retried_and_never_leaves_an_empty_file() {
+        let f = Fixture::new("link-retry");
+        write(f.remote("bin/vite"), "", 100);
+        let mut e = with_links(&f, vec![("bin/vite", "x")], true);
+        let r = e.full_scan();
+        assert_eq!(r.errors.len(), 1, "{r:?}");
+        assert!(fs::symlink_metadata(f.local("bin/vite")).is_err());
+    }
+
+    #[test]
+    fn an_empty_cloud_file_that_is_no_link_is_still_downloaded() {
+        let f = Fixture::new("link-none");
+        write(f.remote("pkg/__init__.py"), "", 100);
+        let mut e = with_links(&f, vec![], false);
+        let r = e.full_scan();
+        assert!(r.errors.is_empty() && r.transferred == 1, "{r:?}");
+        let m = fs::symlink_metadata(f.local("pkg/__init__.py")).unwrap();
+        assert!(m.is_file() && m.len() == 0);
+    }
+
+    #[test]
+    fn link_targets_must_stay_inside_the_folder() {
+        for (rel, target, ok) in [
+            ("a", "b", true),
+            ("a", "./b/../c", true),
+            ("d/a", "../b", true),
+            ("d/a", "../../b", false),
+            ("a", "../b", false),
+            ("d/e/a", "../../x/../y", true),
+            ("a", "/etc/passwd", false),
+            ("a", "", false),
+            ("a", "b\0c", false),
+        ] {
+            assert_eq!(safe_link_target(rel, target), ok, "{rel} -> {target}");
+        }
+        assert!(!safe_link_target("a", &"b/".repeat(2100)));
+    }
+
     #[test]
     fn two_cloud_files_with_one_name_are_skipped_and_the_rest_still_syncs() {
         let f = Fixture::new("dupname");
@@ -1834,14 +2050,16 @@ mod tests {
     }
 
     #[test]
-    fn a_new_download_never_replaces_what_already_has_its_name() {
+    fn a_symlink_holding_a_name_is_skipped_not_an_error() {
         let mut f = Fixture::new("no-replace");
-        // A symlink is not a regular file, so the plan sees "nothing here"; the name is still taken.
+        // A symlink is not a regular file, so `scan` sees "nothing here"; the name is still taken. Planning a
+        // download over it failed on every retry, which also kept the run from ever counting as clean.
         std::os::unix::fs::symlink("/nowhere", f.local("s.txt")).unwrap();
         write(f.remote("s.txt"), "cloud", 100);
         let r = f.engine.full_scan();
-        assert_eq!(r.errors.len(), 1, "{r:?}");
+        assert!(r.errors.is_empty() && r.transferred == 0, "{r:?}");
         assert!(fs::symlink_metadata(f.local("s.txt")).unwrap().file_type().is_symlink());
+        assert!(f.remote("s.txt").exists(), "the cloud copy stays");
     }
 
     #[test]

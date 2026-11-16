@@ -225,6 +225,34 @@ pub fn dropbox_entries(v: &Value) -> Vec<Change> {
         .collect()
 }
 
+/// Where the Dropbox entry at `path` (from the Dropbox root) points when it is a symlink, `None` for a plain file or one
+/// that is gone. The official client stores a link as an empty file and keeps its target only in this metadata field;
+/// rclone does not pass it on, so this asks the API itself.
+// shortcut: one request (and one TLS handshake) per call; batch through `list_folder` if first syncs of many empty
+// files turn out slow.
+pub fn dropbox_link_target(token: Token, path: &str) -> Result<Option<String>> {
+    let (st, v) = Http::new(token).post(
+        "https://api.dropboxapi.com/2/files/get_metadata",
+        &json!({"path": format!("/{path}")}),
+        true,
+    )?;
+    if st == 409 && s(&v["error_summary"]).starts_with("path/not_found") {
+        return Ok(None);
+    }
+    if st != 200 {
+        return fail("dropbox metadata", st, &v);
+    }
+    Ok(symlink_target(&v))
+}
+
+/// `symlink_info.target` of a Dropbox `FileMetadata`.
+fn symlink_target(v: &Value) -> Option<String> {
+    v["symlink_info"]["target"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+}
+
 // ---- Google Drive: changes.list with a page token ----
 
 struct Drive {
@@ -469,6 +497,17 @@ pub fn impact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dropbox_link_target_is_read_from_the_metadata() {
+        // Shapes taken from `files/get_metadata` answers for links made by the official client.
+        let link =
+            json!({".tag": "file", "name": "vite", "size": 0, "symlink_info": {"target": "../vite/bin/vite.js"}});
+        assert_eq!(symlink_target(&link).as_deref(), Some("../vite/bin/vite.js"));
+        assert_eq!(symlink_target(&json!({".tag": "file", "size": 0})), None);
+        assert_eq!(symlink_target(&json!({"symlink_info": null})), None);
+        assert_eq!(symlink_target(&json!({"symlink_info": {"target": ""}})), None);
+    }
 
     #[test]
     fn dropbox_reset_covers_expired_and_foreign_cursors() {
