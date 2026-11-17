@@ -583,6 +583,46 @@ pub struct RcloneRemote {
     pub exclude: Vec<String>,
     /// A Dropbox account: its symlinks (empty files whose target lives in the metadata) can be read, see `link_target`.
     pub dropbox: bool,
+    /// Folders a failed or cut-short listing already got, kept for the next try (see `Listed`).
+    listed: std::sync::Mutex<Listed>,
+    /// How old a kept folder may be. The feed drops the folders it reports, so an hour is safe with one; a provider
+    /// without a feed (MEGA) has nothing to say what changed, so it gets a short one.
+    pub max_age: std::time::Duration,
+}
+
+/// The folders of an unfinished cloud listing, so a failed or paused scan resumes instead of starting over (a big
+/// Dropbox takes ~10 min, and one folder failing at the end used to throw all of it away). Only a folder listed *whole*
+/// is kept, never a partial answer. It is cleared when a listing completes, by `forget` for every change the cloud's
+/// feed reports (`Remote::forget_listed`), and by age.
+#[derive(Default)]
+struct Listed(std::collections::HashMap<String, (bool, std::time::Instant, Vec<Item>)>);
+
+impl Listed {
+    fn get(&self, dir: &str, recursive: bool, max_age: std::time::Duration) -> Option<Vec<Item>> {
+        let (r, at, items) = self.0.get(dir)?;
+        (*r == recursive && at.elapsed() < max_age).then(|| items.clone())
+    }
+    fn put(&mut self, dir: &str, recursive: bool, items: &[Item]) {
+        self.0
+            .insert(dir.to_string(), (recursive, std::time::Instant::now(), items.to_vec()));
+    }
+    /// Drops every kept folder that holds, or is held by, one of `paths` (`None` = all): a change at `a/b/x` is in
+    /// the listing of `a/b`, of `a` and of the root, and a new folder `a/n` also in whatever was listed under it.
+    fn forget(&mut self, paths: Option<&[String]>) {
+        let Some(paths) = paths else {
+            return self.0.clear();
+        };
+        // Case-blind: Dropbox's feed may spell a folder differently (`/docs/New` beside `/Docs/Work`) than the listing.
+        let near = |k: &str, p: &str| {
+            k.is_empty() || p.is_empty() || k == p || p.starts_with(&format!("{k}/")) || k.starts_with(&format!("{p}/"))
+        };
+        // Lowercased once: a run of thousands of paths against hundreds of kept folders.
+        let paths: Vec<String> = paths.iter().map(|p| p.to_lowercase()).collect();
+        self.0.retain(|k, _| {
+            let k = k.to_lowercase();
+            !paths.iter().any(|p| near(&k, p))
+        });
+    }
 }
 
 /// Folders a service keeps in the tree but refuses to list. OneDrive Personal's locked "Personal Vault" fails with
@@ -611,10 +651,62 @@ pub fn exclude_rules(kind: &str, unchecked: &[String]) -> Vec<String> {
 }
 
 impl RcloneRemote {
+    pub fn new(rc: std::sync::Arc<Rclone>, fs: String, exclude: Vec<String>, dropbox: bool) -> Self {
+        Self {
+            rc,
+            fs,
+            exclude,
+            dropbox,
+            listed: Default::default(),
+            max_age: std::time::Duration::from_secs(3600),
+        }
+    }
     /// The remote's name (`id:` before the colon) is the account id: the stats group of its transfers.
     pub fn group(&self) -> &str {
         self.fs.split(':').next().unwrap_or("")
     }
+}
+
+/// A folder listing that took at least this long is kept for the next try (see `Listed`).
+const KEEP_IF_SLOWER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// An error worth asking again: the service or the network hiccuped. A login that expired, a folder that is gone or
+/// anything unknown fails at once, so a real problem is not shown minutes late.
+fn transient(e: &str) -> bool {
+    let e = e.to_lowercase();
+    // A status code only as a word of its own: "2500 pics" in a folder name is not a 500.
+    e.split(|c: char| !c.is_alphanumeric())
+        .any(|w| matches!(w, "500" | "502" | "503" | "504"))
+        || [
+            "unexpected error",
+            "too many requests",
+            "timeout",
+            "timed out",
+            "temporar",
+            "connection reset",
+            "connection refused",
+        ]
+        .iter()
+        .any(|t| e.contains(t))
+}
+
+/// Runs `f`, and after a transient failure again up to 3 times, waiting `base`, 2x, 3x seconds (cut short by
+/// `cancelled`). Retrying one folder is cheap; failing the whole listing threw away minutes of work.
+fn retry_transient<T>(cancelled: &dyn Fn() -> bool, base: u64, f: impl Fn() -> Result<T>) -> Result<T> {
+    for n in 1..=3 {
+        match f() {
+            Err(e) if transient(&e) && !cancelled() => {
+                for _ in 0..base * n {
+                    if cancelled() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+            r => return r,
+        }
+    }
+    f()
 }
 
 /// Folders above this depth (the root is 0) are listed one level at a time by `walk_cloud`.
@@ -738,11 +830,42 @@ impl crate::engine::Remote for RcloneRemote {
         on_progress: &(dyn Fn(usize, usize) + Sync),
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Vec<Item>> {
-        let one = |dir: &str, recursive| self.rc.list(&self.fs, dir, &self.exclude, recursive);
-        match walk_cloud(&one, on_progress, cancelled)? {
+        // A folder that fails (Dropbox's "unexpected error occurred" after a rate-limit wait) is listed again by
+        // itself: failing the whole walk threw away minutes of listing and the retry hit the same limit, in a loop.
+        let one = |dir: &str, recursive| {
+            if let Some(kept) = self
+                .listed
+                .lock()
+                .ok()
+                .and_then(|l| l.get(dir, recursive, self.max_age))
+            {
+                return Ok(kept);
+            }
+            let began = std::time::Instant::now();
+            let items = retry_transient(cancelled, 20, || self.rc.list(&self.fs, dir, &self.exclude, recursive))?;
+            // Only a slow folder is worth keeping: a fast one is cheap to list again, and keeping every folder would
+            // hold a second copy of the whole cloud's listing in memory during the scan.
+            if began.elapsed() >= KEEP_IF_SLOWER
+                && let Ok(mut l) = self.listed.lock()
+            {
+                l.put(dir, recursive, &items);
+            }
+            Ok(items)
+        };
+        // Kept only while the listing is unfinished: a failure or a cancel leaves it for the next try.
+        let walked = walk_cloud(&one, on_progress, cancelled);
+        if walked.is_ok() {
+            self.forget_listed(None);
+        }
+        match walked? {
             Some(items) => Ok(items),
             // The old single walk, which rclone resolves folder by folder itself.
-            None => self.list(),
+            None => retry_transient(cancelled, 20, || self.list()),
+        }
+    }
+    fn forget_listed(&self, paths: Option<&[String]>) {
+        if let Ok(mut l) = self.listed.lock() {
+            l.forget(paths);
         }
     }
     fn list_dir(&self, rel: &str) -> Result<Vec<Item>> {
@@ -781,6 +904,9 @@ impl crate::engine::Remote for RcloneRemote {
     }
     fn remove_empty_dir(&self, rel: &str) -> Result<()> {
         self.rc.rmdir(&self.fs, rel)
+    }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.rc.mkdir(&self.fs, rel)
     }
     fn forget_cache(&self) {
         // One cache for every account's remote in the shared rcd: the others just rebuild theirs on next use.
@@ -1169,6 +1295,99 @@ mod tests {
         assert_eq!(paths, want);
         // The root, a, a/b, x one level at a time; a/b/c (depth 3) in one recursive call.
         assert_eq!(seen.lock().unwrap().last(), Some(&(5, 5)));
+    }
+
+    #[test]
+    fn a_status_code_is_a_word_of_its_own() {
+        assert!(transient("HTTP error 503 Service Unavailable") && transient("googleapi: Error 500: backend"));
+        assert!(!transient("directory not found: Fotos/2500 pics"));
+    }
+
+    #[test]
+    fn only_a_transient_error_is_asked_again() {
+        let calls = std::cell::Cell::new(0);
+        let r: Result<()> = retry_transient(&|| false, 0, || {
+            calls.set(calls.get() + 1);
+            Err("operations/list: invalid_grant 401".into())
+        });
+        assert!(r.is_err() && calls.get() == 1);
+        calls.set(0);
+        let r = retry_transient(&|| false, 0, || {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                Err("error in ListJSON: unexpected error occurred".into())
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!((r, calls.get()), (Ok(7), 3));
+    }
+
+    /// `list_one` of the real remote: asks `Listed` first, keeps what it lists, counts the calls that reached the cloud.
+    fn kept<'a>(
+        cache: &'a std::sync::Mutex<Listed>,
+        calls: &'a std::sync::Mutex<Vec<String>>,
+        cloud: impl Fn(&str, bool) -> Result<Vec<Item>> + Sync + 'a,
+    ) -> impl Fn(&str, bool) -> Result<Vec<Item>> + Sync + 'a {
+        move |dir, recursive| {
+            if let Some(k) = cache
+                .lock()
+                .unwrap()
+                .get(dir, recursive, std::time::Duration::from_secs(60))
+            {
+                return Ok(k);
+            }
+            calls.lock().unwrap().push(dir.to_string());
+            let items = cloud(dir, recursive)?;
+            cache.lock().unwrap().put(dir, recursive, &items);
+            Ok(items)
+        }
+    }
+
+    #[test]
+    fn a_second_try_lists_only_what_the_first_did_not_finish() {
+        let (cache, calls) = (Default::default(), Default::default());
+        let first = kept(&cache, &calls, fake_cloud(DEEP, Some("a/b")));
+        assert!(walk_cloud(&first, &|_, _| {}, &|| false).is_err());
+        calls.lock().unwrap().clear();
+        let again = kept(&cache, &calls, fake_cloud(DEEP, None));
+        let items = walk_cloud(&again, &|_, _| {}, &|| false).unwrap().unwrap();
+        assert_eq!(items.len(), DEEP.len(), "nothing lost or doubled");
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls.contains(&"a/b".to_string()),
+            "the failed folder is listed: {calls:?}"
+        );
+        assert!(
+            !calls.contains(&String::new()) && !calls.contains(&"a".to_string()),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_change_drops_the_folders_around_it_and_only_those() {
+        let mut l = Listed::default();
+        for d in ["", "a", "a/b", "c", "a/bb"] {
+            l.put(d, false, &[]);
+        }
+        l.forget(Some(&["A/B/x.txt".to_string()]));
+        let left: std::collections::BTreeSet<_> = l.0.keys().cloned().collect();
+        assert_eq!(
+            left,
+            ["a/bb".to_string(), "c".to_string()].into(),
+            "the root, a and a/b go"
+        );
+        l.forget(None);
+        assert!(l.0.is_empty());
+    }
+
+    #[test]
+    fn a_kept_folder_is_not_used_when_old_or_listed_the_other_way() {
+        let mut l = Listed::default();
+        l.put("a", true, &[]);
+        assert!(l.get("a", true, std::time::Duration::from_secs(60)).is_some());
+        assert!(l.get("a", false, std::time::Duration::from_secs(60)).is_none());
+        assert!(l.get("a", true, std::time::Duration::ZERO).is_none());
     }
 
     #[test]

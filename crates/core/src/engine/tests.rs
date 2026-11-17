@@ -4,6 +4,29 @@ use super::*;
 struct DirRemote(PathBuf);
 
 impl DirRemote {
+    /// Every file and folder under `base`, as paths below `prefix` (`""` = the cloud's root).
+    fn all(&self, base: &Path, prefix: &str) -> Vec<Item> {
+        let join = |p: String| if prefix.is_empty() { p } else { format!("{prefix}/{p}") };
+        let (files, dirs, _) = scan(base, &[], &Rules::default());
+        let dirs = dirs.into_iter().map(|p| Item {
+            path: join(p),
+            size: 0,
+            mtime: 0,
+            is_dir: true,
+            id: String::new(),
+            hash: None,
+        });
+        let files = files.into_iter().map(|(p, s)| Item {
+            path: join(p),
+            size: s.size,
+            mtime: s.mtime,
+            is_dir: false,
+            id: String::new(),
+            hash: None,
+        });
+        dirs.chain(files).collect()
+    }
+
     fn item(&self, rel: &str, m: &fs::Metadata) -> Item {
         let s = sig_of(m);
         Item {
@@ -19,18 +42,10 @@ impl DirRemote {
 
 impl Remote for DirRemote {
     fn list(&self) -> Result<Vec<Item>> {
-        Ok(scan(&self.0, &[], &Rules::default())
-            .0
-            .into_iter()
-            .map(|(p, s)| Item {
-                path: p,
-                size: s.size,
-                mtime: s.mtime,
-                is_dir: false,
-                id: String::new(),
-                hash: None,
-            })
-            .collect())
+        Ok(self.all(&self.0, ""))
+    }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        fs::create_dir_all(self.0.join(rel)).map_err(|e| e.to_string())
     }
     fn list_dir(&self, rel: &str) -> Result<Vec<Item>> {
         // rclone's wording for a folder that is not there.
@@ -68,18 +83,10 @@ impl Remote for DirRemote {
         fs::remove_dir(self.0.join(rel)).map_err(|e| e.to_string())
     }
     fn list_under(&self, dir: &str) -> Result<Vec<Item>> {
-        Ok(scan(&self.0.join(dir), &[], &Rules::default())
-            .0
-            .into_iter()
-            .map(|(p, s)| Item {
-                path: format!("{dir}/{p}"),
-                size: s.size,
-                mtime: s.mtime,
-                is_dir: false,
-                id: String::new(),
-                hash: None,
-            })
-            .collect())
+        if !self.0.join(dir).is_dir() {
+            return Err("directory not found".into());
+        }
+        Ok(self.all(&self.0.join(dir), dir))
     }
     fn move_dir(&self, from: &str, to: &str) -> Result<()> {
         fs::create_dir_all(self.0.join(to).parent().unwrap()).map_err(|e| e.to_string())?;
@@ -183,6 +190,9 @@ impl Remote for Calls {
     fn upload(&self, root: &Path, rel: &str) -> Result<()> {
         self.inner.upload(root, rel)
     }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.inner.make_dir(rel)
+    }
     fn download(&self, rel: &str, dest: &Path) -> Result<()> {
         self.inner.download(rel, dest)
     }
@@ -207,6 +217,9 @@ impl Remote for Twice {
     fn upload(&self, root: &Path, rel: &str) -> Result<()> {
         self.0.upload(root, rel)
     }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.0.make_dir(rel)
+    }
     fn download(&self, rel: &str, dest: &Path) -> Result<()> {
         self.0.download(rel, dest)
     }
@@ -230,6 +243,9 @@ impl Remote for Links {
     }
     fn upload(&self, root: &Path, rel: &str) -> Result<()> {
         self.inner.upload(root, rel)
+    }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.inner.make_dir(rel)
     }
     fn download(&self, rel: &str, dest: &Path) -> Result<()> {
         self.inner.download(rel, dest)
@@ -450,6 +466,9 @@ impl Remote for Under {
     fn upload(&self, root: &Path, rel: &str) -> Result<()> {
         self.0.upload(root, rel)
     }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.0.make_dir(rel)
+    }
     fn download(&self, rel: &str, dest: &Path) -> Result<()> {
         self.0.download(rel, dest)
     }
@@ -529,6 +548,9 @@ impl Remote for Spy {
         self.2.lock().unwrap().push(self.1.lock().unwrap().clone());
         self.0.upload(root, rel)
     }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.0.make_dir(rel)
+    }
     fn download(&self, rel: &str, dest: &Path) -> Result<()> {
         self.0.download(rel, dest)
     }
@@ -552,6 +574,9 @@ impl Remote for Racy {
             hook();
         }
         self.0.upload(root, rel)
+    }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.0.make_dir(rel)
     }
     fn download(&self, rel: &str, dest: &Path) -> Result<()> {
         self.0.download(rel, dest)
@@ -590,6 +615,9 @@ impl Remote for Slow {
         std::thread::sleep(std::time::Duration::from_millis(150));
         self.1.fetch_sub(1, SeqCst);
         self.0.upload(root, rel)
+    }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.0.make_dir(rel)
     }
     fn download(&self, rel: &str, dest: &Path) -> Result<()> {
         self.0.download(rel, dest)
@@ -874,6 +902,9 @@ impl Remote for CannotCompare {
     fn upload(&self, root: &Path, rel: &str) -> Result<()> {
         self.0.upload(root, rel)
     }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.0.make_dir(rel)
+    }
     fn download(&self, rel: &str, dest: &Path) -> Result<()> {
         self.0.download(rel, dest)
     }
@@ -987,7 +1018,10 @@ fn a_remote_delete_trashes_the_local_file_instead_of_removing_it() {
     fs::remove_file(f.remote("gone/x.txt")).unwrap();
     f.engine.sync_paths(&["gone/x.txt".into()]);
     assert!(!f.local("gone/x.txt").exists());
-    assert!(!f.local("gone").exists(), "the empty folder is cleaned up");
+    assert!(
+        f.local("gone").is_dir(),
+        "the emptied folder stays, as in the official clients"
+    );
     let trash = f.local(".fastsync/trash");
     let stamp = fs::read_dir(&trash).unwrap().next().unwrap().unwrap().path();
     assert_eq!(fs::read_to_string(stamp.join("gone/x.txt")).unwrap(), "x");
@@ -1093,6 +1127,9 @@ impl Remote for NoDownload {
     fn upload(&self, root: &Path, rel: &str) -> Result<()> {
         self.0.upload(root, rel)
     }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.0.make_dir(rel)
+    }
     fn download(&self, _: &str, _: &Path) -> Result<()> {
         Err("downloaded".into())
     }
@@ -1161,13 +1198,26 @@ fn sibling_folders_are_listed_side_by_side_and_too_many_ask_for_a_full_scan() {
     for d in &few {
         assert_eq!(fs::read_to_string(f.local(&format!("{d}/file.txt"))).unwrap(), *d);
     }
-    // More than the limit: nothing is listed or touched, the run asks for a full scan.
+    // More than the limit under one parent: that parent is listed once, no full scan.
     let many = names(FEED_DIRS_MAX + 1);
     let before = e.remote.listings.load(Relaxed);
     let r = e.sync_paths_in(&many, &many);
+    assert!(!r.wants_full && r.errors.is_empty(), "{r:?}");
+    assert_eq!(e.remote.listings.load(Relaxed), before + 1);
+    assert_eq!(
+        fs::read_to_string(f.local(&format!("{}/file.txt", many[FEED_DIRS_MAX]))).unwrap(),
+        many[FEED_DIRS_MAX]
+    );
+    // More than the limit at the top level: nothing is listed or touched, the run asks for a full scan.
+    let top: Vec<String> = (0..=FEED_DIRS_MAX).map(|i| format!("top{i}")).collect();
+    for d in &top {
+        write(f.remote(&format!("{d}/file.txt")), d, 100);
+    }
+    let before = e.remote.listings.load(Relaxed);
+    let r = e.sync_paths_in(&top, &top);
     assert!(r.wants_full && r.errors.is_empty() && r.transferred == 0, "{r:?}");
     assert_eq!(e.remote.listings.load(Relaxed), before);
-    assert!(!f.local(&format!("{}/file.txt", many[FEED_DIRS_MAX])).exists());
+    assert!(!f.local("top0/file.txt").exists());
     // Exactly the limit still goes by listing; subfolders of a reported folder do not count.
     let at_limit = names(FEED_DIRS_MAX);
     let mut with_subs = at_limit.clone();
@@ -1283,6 +1333,9 @@ impl Remote for Hashing {
     fn upload(&self, root: &Path, rel: &str) -> Result<()> {
         self.uploads.fetch_add(1, Relaxed);
         self.inner.upload(root, rel)
+    }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.inner.make_dir(rel)
     }
     fn download(&self, rel: &str, dest: &Path) -> Result<()> {
         self.inner.download(rel, dest)
@@ -1402,6 +1455,9 @@ impl Remote for Counting {
     fn upload(&self, root: &Path, rel: &str) -> Result<()> {
         self.uploads.fetch_add(1, Relaxed);
         self.inner.upload(root, rel)
+    }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.inner.make_dir(rel)
     }
     fn download(&self, rel: &str, dest: &Path) -> Result<()> {
         self.inner.download(rel, dest)
@@ -1549,6 +1605,8 @@ fn a_failed_listing_after_the_folder_moved_still_leaves_the_rows_right() {
     assert!(e.db.under("a").unwrap().is_empty());
     assert_eq!(e.db.under("b").unwrap().len(), 2);
     assert_eq!(Counting::n(&e.remote.uploads), 2);
+    // The old folder is forgotten and the new one known: the walk has nothing left to report.
+    assert!(e.paths_to_sync(vec![], vec![], true).is_empty());
 }
 
 #[test]
@@ -1662,6 +1720,9 @@ impl Remote for OnlyFolders {
     fn upload(&self, root: &Path, rel: &str) -> Result<()> {
         self.inner.upload(root, rel)
     }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.inner.make_dir(rel)
+    }
     fn download(&self, rel: &str, dest: &Path) -> Result<()> {
         self.inner.download(rel, dest)
     }
@@ -1721,6 +1782,41 @@ fn a_folder_that_cannot_be_listed_is_a_failure_of_its_own_never_an_empty_folder(
     // Shown as an error and listed again by itself; no full scan, and the cursor may move on.
     assert_eq!(r.failed_dirs, ["new"], "{r:?}");
     assert!(!r.has_global_failure() && r.errors.len() == 1, "{r:?}");
+}
+
+#[test]
+fn a_folder_renamed_in_the_cloud_whose_new_name_cannot_be_listed_keeps_the_old_files_until_it_can() {
+    let f = Fixture::new("rename-listing-fails");
+    write(f.remote("a/x.txt"), "synced", 100);
+    let mut e = Engine::new(
+        f.engine.root.clone(),
+        OnlyFolders {
+            inner: DirRemote(f.engine.remote.0.clone()),
+            folders_fail: false,
+            listings: Default::default(),
+        },
+        Db::memory().unwrap(),
+    );
+    assert!(
+        e.sync_paths_in(&["a".to_string()], &["a".to_string()])
+            .errors
+            .is_empty()
+    );
+    assert_eq!(fs::read_to_string(f.local("a/x.txt")).unwrap(), "synced");
+    // Renamed in the cloud, and the listing of the new name fails: the old file reads as deleted there.
+    fs::rename(f.remote("a"), f.remote("b")).unwrap();
+    e.remote.folders_fail = true;
+    let paths = ["a/x.txt".to_string(), "b".to_string()];
+    let r = e.sync_paths_in(&paths, &["b".to_string()]);
+    assert_eq!(r.failed_dirs, ["b"], "{r:?}");
+    assert!(
+        r.failed.contains(&"a/x.txt".to_string()),
+        "retried with the folder: {r:?}"
+    );
+    assert!(
+        f.local("a/x.txt").exists() && trashed(&f, "a/x.txt").is_none(),
+        "nothing was trashed"
+    );
 }
 
 #[test]
@@ -1848,6 +1944,9 @@ impl Remote for Folding {
     fn upload(&self, root: &Path, rel: &str) -> Result<()> {
         self.uploads.fetch_add(1, Relaxed);
         self.inner.upload(root, &self.real(rel))
+    }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.inner.make_dir(&self.real(rel))
     }
     fn download(&self, rel: &str, dest: &Path) -> Result<()> {
         self.inner.download(&self.real(rel), dest)
@@ -2363,6 +2462,9 @@ impl Remote for Cached {
     fn upload(&self, root: &Path, rel: &str) -> Result<()> {
         self.inner.upload(root, rel)
     }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.inner.make_dir(rel)
+    }
     fn download(&self, rel: &str, dest: &Path) -> Result<()> {
         self.downloads.fetch_add(1, Relaxed);
         self.inner.download(&self.real(rel), dest)
@@ -2410,7 +2512,7 @@ fn a_folder_moved_in_the_cloud_is_not_downloaded_again_through_its_old_path() {
 }
 
 #[test]
-fn a_folder_emptied_by_a_move_or_a_delete_is_removed_in_the_cloud() {
+fn a_renamed_folder_leaves_no_old_cloud_folder_but_one_emptied_by_a_delete_stays() {
     let mut f = Fixture::new("empty-dirs");
     write(f.local("a/b/one.txt"), "one", 100);
     write(f.local("a/b/two!.txt"), "two", 100);
@@ -2427,8 +2529,13 @@ fn a_folder_emptied_by_a_move_or_a_delete_is_removed_in_the_cloud() {
     let r = f.engine.full_scan();
     assert!(r.errors.is_empty() && r.aborted.is_none(), "{r:?}");
     assert!(f.remote("c/one.txt").exists());
-    assert!(!f.remote("a/b").exists(), "the emptied folder stays in the cloud");
-    assert!(!f.remote("z").exists(), "the emptied folder stays in the cloud");
+    assert!(
+        !f.remote("a/b").exists(),
+        "the folder the user renamed is gone from the cloud"
+    );
+    // Only a deleted folder is removed: one that just lost its last file stays, as in the official clients.
+    assert!(f.remote("z").is_dir(), "the emptied folder stays in the cloud");
+    assert!(f.local("z").is_dir());
     // `a` still holds a file: it must stay.
     assert!(f.remote("a/keep.txt").exists());
 }
@@ -2453,6 +2560,112 @@ fn both_edited_keeps_both_copies() {
     );
 }
 
+#[test]
+fn in_a_conflict_the_older_copy_gets_the_conflict_name() {
+    // The local edit is newer: it keeps the name and goes up over the cloud's; the cloud's version is kept beside it.
+    let mut f = Fixture::new("conflict-local-newer");
+    write(f.local("r.txt"), "mine", 10);
+    write(f.remote("r.txt"), "theirs!", 20);
+    let r = f.engine.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(r.conflicts, ["r.txt"]);
+    let name = conflict_name("r.txt", &today(), 1);
+    assert_eq!(fs::read_to_string(f.local("r.txt")).unwrap(), "mine");
+    assert_eq!(fs::read_to_string(f.local(&name)).unwrap(), "theirs!");
+    assert_eq!(
+        fs::read_to_string(f.remote("r.txt")).unwrap(),
+        "mine",
+        "the newer one goes up"
+    );
+    assert_eq!(
+        fs::read_to_string(f.remote(&name)).unwrap(),
+        "theirs!",
+        "the older one is kept in the cloud too"
+    );
+    // Settled: the next scan finds nothing to do and makes no second copy.
+    let r = f.engine.full_scan();
+    assert!(
+        r.errors.is_empty() && r.conflicts.is_empty() && r.transferred == 0,
+        "{r:?}"
+    );
+    assert!(!f.local(&conflict_name("r.txt", &today(), 2)).exists());
+}
+
+#[test]
+fn a_conflict_within_the_providers_whole_seconds_keeps_the_cloud_name() {
+    let mut f = Fixture::new("conflict-tie");
+    write(f.local("r.txt"), "mine", 10);
+    write(f.remote("r.txt"), "theirs!", 11);
+    let r = f.engine.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(fs::read_to_string(f.local("r.txt")).unwrap(), "theirs!");
+    assert_eq!(
+        fs::read_to_string(f.local(&conflict_name("r.txt", &today(), 1))).unwrap(),
+        "mine"
+    );
+}
+
+/// A cloud whose uploads fail while `fail` is set.
+struct FailUp(DirRemote, std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Remote for FailUp {
+    fn list(&self) -> Result<Vec<Item>> {
+        self.0.list()
+    }
+    fn stat(&self, rel: &str) -> Result<Option<Item>> {
+        self.0.stat(rel)
+    }
+    fn upload(&self, root: &Path, rel: &str) -> Result<()> {
+        if self.1.load(Relaxed) {
+            return Err("connection lost".into());
+        }
+        self.0.upload(root, rel)
+    }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.0.make_dir(rel)
+    }
+    fn download(&self, rel: &str, dest: &Path) -> Result<()> {
+        self.0.download(rel, dest)
+    }
+    fn delete(&self, rel: &str) -> Result<()> {
+        self.0.delete(rel)
+    }
+}
+
+#[test]
+fn a_newer_local_file_whose_upload_failed_is_an_ordinary_edit_next_time_not_a_second_conflict() {
+    let f = Fixture::new("conflict-upload-fails");
+    write(f.local("r.txt"), "mine", 10);
+    write(f.remote("r.txt"), "theirs!", 20);
+    let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut e = Engine::new(
+        f.engine.root.clone(),
+        FailUp(DirRemote(f.engine.remote.0.clone()), fail.clone()),
+        Db::memory().unwrap(),
+    );
+    let r = e.full_scan();
+    assert!(!r.errors.is_empty(), "the failed upload is reported");
+    assert_eq!(
+        fs::read_to_string(f.local("r.txt")).unwrap(),
+        "mine",
+        "the newer file is never touched"
+    );
+    assert_eq!(fs::read_to_string(f.remote("r.txt")).unwrap(), "theirs!");
+    fail.store(false, Relaxed);
+    let r = e.full_scan();
+    assert!(r.errors.is_empty() && r.conflicts.is_empty(), "{r:?}");
+    assert_eq!(
+        fs::read_to_string(f.remote("r.txt")).unwrap(),
+        "mine",
+        "the retry is a plain upload"
+    );
+    let again = conflict_name("r.txt", &today(), 2);
+    assert!(
+        !f.local(&again).exists() && !f.remote(&again).exists(),
+        "no second copy of the old version"
+    );
+}
+
 /// A cloud whose downloads all fail.
 struct NoDown(DirRemote);
 
@@ -2465,6 +2678,9 @@ impl Remote for NoDown {
     }
     fn upload(&self, root: &Path, rel: &str) -> Result<()> {
         self.0.upload(root, rel)
+    }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.0.make_dir(rel)
     }
     fn download(&self, _rel: &str, _dest: &Path) -> Result<()> {
         Err("connection lost".into())
@@ -2509,7 +2725,7 @@ fn a_name_that_is_not_valid_text_is_reported_not_silently_skipped() {
     let f = Fixture::new("badname");
     write(f.local("ok.txt"), "x", 10);
     fs::write(f.engine.root.join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt")), "y").unwrap();
-    let (files, bad) = scan(&f.engine.root, &[], &Rules::default());
+    let (files, _, bad) = scan(&f.engine.root, &[], &Rules::default());
     assert!(files.contains_key("ok.txt") && files.len() == 1);
     assert_eq!(bad.len(), 1, "{bad:?}");
     assert!(bad[0].starts_with("caf"));
@@ -2836,7 +3052,7 @@ fn a_folder_hidden_by_a_rule_is_not_walked_but_still_handled_like_ignored_files(
     write(f.local("build/o.bin"), "l", 100);
     write(f.local("src/a.rs"), "s", 100);
     let rules = Rules::parse("build/");
-    let (files, _) = scan(&f.engine.root, &[], &rules);
+    let (files, _, _) = scan(&f.engine.root, &[], &rules);
     assert_eq!(files.keys().collect::<Vec<_>>(), ["src/a.rs"], "build/ is not entered");
     // Synced before the rule: the cloud copy goes, the local file stays, and the walk does not call it deleted.
     f.engine.full_scan();
@@ -2923,4 +3139,399 @@ fn native_client_files_are_ignored() {
     for name in ["rules.dropboxignore", ".megaignore", "a~$b.txt", "dropbox.txt"] {
         assert!(!ignored(name), "{name}");
     }
+}
+
+#[test]
+fn trashing_the_same_path_twice_keeps_both_copies() {
+    let f = Fixture::new("trash-twice");
+    let root = f.engine.root.clone();
+    for text in ["one", "two"] {
+        write(f.local("a.txt"), text, 10);
+        trash_move(&root, &f.local("a.txt"), "a.txt").unwrap();
+    }
+    assert!(!f.local("a.txt").exists());
+    assert_eq!(trash_usage(&root).0, 2);
+}
+
+#[test]
+fn an_overwriting_download_replaces_the_file_and_leaves_no_set_aside_copy() {
+    let f = Fixture::new("overwrite-clean");
+    write(f.local("a.txt"), "old", 100);
+    write(f.remote("a.txt"), "new content", 10);
+    let item = f.engine.remote.stat("a.txt").unwrap().unwrap();
+    let expect = local_sig(&f.engine.root, "a.txt");
+    fetch(&f.engine.remote, &f.engine.root, "a.txt", expect, &item, None).unwrap();
+    assert_eq!(fs::read_to_string(f.local("a.txt")).unwrap(), "new content");
+    let tmp = f.engine.root.join(HIDDEN).join("tmp");
+    assert_eq!(fs::read_dir(tmp).unwrap().count(), 0);
+}
+
+#[test]
+fn an_empty_folder_goes_up_and_an_empty_cloud_folder_comes_down() {
+    let mut f = Fixture::new("dirs-empty");
+    fs::create_dir_all(f.local("mine/inner")).unwrap();
+    fs::create_dir_all(f.remote("theirs")).unwrap();
+    let r = f.engine.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert!(f.remote("mine/inner").is_dir() && f.local("theirs").is_dir());
+    // Both are synced now: a second scan changes nothing.
+    assert!(f.engine.full_scan().errors.is_empty());
+    assert!(f.local("mine/inner").is_dir() && f.remote("theirs").is_dir());
+}
+
+#[test]
+fn a_folder_the_user_deletes_is_deleted_on_the_other_side_and_one_emptied_is_not() {
+    let mut f = Fixture::new("dirs-delete");
+    for d in ["here", "there", "kept"] {
+        fs::create_dir_all(f.local(d)).unwrap();
+    }
+    write(f.local("kept/a.txt"), "a", 100);
+    assert!(f.engine.full_scan().errors.is_empty());
+    fs::remove_dir(f.local("here")).unwrap();
+    fs::remove_dir(f.remote("there")).unwrap();
+    // The last file of `kept` goes: the folder stays on both sides.
+    fs::remove_file(f.local("kept/a.txt")).unwrap();
+    let r = f.engine.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert!(!f.remote("here").exists() && !f.local("there").exists());
+    assert!(f.local("kept").is_dir() && f.remote("kept").is_dir());
+    // And through a path run (the watcher's way).
+    fs::create_dir_all(f.local("w")).unwrap();
+    assert!(f.engine.sync_paths(&["w".into()]).errors.is_empty());
+    assert!(f.remote("w").is_dir());
+    fs::remove_dir(f.local("w")).unwrap();
+    assert!(f.engine.sync_paths(&["w".into()]).errors.is_empty());
+    assert!(!f.remote("w").exists());
+}
+
+#[test]
+fn a_folder_removed_in_the_cloud_that_still_holds_a_new_file_stays_and_the_file_goes_up() {
+    let mut f = Fixture::new("dirs-not-empty");
+    fs::create_dir_all(f.local("d")).unwrap();
+    assert!(f.engine.full_scan().errors.is_empty());
+    fs::remove_dir(f.remote("d")).unwrap();
+    write(f.local("d/new.txt"), "new", 100);
+    let r = f.engine.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert!(f.local("d/new.txt").exists(), "nothing of ours is removed");
+    assert!(f.remote("d/new.txt").exists());
+}
+
+#[test]
+fn unchecked_and_ignored_folders_are_left_alone() {
+    let mut f = Fixture::new("dirs-skip");
+    f.engine.excluded = vec!["off".into()];
+    f.engine.ignore = Rules::parse("build/");
+    fs::create_dir_all(f.local("off/x")).unwrap();
+    fs::create_dir_all(f.local("build/x")).unwrap();
+    fs::create_dir_all(f.remote("off/y")).unwrap();
+    fs::create_dir_all(f.remote("build/y")).unwrap();
+    let r = f.engine.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert!(!f.remote("off/x").exists() && !f.remote("build/x").exists());
+    assert!(!f.local("off/y").exists() && !f.local("build/y").exists());
+}
+
+#[test]
+fn a_mirror_never_creates_or_removes_cloud_folders() {
+    let mut f = Fixture::new("dirs-mirror");
+    f.engine.download_only = true;
+    fs::create_dir_all(f.local("only-here")).unwrap();
+    fs::create_dir_all(f.remote("only-there")).unwrap();
+    let r = f.engine.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert!(!f.remote("only-here").exists(), "the cloud is never written");
+    assert!(
+        !f.local("only-here").exists(),
+        "a local-only folder goes, the cloud is the truth"
+    );
+    assert!(f.local("only-there").is_dir());
+}
+
+#[test]
+fn folders_that_differ_only_by_case_are_left_alone() {
+    let mut f = Fixture::new("dirs-case");
+    fs::create_dir_all(f.local("Docs")).unwrap();
+    fs::create_dir_all(f.remote("docs")).unwrap();
+    let r = f.engine.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert!(!f.local("docs").exists() && !f.remote("Docs").exists());
+    assert!(!f.engine.db.dir_synced("Docs").unwrap() && !f.engine.db.dir_synced("docs").unwrap());
+}
+
+/// Counts `make_dir` calls; everything else is the plain folder.
+struct MkdirCount(DirRemote, AtomicUsize);
+
+impl Remote for MkdirCount {
+    fn list(&self) -> Result<Vec<Item>> {
+        self.0.list()
+    }
+    fn list_dir(&self, rel: &str) -> Result<Vec<Item>> {
+        self.0.list_dir(rel)
+    }
+    fn stat(&self, rel: &str) -> Result<Option<Item>> {
+        self.0.stat(rel)
+    }
+    fn upload(&self, root: &Path, rel: &str) -> Result<()> {
+        self.0.upload(root, rel)
+    }
+    fn download(&self, rel: &str, dest: &Path) -> Result<()> {
+        self.0.download(rel, dest)
+    }
+    fn delete(&self, rel: &str) -> Result<()> {
+        self.0.delete(rel)
+    }
+    fn remove_empty_dir(&self, rel: &str) -> Result<()> {
+        self.0.remove_empty_dir(rel)
+    }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.1.fetch_add(1, Relaxed);
+        self.0.make_dir(rel)
+    }
+}
+
+#[test]
+fn a_first_sync_makes_cloud_folders_only_for_the_ones_no_upload_made() {
+    let f = Fixture::new("dirs-mkdir-count");
+    for d in 0..20 {
+        write(f.local(&format!("d{d}/deep/f.txt")), "x", 100);
+    }
+    fs::create_dir_all(f.local("empty/chain/end")).unwrap();
+    let mut e = Engine::new(
+        f.engine.root.clone(),
+        MkdirCount(DirRemote(f.engine.remote.0.clone()), AtomicUsize::new(0)),
+        Db::memory().unwrap(),
+    );
+    let r = e.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    // `empty`, `empty/chain`, `empty/chain/end`: no upload went under them. The 40 others came with their files.
+    assert_eq!(e.remote.1.load(Relaxed), 3);
+    assert!(f.remote("empty/chain/end").is_dir());
+    assert!(e.db.dir_synced("d7/deep").unwrap());
+}
+
+#[test]
+fn hiding_a_synced_folder_with_a_rule_removes_its_empty_folders_from_the_cloud_and_keeps_the_local_ones() {
+    for path_run in [false, true] {
+        let mut f = Fixture::new(&format!("dirs-rule-{path_run}"));
+        write(f.local("build/x/y.txt"), "y", 100);
+        write(f.local("keep.txt"), "k", 100);
+        fs::create_dir_all(f.local("build/e")).unwrap();
+        assert!(f.engine.full_scan().errors.is_empty());
+        assert!(f.remote("build/e").is_dir());
+        f.engine.ignore = Rules::parse("build/");
+        let r = if path_run {
+            // What the runner queues for a new rule: the files it now hides.
+            f.engine.sync_paths(&["build/x/y.txt".into()])
+        } else {
+            f.engine.full_scan()
+        };
+        assert!(r.errors.is_empty(), "{r:?}");
+        assert!(!f.remote("build").exists(), "path_run {path_run}");
+        assert!(f.local("build/x/y.txt").exists() && f.local("build/e").is_dir());
+        assert!(f.remote("keep.txt").exists());
+    }
+}
+
+#[test]
+fn a_run_the_guard_stops_leaves_the_folders_alone() {
+    let mut f = Fixture::new("dirs-guard");
+    for i in 0..12 {
+        write(f.local(&format!("d/f{i}.txt")), &"x".repeat(i + 1), 100);
+    }
+    fs::create_dir_all(f.local("empty")).unwrap();
+    assert!(f.engine.full_scan().errors.is_empty());
+    for i in 0..12 {
+        fs::remove_file(f.remote(&format!("d/f{i}.txt"))).unwrap();
+    }
+    fs::remove_dir(f.remote("empty")).unwrap();
+    let r = f.engine.full_scan();
+    assert!(r.aborted.is_some(), "{r:?}");
+    assert!(f.local("empty").is_dir() && f.local("d/f3.txt").exists());
+    assert!(
+        f.engine.db.dir_synced("empty").unwrap(),
+        "nothing decided: the row stays"
+    );
+}
+
+#[test]
+fn a_cancel_stops_the_folder_actions() {
+    let mut f = Fixture::new("dirs-cancel");
+    f.engine.cancel.store(true, Relaxed);
+    let work = DirWork {
+        path: "x".into(),
+        local: true,
+        cloud: false,
+        hidden: false,
+    };
+    f.engine.run_dirs(vec![work], &[], &mut Report::default());
+    assert!(!f.remote("x").exists());
+}
+
+#[test]
+fn a_local_folder_that_cannot_be_removed_is_a_failure_and_keeps_its_row() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = Fixture::new("dirs-perm");
+    fs::create_dir_all(f.local("p/d")).unwrap();
+    assert!(f.engine.full_scan().errors.is_empty());
+    fs::remove_dir(f.remote("p/d")).unwrap();
+    fs::set_permissions(f.local("p"), fs::Permissions::from_mode(0o555)).unwrap();
+    // Root (a container build) is not stopped by a read-only parent: nothing to see then.
+    if fs::create_dir(f.local("p/probe")).is_ok() {
+        fs::set_permissions(f.local("p"), fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let r = f.engine.full_scan();
+    fs::set_permissions(f.local("p"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(r.failed, ["p/d"], "{r:?}");
+    // Forgetting it would send the folder back up to the cloud it was deleted from.
+    assert!(f.engine.db.dir_synced("p/d").unwrap());
+    assert!(!f.remote("p/d").exists());
+}
+
+#[test]
+fn an_account_upgraded_from_version_1_still_removes_a_folder_deleted_here_in_the_cloud() {
+    let f = Fixture::new("dirs-v1");
+    let db = f.base.join("state.db");
+    let engine = |db: &Path| {
+        Engine::new(
+            f.engine.root.clone(),
+            DirRemote(f.engine.remote.0.clone()),
+            Db::open(db).unwrap(),
+        )
+    };
+    let mut e = engine(&db);
+    write(f.local("a/x.txt"), "x", 100);
+    assert!(e.full_scan().errors.is_empty());
+    drop(e);
+    // What a version-1 file looks like: files and no folders table.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("DROP TABLE folders; PRAGMA user_version=1")
+        .unwrap();
+    let mut e = engine(&db);
+    fs::remove_dir_all(f.local("a")).unwrap();
+    let r = e.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert!(
+        !f.remote("a").exists(),
+        "seeded as synced, so deleted here means deleted there"
+    );
+}
+
+#[test]
+fn a_mirror_whose_rule_hides_a_synced_folder_leaves_the_cloud_alone() {
+    let mut f = Fixture::new("dirs-hidden-mirror");
+    write(f.local("build/x/y.txt"), "y", 100);
+    fs::create_dir_all(f.local("build/e")).unwrap();
+    assert!(f.engine.full_scan().errors.is_empty());
+    f.engine.download_only = true;
+    f.engine.ignore = Rules::parse("build/");
+    let r = f.engine.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert!(f.remote("build/e").is_dir() && f.remote("build/x/y.txt").exists());
+    assert!(!f.engine.db.dir_synced("build/e").unwrap());
+}
+
+#[test]
+fn a_folder_that_stays_unsettled_is_reported_by_the_walk_once_not_every_time() {
+    let mut f = Fixture::new("dirs-throttle");
+    // A case twin is left alone, so the local one never gets a row.
+    fs::create_dir_all(f.local("Docs")).unwrap();
+    fs::create_dir_all(f.remote("docs")).unwrap();
+    assert!(f.engine.full_scan().errors.is_empty());
+    assert_eq!(f.engine.paths_to_sync(vec![], vec![], true), ["Docs"]);
+    assert!(f.engine.paths_to_sync(vec![], vec![], true).is_empty());
+    // Not for ever: once the interval has passed it is reported again.
+    let past = std::time::Instant::now() - DIR_REPORT_EVERY - std::time::Duration::from_secs(1);
+    *f.engine.dir_reported.lock().unwrap().get_mut("Docs").unwrap() = past;
+    assert_eq!(f.engine.paths_to_sync(vec![], vec![], true), ["Docs"]);
+}
+
+#[test]
+fn a_folder_that_settled_is_reported_at_once_when_it_is_deleted_soon_after() {
+    let mut f = Fixture::new("dirs-throttle-settled");
+    fs::create_dir_all(f.local("x")).unwrap();
+    assert_eq!(f.engine.paths_to_sync(vec![], vec![], true), ["x"]);
+    assert!(f.engine.sync_paths(&["x".into()]).errors.is_empty());
+    assert!(f.engine.paths_to_sync(vec![], vec![], true).is_empty());
+    fs::remove_dir(f.local("x")).unwrap();
+    assert_eq!(f.engine.paths_to_sync(vec![], vec![], true), ["x"]);
+}
+
+/// A cloud whose rmdir always fails with a wording of its own.
+struct OddRmdir(DirRemote);
+
+impl Remote for OddRmdir {
+    fn list(&self) -> Result<Vec<Item>> {
+        self.0.list()
+    }
+    fn list_dir(&self, rel: &str) -> Result<Vec<Item>> {
+        self.0.list_dir(rel)
+    }
+    fn stat(&self, rel: &str) -> Result<Option<Item>> {
+        self.0.stat(rel)
+    }
+    fn upload(&self, root: &Path, rel: &str) -> Result<()> {
+        self.0.upload(root, rel)
+    }
+    fn download(&self, rel: &str, dest: &Path) -> Result<()> {
+        self.0.download(rel, dest)
+    }
+    fn delete(&self, rel: &str) -> Result<()> {
+        self.0.delete(rel)
+    }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.0.make_dir(rel)
+    }
+    fn remove_empty_dir(&self, _: &str) -> Result<()> {
+        Err("the service said no".into())
+    }
+}
+
+#[test]
+fn an_rmdir_error_without_the_usual_wording_is_judged_by_looking_inside() {
+    let f = Fixture::new("dirs-odd-rmdir");
+    let mut e = Engine::new(
+        f.engine.root.clone(),
+        OddRmdir(DirRemote(f.engine.remote.0.clone())),
+        Db::memory().unwrap(),
+    );
+    fs::create_dir_all(f.local("full")).unwrap();
+    fs::create_dir_all(f.local("hollow")).unwrap();
+    assert!(e.full_scan().errors.is_empty());
+    write(f.remote("full/theirs.txt"), "t", 100);
+    fs::remove_dir(f.local("full")).unwrap();
+    fs::remove_dir(f.local("hollow")).unwrap();
+    let r = e.full_scan();
+    // Something is in `full` (the other device's file): it stays, forgotten. `hollow` is empty and refused: retried.
+    assert_eq!(r.failed, ["hollow"], "{r:?}");
+    assert!(!e.db.dir_synced("full").unwrap() && e.db.dir_synced("hollow").unwrap());
+}
+
+#[test]
+fn a_cloud_folder_behind_a_local_symlink_is_not_made_through_it() {
+    let mut f = Fixture::new("dirs-symlink");
+    let outside = f.base.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, f.local("lnk")).unwrap();
+    fs::create_dir_all(f.remote("lnk/sub")).unwrap();
+    let r = f.engine.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert!(!outside.join("sub").exists());
+}
+
+#[test]
+fn a_folder_made_while_the_app_was_closed_is_found_by_the_walk() {
+    let mut f = Fixture::new("dirs-walk");
+    assert!(f.engine.full_scan().errors.is_empty());
+    fs::create_dir_all(f.local("late/er")).unwrap();
+    let paths = f.engine.paths_to_sync(vec![], vec![], true);
+    assert!(paths.contains(&"late".to_string()), "{paths:?}");
+    assert!(f.engine.sync_paths(&paths).errors.is_empty());
+    assert!(f.remote("late/er").is_dir());
+    assert!(
+        f.engine.paths_to_sync(vec![], vec![], true).is_empty(),
+        "synced: nothing left to report"
+    );
 }

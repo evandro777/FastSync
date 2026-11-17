@@ -222,6 +222,42 @@ pub fn case_collisions<'a>(paths: impl Iterator<Item = &'a str>) -> std::collect
     bad
 }
 
+/// What to do with one folder (empty or not: its files have their own rows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirAction {
+    None,
+    /// Both sides have it: only the row is written.
+    Adopt,
+    MakeCloud,
+    MakeLocal,
+    RemoveLocal,
+    RemoveCloud,
+    Forget,
+}
+
+/// The three-way rule for folders: `synced` = a row says both sides had it after the last sync. `restore` turns
+/// a removal into the opposite create (the delete guard's "Restore"). A mirror never touches the cloud.
+pub fn decide_dir(local: bool, cloud: bool, synced: bool, download_only: bool, restore: bool) -> DirAction {
+    use DirAction::*;
+    let a = match (local, cloud, synced) {
+        (true, true, _) => Adopt,
+        (true, false, false) => MakeCloud,
+        (false, true, false) => MakeLocal,
+        (true, false, true) => RemoveLocal,
+        (false, true, true) => RemoveCloud,
+        (false, false, true) => Forget,
+        (false, false, false) => None,
+    };
+    match a {
+        RemoveLocal if restore && !download_only => MakeCloud,
+        RemoveCloud if restore && !download_only => MakeLocal,
+        // The cloud is the truth: a local-only folder goes, a cloud one we had comes back.
+        MakeCloud if download_only => RemoveLocal,
+        RemoveCloud if download_only => MakeLocal,
+        a => a,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +482,28 @@ mod tests {
         let bad = case_collisions(["a.txt", "A.txt", "b.txt", "dir/c", "dir/c"].into_iter());
         assert_eq!(bad.len(), 2);
         assert!(bad.contains("a.txt") && bad.contains("A.txt"));
+    }
+
+    #[test]
+    fn folder_rule_covers_every_input() {
+        use DirAction as D;
+        // (local, cloud, synced) -> (normal, restore, download_only)
+        let table = [
+            ((true, true, false), (D::Adopt, D::Adopt, D::Adopt)),
+            ((true, true, true), (D::Adopt, D::Adopt, D::Adopt)),
+            ((true, false, false), (D::MakeCloud, D::MakeCloud, D::RemoveLocal)),
+            ((false, true, false), (D::MakeLocal, D::MakeLocal, D::MakeLocal)),
+            ((true, false, true), (D::RemoveLocal, D::MakeCloud, D::RemoveLocal)),
+            ((false, true, true), (D::RemoveCloud, D::MakeLocal, D::MakeLocal)),
+            ((false, false, true), (D::Forget, D::Forget, D::Forget)),
+            ((false, false, false), (D::None, D::None, D::None)),
+        ];
+        for ((l, c, s), (normal, restore, mirror)) in table {
+            assert_eq!(decide_dir(l, c, s, false, false), normal, "{l} {c} {s}");
+            assert_eq!(decide_dir(l, c, s, false, true), restore, "restore {l} {c} {s}");
+            assert_eq!(decide_dir(l, c, s, true, false), mirror, "mirror {l} {c} {s}");
+            // A restore never does anything in a mirror.
+            assert_eq!(decide_dir(l, c, s, true, true), mirror, "mirror restore {l} {c} {s}");
+        }
     }
 }

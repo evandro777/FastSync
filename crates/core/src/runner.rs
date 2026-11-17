@@ -17,7 +17,7 @@ use crate::{
     accounts::{Account, account_dir},
     db::Db,
     delta::{self, Change, Poll},
-    engine::{Engine, Phase, Progress, Report, ignored},
+    engine::{Engine, Phase, Progress, Remote, Report, ignored},
     ignore::{RULES, Rules},
     rclone::{Rclone, RcloneRemote, exclude_rules, now_secs},
 };
@@ -168,6 +168,8 @@ fn scan_due(since_end: Option<Duration>) -> bool {
 }
 const RETRY_AFTER: Duration = Duration::from_secs(60);
 const RETRY_MAX: Duration = Duration::from_secs(1800);
+/// The longest a failed full scan makes its retry wait for having run long (see `Retry::cool_down`).
+const COOL_DOWN_MAX: Duration = Duration::from_secs(300);
 /// How long syncing must stay quiet before the conflicts of a burst are announced (once, not per file).
 const CONFLICT_QUIET: Duration = Duration::from_secs(10);
 
@@ -179,6 +181,48 @@ fn retry_after(fails: u32) -> Duration {
 
 /// More failed paths than this are as good as a full scan: the list is dropped and the retry becomes one.
 const RETRY_PATHS_MAX: usize = 5000;
+
+/// How long a batch of many cloud deletions waits for the rest of a possible folder rename: a long poll (30 s), the
+/// pause after a batch and the run's own 3 s burst wait, with room to spare.
+const MASS_DELETE_HOLD: Duration = Duration::from_secs(60);
+
+/// What a change of the rules asks the engine to look at, as `(paths, cloud folders)`, or `None` when only a scan of
+/// everything can say (`Rules::change`, or a DB that cannot be read). Synced files the new rules hide are paths (the
+/// run turns them into cloud deletes, which the delete guard counts); names a removed rule used to hide are paths and
+/// folders to list. The caller also walks the local folder.
+fn rules_delta(old: &Rules, new: &Rules, db: &Db) -> Option<(Vec<String>, Vec<String>)> {
+    let change = old.change(new)?;
+    let mut paths: Vec<String> = db
+        .all()
+        .ok()?
+        .into_iter()
+        .map(|(p, _)| p)
+        .filter(|p| new.matches(p) && !old.matches(p))
+        .collect();
+    let mut dirs = Vec::new();
+    if let crate::ignore::Change::Unhides(names) = change {
+        paths.extend(names.iter().cloned());
+        dirs = names;
+    }
+    Some((paths, dirs))
+}
+
+/// `rules_delta` for the rules the last settled scan was made with (the `excluded` key keeps their text): `None` for a
+/// first sync, a key from before the rules, or a changed list of unchecked folders, which need a full scan.
+fn rules_since_last_scan(db: &Db, picker: &str, new: &Rules) -> Option<(Vec<String>, Vec<String>)> {
+    let stored = db.meta("excluded").ok().flatten()?;
+    let (old_picker, old_rules) = stored.split_once("\n\0\n")?;
+    if old_picker != picker {
+        return None;
+    }
+    rules_delta(&Rules::parse(old_rules), new, db)
+}
+
+/// True when a run may start despite a hold (`Impact::mass_delete`): no hold, or the next batch came, or a full scan
+/// is due anyway, or the time is up.
+fn hold_over(hold_until: Option<Instant>, released: bool, full: bool, now: Instant) -> bool {
+    released || full || hold_until.is_none_or(|t| now >= t)
+}
 
 /// What a due retry runs.
 #[derive(Debug, PartialEq)]
@@ -319,6 +363,14 @@ impl Retry {
             self.at = Some(now + RETRY_AFTER);
         }
     }
+    /// A full scan that failed is not tried again sooner than it ran, up to `COOL_DOWN_MAX`: on a big Dropbox it takes
+    /// ~10 min and fails at the end, so a 1-2 minute back-off meant one scan after another, all of them rate-limited.
+    /// The cap is because the folders it did list are kept, so the retry only lists the rest.
+    fn cool_down(&mut self, took: Duration, now: Instant) {
+        if self.full {
+            self.at = self.at.map(|t| t.max(now + took.min(COOL_DOWN_MAX)));
+        }
+    }
     /// What the loop does after a run: takes it in, and a stopped run's decision that is still unconfirmed makes the
     /// retry a full scan (the paths that failed in it do not carry the decision out).
     fn finish_run(&mut self, r: &Report, ran: &[String], did_full: bool, decision_pending: bool, now: Instant) {
@@ -340,10 +392,19 @@ impl Retry {
     /// cursor; true when the cursor was written. The order is the point: a failed change is in `retry` (and in the DB),
     /// so the cursor can move past it, and a crash between the two writes replays the feed from the old cursor instead
     /// of losing it. A `retry` the DB could not take keeps the cursor back: the failed paths would be safe nowhere.
+    #[cfg(test)]
     fn persist(&mut self, db: &Db, r: &Report, cursor: Option<&str>) -> bool {
+        self.persist_with(db, r, cursor, &[])
+    }
+    /// `persist`, also writing the folders the feed's batches created (Drive/OneDrive) between the two: after the failed
+    /// paths (a listing of one that failed is kept), before the cursor (a replayed batch would find the folder known and
+    /// not list it again). Written only when the cursor is, so a batch that is replayed finds the map as it was.
+    fn persist_with(&mut self, db: &Db, r: &Report, cursor: Option<&str>, dirs: &[(String, String)]) -> bool {
         let remembered = self.save(db);
         match cursor {
-            Some(c) if remembered && self.may_confirm(r) => db.set_meta("cursor", c).is_ok(),
+            Some(c) if remembered && self.may_confirm(r) => {
+                db.add_dirs(dirs).is_ok() && db.set_meta("cursor", c).is_ok()
+            }
             _ => false,
         }
     }
@@ -380,6 +441,39 @@ pub fn spawn(
     on_status: impl Fn(Status) + Send + Sync + 'static,
     on_conflicts: impl Fn(usize, String) + Send + Sync + 'static,
 ) -> Runner {
+    spawn_with(acct, rc, rclone_remote, on_status, on_conflicts)
+}
+
+/// `spawn` with the cloud made by `make_remote` (in the worker thread), so a test can put a spy in its place.
+pub fn spawn_with<R: Remote + 'static>(
+    acct: Account,
+    rc: Arc<Rclone>,
+    make_remote: impl FnOnce(&Account, &Arc<Rclone>) -> R + Send + 'static,
+    on_status: impl Fn(Status) + Send + Sync + 'static,
+    on_conflicts: impl Fn(usize, String) + Send + Sync + 'static,
+) -> Runner {
+    spawn_with_feed(acct, rc, make_remote, delta::for_kind, on_status, on_conflicts)
+}
+
+/// `spawn` with the change feed made by `make_feed(kind, token)`, so a test can put a fake one in its place.
+pub fn spawn_feed(
+    acct: Account,
+    rc: Arc<Rclone>,
+    make_feed: impl FnOnce(&str, delta::Token) -> Option<Box<dyn delta::RemoteChanges>> + Send + 'static,
+    on_status: impl Fn(Status) + Send + Sync + 'static,
+    on_conflicts: impl Fn(usize, String) + Send + Sync + 'static,
+) -> Runner {
+    spawn_with_feed(acct, rc, rclone_remote, make_feed, on_status, on_conflicts)
+}
+
+fn spawn_with_feed<R: Remote + 'static>(
+    acct: Account,
+    rc: Arc<Rclone>,
+    make_remote: impl FnOnce(&Account, &Arc<Rclone>) -> R + Send + 'static,
+    make_feed: impl FnOnce(&str, delta::Token) -> Option<Box<dyn delta::RemoteChanges>> + Send + 'static,
+    on_status: impl Fn(Status) + Send + Sync + 'static,
+    on_conflicts: impl Fn(usize, String) + Send + Sync + 'static,
+) -> Runner {
     let (tx, rx) = channel();
     let on_status = Arc::new(on_status);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -388,7 +482,17 @@ pub fn spawn(
         move || {
             // A panic would end this thread silently and leave the card on its last status for ever.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                work(acct, rc, tx, rx, cancel, on_status.clone(), &on_conflicts)
+                work(
+                    acct,
+                    rc,
+                    make_remote,
+                    make_feed,
+                    tx,
+                    rx,
+                    cancel,
+                    on_status.clone(),
+                    &on_conflicts,
+                )
             }));
             match result {
                 Ok(Err(e)) => on_status(Status::Error(e)),
@@ -406,9 +510,28 @@ pub fn spawn(
     }
 }
 
-fn work(
+/// The cloud of a real account: rclone's remote named by the account id.
+fn rclone_remote(acct: &Account, rc: &Arc<Rclone>) -> RcloneRemote {
+    let mut r = RcloneRemote::new(
+        rc.clone(),
+        format!("{}:", acct.id),
+        exclude_rules(&acct.kind, &acct.excluded),
+        acct.kind == "dropbox",
+    );
+    // No feed to say what changed (MEGA): a kept folder is trusted only briefly.
+    if !matches!(acct.kind.as_str(), "dropbox" | "drive" | "onedrive") {
+        r.max_age = Duration::from_secs(600);
+    }
+    r
+}
+
+// The worker's whole environment, handed over once by `spawn_with`: a struct would only rename the arguments.
+#[allow(clippy::too_many_arguments)]
+fn work<R: Remote + 'static>(
     acct: Account,
     rc: Arc<Rclone>,
+    make_remote: impl FnOnce(&Account, &Arc<Rclone>) -> R,
+    make_feed: impl FnOnce(&str, delta::Token) -> Option<Box<dyn delta::RemoteChanges>>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
     cancel: Arc<AtomicBool>,
@@ -432,17 +555,7 @@ fn work(
         rc.skip_shortcuts(&acct.id)?;
     }
     let cursor = db.meta("cursor").ok().flatten();
-    let fs = format!("{}:", acct.id);
-    let mut engine = Engine::new(
-        root.clone(),
-        RcloneRemote {
-            rc: rc.clone(),
-            fs,
-            exclude: exclude_rules(&acct.kind, &acct.excluded),
-            dropbox: acct.kind == "dropbox",
-        },
-        db,
-    );
+    let mut engine = Engine::new(root.clone(), make_remote(&acct, &rc), db);
     engine.excluded = acct.excluded.clone();
     engine.download_only = acct.download_only;
     engine.cancel = cancel.clone();
@@ -451,7 +564,11 @@ fn work(
     // A provider with a delta feed would otherwise wait for a cursor reset, and a re-ticked folder whose files the
     // user removed by hand meanwhile would read as "deleted locally" and be deleted in the cloud.
     // The ignore rules ride on the same mechanism: a changed rules file also needs a full scan first.
-    let mut rules_text = std::fs::read_to_string(root.join(RULES)).unwrap_or_default();
+    // Unreadable rules (UTF-16 from a Windows editor, no permission) must not start as "no rules": the first scan
+    // would upload everything they hide.
+    // (This worker ends here: only a restart or saving the account starts it again.)
+    let mut rules_text = read_rules(&root).map_err(|e| format!("{e} (fix it and restart FastSync)"))?;
+    let mut rules_bad = false;
     engine.ignore = Rules::parse(&rules_text);
     let mut excluded_key = format!("{}\n\0\n{rules_text}", acct.excluded.join("\n"));
     let excluded_changed = engine.db.meta("excluded").ok().flatten().unwrap_or_default() != excluded_key;
@@ -503,8 +620,14 @@ fn work(
     let token_rc = rc.clone();
     let token: delta::Token = Box::new(move || token_rc.token(&id).map(|t| t.0));
     let mut root_id = None;
-    match delta::for_kind(&kind, token) {
+    // A feed with no saved cursor sends `Reset(first cursor)`, which makes the first full scan. Starting one on our own
+    // too let the cursor arrive during it, and that late `Reset` ran a second scan right after (11 min on 100k files).
+    let mut waits_cursor = false;
+    let mut has_feed = false;
+    match make_feed(&kind, token) {
         Some(feed) => {
+            has_feed = true;
+            waits_cursor = cursor.is_none();
             poller(feed, cursor.clone(), tx.clone(), stop.clone());
             if cursor.is_some() {
                 let _ = tx.send(Event::Walk);
@@ -529,13 +652,27 @@ fn work(
     let (mut pending, mut feed_paths) = (BTreeSet::new(), BTreeSet::new());
     // Cloud folders the feed reported without their contents (a new or moved Dropbox folder): listed alone by the run.
     let mut feed_dirs: BTreeSet<String> = BTreeSet::new();
-    let (mut full, mut walk) = (excluded_changed, false);
+    // Only the rules file changed since the last settled scan, and the feed covers the cloud: the files it concerns are
+    // looked at by path (below), no scan of everything. Needs a saved cursor, or the first `Reset` scans anyway.
+    let rules_start = (excluded_changed && has_feed && !waits_cursor)
+        .then(|| rules_since_last_scan(&engine.db, &acct.excluded.join("\n"), &engine.ignore))
+        .flatten();
+    // Not yet while waiting for the first cursor: any event (the root id, a watch) would run the scan before it.
+    let scan_at_start = excluded_changed && !waits_cursor && rules_start.is_none();
+    let (mut full, mut walk) = (scan_at_start, false);
     // Why the next full scan runs (the first cause wins), written to the log as `full:<why>`.
     // The start-up scan (also after Edit, which restarts the runner) is the one `excluded_changed` asks for.
     let mut why: &'static str = "rescan";
     // The first loop turn waits for an event: this one makes it run the scan.
-    if excluded_changed {
+    if scan_at_start {
         let _ = tx.send(Event::Full);
+    }
+    // A run of paths (not a full scan) that carries out a change of the rules, and so may confirm the `excluded` key.
+    let mut rules_run = false;
+    if let Some((paths, dirs)) = rules_start {
+        feed_paths.extend(paths);
+        feed_dirs.extend(dirs);
+        (walk, rules_run) = (true, true);
     }
     let mut excluded_pending = excluded_changed;
     let mut new_cursor: Option<String> = None;
@@ -545,6 +682,10 @@ fn work(
     // events cannot hold it back for ever).
     let mut conflicts: Vec<String> = Vec::new();
     let mut alert_at = Instant::now();
+    // Set by a feed batch of many deletions: no run before it (unless a scan is due), see `Impact::mass_delete`.
+    let mut hold_until: Option<Instant> = None;
+    // Folders the feed reported as created (Drive/OneDrive: id, path), saved with the cursor that moves past them.
+    let mut dir_adds: Vec<(String, String)> = Vec::new();
     loop {
         if !conflicts.is_empty() && Instant::now() >= alert_at {
             let all = std::mem::take(&mut conflicts);
@@ -553,6 +694,7 @@ fn work(
         let wait = [
             retry.wait(Instant::now()),
             (!conflicts.is_empty()).then(|| alert_at.saturating_duration_since(Instant::now())),
+            hold_until.map(|t| t.saturating_duration_since(Instant::now())),
         ]
         .into_iter()
         .flatten()
@@ -576,24 +718,51 @@ fn work(
                 Err(_) => break,
             }
         }
+        let mut released = false;
         for ev in events {
             match ev {
                 Event::Local(p) => pending.extend(p),
                 Event::Remote(changes, cur) => {
-                    let dirs = engine.db.dirs().unwrap_or_default().into_iter().collect();
+                    // The saved folder map plus the folders earlier batches created and not yet saved.
+                    let mut dirs: std::collections::HashMap<String, String> =
+                        engine.db.dirs().unwrap_or_default().into_iter().collect();
+                    dirs.extend(dir_adds.iter().cloned());
                     let db = &engine.db;
                     let i = delta::impact(&changes, &dirs, root_id.as_deref(), |id| {
                         db.path_of_id(id).ok().flatten()
                     });
+                    dir_adds.extend(i.new_dirs.iter().cloned());
                     if i.full_scan {
                         mark(&mut full, &mut why, "feed");
                     }
+                    // A big batch of deletions waits one poll for the new name of a folder renamed in the cloud; the
+                    // next batch (any) ends the wait, and the guard still judges what is left.
+                    if hold_until.is_some() {
+                        released = true;
+                    } else if i.mass_delete {
+                        hold_until = Some(Instant::now() + MASS_DELETE_HOLD);
+                    }
+                    // Folders an unfinished listing kept may be out of date now. Only Dropbox reports paths; the
+                    // others report ids, so they drop everything.
+                    engine
+                        .remote
+                        .forget_listed(feed_touched(kind == "dropbox", &i.paths, &i.dirs).as_deref());
                     feed_paths.extend(i.paths);
                     feed_dirs.extend(i.dirs);
                     new_cursor = Some(cur);
                 }
                 Event::Reset(cur) => {
-                    mark(&mut full, &mut why, "reset");
+                    engine.remote.forget_listed(None);
+                    // The first cursor of a new account is the start-up scan, not a reset.
+                    mark(
+                        &mut full,
+                        &mut why,
+                        if std::mem::take(&mut waits_cursor) {
+                            "rescan"
+                        } else {
+                            "reset"
+                        },
+                    );
                     new_cursor = Some(cur);
                 }
                 Event::Root(id) => root_id = id,
@@ -614,7 +783,11 @@ fn work(
                         mark(&mut full, &mut why, "tick");
                     }
                 }
-                Event::SyncNow => mark(&mut full, &mut why, "now"),
+                Event::SyncNow => {
+                    // The user asked for the truth: nothing kept from an earlier try.
+                    engine.remote.forget_listed(None);
+                    mark(&mut full, &mut why, "now");
+                }
                 Event::Resolve(d) => {
                     // Only a held account has anything to resolve, and a mirror cannot put files back in the cloud.
                     if held.is_some() && !(d == Decision::Restore && acct.download_only) {
@@ -651,18 +824,42 @@ fn work(
             }
         }
         // Edited here or arrived from the cloud: either way the file on disk is the truth.
-        // A missing file means no rules, but a failed read (editor mid-save, permissions) keeps the old ones: empty
-        // rules would upload every file they hide.
-        let now = match std::fs::read_to_string(root.join(RULES)) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(_) => rules_text.clone(),
+        // A missing file means no rules, but a failed read (editor mid-save, permissions, UTF-16) keeps the old ones
+        // and runs nothing until it reads again: empty rules would upload every file they hide.
+        let now = match read_rules(&root) {
+            Ok(t) => {
+                // Readable again, maybe with the same text: nothing else would start a run to clear the error card.
+                walk |= rules_bad;
+                rules_bad = false;
+                t
+            }
+            Err(e) => {
+                if !rules_bad {
+                    let e = format!("{e} (rules not applied, nothing is synced until it can be read)");
+                    engine.db.log("error", RULES, None, &e);
+                    on_status(Status::Error(e));
+                    rules_bad = true;
+                }
+                rules_text.clone()
+            }
         };
         if now != rules_text {
-            engine.ignore = Rules::parse(&now);
+            let old = std::mem::replace(&mut engine.ignore, Rules::parse(&now));
             excluded_key = format!("{}\n\0\n{now}", acct.excluded.join("\n"));
             rules_text = now;
-            mark(&mut full, &mut why, "rules");
+            // What the change can show or hide is looked at by path; only a change that cannot be said that way (and a
+            // provider without a feed, which scans every few minutes anyway) is a scan of everything.
+            match has_feed
+                .then(|| rules_delta(&old, &engine.ignore, &engine.db))
+                .flatten()
+            {
+                Some((paths, dirs)) => {
+                    feed_paths.extend(paths);
+                    feed_dirs.extend(dirs);
+                    (walk, rules_run) = (true, true);
+                }
+                None => mark(&mut full, &mut why, "rules"),
+            }
             excluded_pending = true;
         }
         // Taken here, not in the run: a paused or held account must not spin on a retry that is already due (the full
@@ -675,7 +872,12 @@ fn work(
             &mut feed_paths,
             &mut feed_dirs,
         );
-        if paused {
+        if hold_over(hold_until, released, full, Instant::now()) {
+            hold_until = None;
+        } else {
+            continue;
+        }
+        if paused || rules_bad {
             continue;
         }
         // Held: no walk, no scan, no feed paths, so no "up to date" and no saved cursor for a change nobody
@@ -684,6 +886,10 @@ fn work(
             pending.clear();
             feed_paths.clear();
             feed_dirs.clear();
+            // The paths of a change of the rules are dropped with the rest: the scan after the decision does it all.
+            if std::mem::take(&mut rules_run) {
+                mark(&mut full, &mut why, "rules");
+            }
             continue;
         }
         if !run_wanted(full, walk, &pending, &feed_paths, &feed_dirs) {
@@ -720,8 +926,8 @@ fn work(
                 } else {
                     on_status(syncing());
                     let r = engine.sync_paths_in(&paths, &dirs);
-                    // A folder renamed in the cloud can arrive as its deletions first and the new name in a later
-                    // batch: a stop here may be a move only a full scan (which pairs them) can see.
+                    // A stop here may be a folder renamed in the cloud whose new name did not arrive within the hold
+                    // (`MASS_DELETE_HOLD`): only a full scan, which pairs them, can see that.
                     if r.aborted.is_some() || r.wants_full {
                         (engine.full_scan(), paths, dirs, true)
                     } else {
@@ -730,6 +936,14 @@ fn work(
                 }
             }
         });
+        // Our own uploads, deletes and moves in a run of some paths are not in what an unfinished listing kept, and
+        // the feed's echo of them may come later than the next scan: forgotten here, never left to the feed.
+        // Only the folders around what it looked at: a busy machine runs paths every few minutes, and dropping
+        // everything each time would leave nothing for a retry to resume.
+        if run_changes_cloud(did_full, &ran, &ran_dirs) {
+            let touched: Vec<String> = ran.iter().chain(&ran_dirs).cloned().collect();
+            engine.remote.forget_listed(Some(&touched));
+        }
         pending.clear();
         feed_paths.clear();
         feed_dirs.clear();
@@ -773,10 +987,11 @@ fn work(
         }
         // Only a whole scan with nothing global wrong counts: after a stop, a cut or a failed listing the next start
         // must scan again. A file that failed does not hold it back: it is retried by its path.
-        if full && excluded_pending && settled(&report) {
+        if (full || rules_run) && excluded_pending && settled(&report) {
             let _ = engine.db.set_meta("excluded", &excluded_key);
             excluded_pending = false;
         }
+        rules_run = false;
         (full, walk) = (false, false);
         if did_full {
             last_full_end = Some(Instant::now());
@@ -801,13 +1016,29 @@ fn work(
             // A stopped run's decision is not carried out by the paths that failed in it: only a clean full scan
             // does that, so with one pending the retry is a full scan.
             retry.finish_run(&report, &ran, did_full, resolution.is_some(), Instant::now());
+            if did_full {
+                retry.cool_down(began.elapsed(), Instant::now());
+            }
         }
-        if retry.persist(&engine.db, &report, new_cursor.as_deref()) {
-            new_cursor = None;
+        // A full scan replaced the folder map with the cloud's own listing, which includes these.
+        if did_full && settled(&report) {
+            dir_adds.clear();
+        }
+        if retry.persist_with(&engine.db, &report, new_cursor.as_deref(), &dir_adds) {
+            (new_cursor, dir_adds) = (None, Vec::new());
         }
         on_status(summary(&report));
     }
     Ok(())
+}
+
+/// The rules file's text: empty when there is none. Any other failure is an error, never "no rules".
+fn read_rules(root: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(root.join(RULES)) {
+        Ok(t) => Ok(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("{RULES}: {e}")),
+    }
 }
 
 fn summary(r: &Report) -> Status {
@@ -951,6 +1182,18 @@ fn after_cancel(did_full: bool, ran: Vec<String>) -> (bool, Vec<String>) {
     if did_full { (true, Vec::new()) } else { (false, ran) }
 }
 
+/// What an unfinished listing must forget after a feed event: `None` = everything. Only Dropbox reports paths; the
+/// others report ids, so any change may be anywhere.
+fn feed_touched(dropbox: bool, paths: &[String], dirs: &[String]) -> Option<Vec<String>> {
+    dropbox.then(|| paths.iter().chain(dirs).cloned().collect())
+}
+
+/// True when a run of some paths may have changed the cloud, so the folders an unfinished listing kept are out of
+/// date. A full scan is not one (its listing is the truth), nor is a walk that found no paths.
+fn run_changes_cloud(did_full: bool, ran: &[String], ran_dirs: &[String]) -> bool {
+    !did_full && !(ran.is_empty() && ran_dirs.is_empty())
+}
+
 /// True when a full scan may confirm the unchecked-folders key: it was whole (not stopped or cut short) and nothing
 /// that is not about one file went wrong. A file that failed is retried by its path, and the failures that matter to
 /// this key (a folder that could not be trashed) are not about one file, so one stuck file cannot keep it open and
@@ -1047,6 +1290,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_change_of_rules_is_looked_at_by_path_unless_only_everything_can_say() {
+        let db = Db::memory().unwrap();
+        let sig = crate::decide::Sig { size: 1, mtime: 1 };
+        for p in ["a.log", "keep.txt", "gen/api/x.rs"] {
+            db.set(
+                p,
+                &crate::decide::Base {
+                    local: sig,
+                    remote: sig,
+                },
+                "",
+            )
+            .unwrap();
+        }
+        let rules = |t: &str| Rules::parse(t);
+        // A rule added: the synced files it now hides are the paths (the run makes cloud deletes of them).
+        let (paths, dirs) = rules_delta(&rules(""), &rules("*.log\n"), &db).unwrap();
+        assert_eq!((paths, dirs), (vec!["a.log".to_string()], vec![]));
+        // A literal rule removed: that name is looked at and its cloud folder listed.
+        let (paths, dirs) = rules_delta(&rules("gen/api\n"), &rules(""), &db).unwrap();
+        assert_eq!(
+            (paths, dirs),
+            (vec!["gen/api".to_string()], vec!["gen/api".to_string()])
+        );
+        // A wildcard removed: it could show anything.
+        assert!(rules_delta(&rules("*.log\n"), &rules(""), &db).is_none());
+        // The text saved with the last settled scan: a changed list of unchecked folders or no key is a full scan.
+        db.set_meta("excluded", "x\n\0\n*.log\n").unwrap();
+        assert!(rules_since_last_scan(&db, "x", &rules("*.log\n*.tmp\n")).is_some());
+        assert!(rules_since_last_scan(&db, "y", &rules("*.log\n*.tmp\n")).is_none());
+        db.set_meta("excluded", "").unwrap();
+        assert!(rules_since_last_scan(&db, "", &rules("")).is_none());
+    }
+
+    #[test]
+    fn a_hold_for_many_deletions_ends_with_the_next_batch_a_due_scan_or_the_time() {
+        let now = Instant::now();
+        let later = Some(now + Duration::from_secs(60));
+        assert!(hold_over(None, false, false, now));
+        assert!(!hold_over(later, false, false, now));
+        assert!(hold_over(later, true, false, now), "the next batch");
+        assert!(hold_over(later, false, true, now), "a full scan is due anyway");
+        assert!(hold_over(later, false, false, now + Duration::from_secs(61)));
+    }
+
+    #[test]
     fn the_first_cause_of_a_full_scan_is_the_one_logged() {
         let (mut full, mut why) = (false, "rescan");
         mark(&mut full, &mut why, "now");
@@ -1057,6 +1346,19 @@ mod tests {
         full = false;
         mark(&mut full, &mut why, "feed");
         assert_eq!(why, "feed");
+    }
+
+    #[test]
+    fn a_rules_file_that_cannot_be_read_is_an_error_not_no_rules() {
+        let dir = std::env::temp_dir().join(format!("fastsync-rules-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(read_rules(&dir), Ok(String::new()));
+        std::fs::write(dir.join(RULES), "node_modules\n").unwrap();
+        assert_eq!(read_rules(&dir), Ok("node_modules\n".into()));
+        // UTF-16 with a BOM, as a Windows editor can save it.
+        std::fs::write(dir.join(RULES), [0xff, 0xfe, b'a', 0, b'\n', 0]).unwrap();
+        assert!(read_rules(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1199,6 +1501,41 @@ mod tests {
     }
 
     #[test]
+    fn what_an_unfinished_listing_forgets() {
+        let (p, d) = (s(&["A/x.txt"]), s(&["B"]));
+        assert_eq!(
+            feed_touched(true, &p, &d),
+            Some(s(&["A/x.txt", "B"])),
+            "Dropbox names the paths"
+        );
+        assert_eq!(feed_touched(false, &p, &d), None, "ids: everything goes");
+        // A path run (an upload may be under way) forgets; a full scan and an idle walk do not.
+        assert!(run_changes_cloud(false, &p, &[]) && run_changes_cloud(false, &[], &d));
+        assert!(!run_changes_cloud(true, &p, &d) && !run_changes_cloud(false, &[], &[]));
+    }
+
+    #[test]
+    fn a_failed_full_scan_waits_at_least_as_long_as_it_ran() {
+        let (mut r, t0) = (Retry::default(), Instant::now());
+        let mut rep = Report::default();
+        rep.errors.push("listing the cloud failed".into());
+        r.record(&rep, &[], true, t0);
+        r.cool_down(Duration::from_secs(200), t0);
+        assert_eq!(r.wait(t0), Some(Duration::from_secs(200)));
+        r.cool_down(Duration::from_secs(600), t0);
+        assert_eq!(
+            r.wait(t0),
+            Some(COOL_DOWN_MAX),
+            "capped: the folders it listed are kept"
+        );
+        // A retry of paths is not stretched.
+        let mut p = Retry::default();
+        p.record(&failed(&["a"]), &s(&["a"]), false, t0);
+        p.cool_down(Duration::from_secs(600), t0);
+        assert_eq!(p.wait(t0), Some(retry_after(1)));
+    }
+
+    #[test]
     fn what_the_loop_does_after_a_run_follows_these_rules() {
         let (mut r, t0) = (Retry::default(), Instant::now());
         // A failed file: retried alone, the cursor may move on (it is remembered).
@@ -1272,8 +1609,19 @@ mod tests {
         db.refuse_meta_key("retry");
         let mut r = Retry::default();
         r.finish_run(&failed(&["a"]), &s(&["a"]), false, false, t0);
-        assert!(!r.persist(&db, &failed(&["a"]), cur));
+        let folder = [("id".to_string(), "docs".to_string())];
+        assert!(!r.persist_with(&db, &failed(&["a"]), cur, &folder));
         assert_eq!(db.meta("cursor").unwrap().as_deref(), Some("cursor-1"));
+        assert!(db.dirs().unwrap().is_empty(), "the folders wait with the cursor");
+        // The folders a feed batch created are saved with the cursor that moves past them, and never over a row a full
+        // scan wrote.
+        let db = Db::memory().unwrap();
+        let mut r = Retry::default();
+        r.finish_run(&Report::default(), &[], false, false, t0);
+        assert!(r.persist_with(&db, &Report::default(), cur, &folder));
+        assert_eq!(db.dirs().unwrap(), folder);
+        db.add_dirs(&[("id".to_string(), "elsewhere".to_string())]).unwrap();
+        assert_eq!(db.dirs().unwrap(), folder);
         // A failed listing needs a full scan: the cursor stays back whatever was saved.
         let db = Db::memory().unwrap();
         let mut r = Retry::default();

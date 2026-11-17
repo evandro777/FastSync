@@ -12,7 +12,9 @@ use std::{
 
 use crate::{
     db::Db,
-    decide::{Action, Base, MIN_FILES, Sig, conflict_name, decide, decide_down, delete_guard_ok},
+    decide::{
+        Action, Base, DirAction, MIN_FILES, Sig, conflict_name, decide, decide_dir, decide_down, delete_guard_ok,
+    },
     ignore::Rules,
     rclone::{Item, now_secs},
 };
@@ -76,10 +78,17 @@ pub trait Remote: Send + Sync {
     fn remove_empty_dir(&self, _rel: &str) -> Result<()> {
         Err("rmdir unsupported".into())
     }
+    /// Creates the cloud folder `rel` (with its parents); fine when it exists. An empty folder has no file to carry it.
+    fn make_dir(&self, _rel: &str) -> Result<()> {
+        Err("mkdir unsupported".into())
+    }
     /// Drops what the transport remembers about the cloud's folders. Called before a full listing: a folder moved or
     /// renamed in the cloud would otherwise still answer under its old path (rclone keeps the old folder id), and the
     /// engine would download its files again into the old place.
     fn forget_cache(&self) {}
+    /// Drops the folders of an unfinished listing that the cloud's feed says changed (`None` = all of them), so a
+    /// retry after a failed or paused scan never re-uses a folder that is out of date.
+    fn forget_listed(&self, _paths: Option<&[String]>) {}
     /// True only when the local file at `local_root/rel` is proven to have the same bytes as `remote` (by the
     /// service's own hash). Unknown means false: the caller then keeps both copies.
     fn same_content(&self, _local_root: &Path, _rel: &str, _remote: &Item) -> bool {
@@ -212,6 +221,16 @@ struct Moved {
     remote: Option<Item>,
 }
 
+/// A folder the plan looked at and which sides have it (see `decide_dir`).
+struct DirWork {
+    path: String,
+    local: bool,
+    cloud: bool,
+    /// A rule now hides this synced folder: its cloud copy goes (empty-only), the local one stays. `local`/`cloud`
+    /// are not looked at.
+    hidden: bool,
+}
+
 type Planned = (Work, Action, Option<Base>);
 
 /// Old paths tried per new path before giving up (each is one hash of a local file).
@@ -219,6 +238,10 @@ const PAIR_TRIES: usize = 8;
 
 /// Smaller files are just downloaded: hashing a candidate costs more than the request saves.
 const COPY_MIN: u64 = 1 << 20;
+
+/// A conflict's local file counts as the newer one only by more than this many milliseconds (providers keep whole
+/// seconds): closer than that, the cloud's version keeps the name, as it always did.
+const NEWER_BY_MS: i64 = 2000;
 
 pub struct Engine<R: Remote> {
     pub root: PathBuf,
@@ -245,7 +268,13 @@ pub struct Engine<R: Remote> {
     /// already counts the file there), renamed by `run` only after the delete guard and the cancel checks have passed,
     /// so a stopped or cut-short run never leaves a user's file renamed.
     case_renames: Vec<(String, String, Sig)>,
+    /// When the walk last reported each folder (`local_changes`): a folder that never gets settled (its cloud `mkdir`
+    /// keeps failing, a case twin, a file holding the name) is reported again only after `DIR_REPORT_EVERY`, so it
+    /// does not start a run at every walk.
+    dir_reported: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
+
+const DIR_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Editor and downloader leftovers, and the native clients' own state, that must never be synced. The native
 /// folders (Dropbox's `.dropbox.cache`, ...) are one machine's private cache: sharing them would corrupt the client
@@ -317,14 +346,32 @@ fn sig_of(m: &fs::Metadata) -> Sig {
     Sig { size: m.len(), mtime }
 }
 
-/// Regular files only: a symlink could point anywhere, and empty folders are not synced.
+/// Regular files only: a symlink could point anywhere, and folders have their own rows (`decide_dir`).
 fn local_sig(root: &Path, rel: &str) -> Option<Sig> {
     let m = fs::symlink_metadata(root.join(rel)).ok()?;
     m.is_file().then(|| sig_of(&m))
 }
 
-/// More reported folders than this are not listed one by one: the run asks for a full scan instead.
+/// More reported folders than this are listed by their parents instead (`feed_dirs_to_list`); only when that still
+/// leaves more (they are all at the top level) the run asks for a full scan.
 const FEED_DIRS_MAX: usize = 30;
+
+/// The folders of `dirs` that are not inside another one of them, sorted and without repeats. Compared with
+/// `ancestor/`, not by sorting alone: `a b` sorts between `a` and `a/b`.
+fn top_dirs(mut dirs: Vec<String>) -> Vec<String> {
+    dirs.sort();
+    dirs.dedup();
+    let mut top: Vec<String> = Vec::new();
+    for d in dirs {
+        if !top
+            .iter()
+            .any(|a| d.strip_prefix(a.as_str()).is_some_and(|r| r.starts_with('/')))
+        {
+            top.push(d);
+        }
+    }
+    top
+}
 
 /// True when a failed listing of the cloud folder `dir` really means it is gone. "Not found" alone is not enough (a
 /// glitch once passed as an empty root): the folder's own `stat` has to say so too, and the root is never gone.
@@ -484,14 +531,12 @@ fn lookup<R: Remote>(
 /// drop what it holds cost every full scan and every walk. `ignore`: a folder the rules hide is not entered either
 /// (a `node_modules/` of 100k files would otherwise be read and matched file by file on every walk); the callers
 /// treat a path missing from the result like an ignored one, because `run` applies the rules before anything else.
-pub fn scan(root: &Path, skip: &[String], ignore: &Rules) -> (HashMap<String, Sig>, Vec<String>) {
-    fn go(
-        dir: &Path,
-        prefix: &str,
-        (skip, ignore): (&[String], &Rules),
-        out: &mut HashMap<String, Sig>,
-        bad: &mut Vec<String>,
-    ) {
+/// It returns the files, the folders it entered (every one that is not unchecked or hidden by the rules, empty or
+/// not) and the unreadable places. A folder missing from the result is "not looked at" as much as "not there":
+/// callers judge it with the same filters as for files.
+pub fn scan(root: &Path, skip: &[String], ignore: &Rules) -> (HashMap<String, Sig>, BTreeSet<String>, Vec<String>) {
+    type Out<'a> = (&'a mut HashMap<String, Sig>, &'a mut BTreeSet<String>);
+    fn go(dir: &Path, prefix: &str, (skip, ignore): (&[String], &Rules), (out, dirs): Out, bad: &mut Vec<String>) {
         let rd = match fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(_) => {
@@ -530,16 +575,17 @@ pub fn scan(root: &Path, skip: &[String], ignore: &Rules) -> (HashMap<String, Si
             };
             if m.is_dir() {
                 if !excluded(&rel, skip) && !ignore.matches_dir(&rel) {
-                    go(&e.path(), &rel, (skip, ignore), out, bad);
+                    dirs.insert(rel.clone());
+                    go(&e.path(), &rel, (skip, ignore), (&mut *out, &mut *dirs), bad);
                 }
             } else if m.is_file() && !excluded(&rel, skip) {
                 out.insert(rel, sig_of(&m));
             }
         }
     }
-    let (mut out, mut bad) = (HashMap::new(), Vec::new());
-    go(root, "", (skip, ignore), &mut out, &mut bad);
-    (out, bad)
+    let (mut out, mut dirs, mut bad) = (HashMap::new(), BTreeSet::new(), Vec::new());
+    go(root, "", (skip, ignore), (&mut out, &mut dirs), &mut bad);
+    (out, dirs, bad)
 }
 
 /// True when `path` is, or sits inside, a place `scan` could not read.
@@ -588,6 +634,7 @@ impl<R: Remote> Engine<R> {
             progress: Default::default(),
             cancel: Default::default(),
             case_renames: Vec::new(),
+            dir_reported: Default::default(),
         }
     }
 
@@ -615,14 +662,33 @@ impl<R: Remote> Engine<R> {
             }
             let untouched =
                 !under_symlink(&self.root, &path) && local_sig(&self.root, &path).is_some_and(|l| base.local == l);
-            if untouched && let Err(e) = self.trash(&path) {
-                self.db.log("error", &path, None, &e.to_string());
-                report.errors.push(format!("{path}: {e}"));
-                continue;
+            if untouched {
+                if let Err(e) = self.trash(&path) {
+                    self.db.log("error", &path, None, &e.to_string());
+                    report.errors.push(format!("{path}: {e}"));
+                    continue;
+                }
+                prune_empty(&self.root, &path);
             }
             if let Err(e) = self.db.forget(&path) {
                 report.errors.push(format!("{path}: {e}"));
             }
+        }
+        // Its synced folders leave the disk too (empty ones: `remove_dir` refuses anything with a file in it), deepest
+        // first. The cloud's folders stay.
+        let mut gone: Vec<String> = self
+            .db
+            .all_dir_rows()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|d| excluded(d, &self.excluded))
+            .collect();
+        gone.sort_by_key(|d| std::cmp::Reverse(d.matches('/').count()));
+        for dir in gone {
+            if !under_symlink(&self.root, &dir) {
+                let _ = fs::remove_dir(self.root.join(&dir));
+            }
+            let _ = self.db.forget_dir_row(&dir);
         }
     }
 
@@ -682,20 +748,45 @@ impl<R: Remote> Engine<R> {
         // Drive allows two files with one name in a folder: a map would keep either one, so the local copy could flip
         // between them. Such a path is skipped (like a case clash) until the user renames one.
         let mut duplicate: BTreeSet<String> = BTreeSet::new();
+        let mut cloud_dirs: HashSet<String> = HashSet::new();
         for i in items {
-            if i.is_dir || !safe_rel(&i.path) || excluded(&i.path, &self.excluded) {
+            if i.is_dir {
+                cloud_dirs.insert(i.path);
+                continue;
+            }
+            if !safe_rel(&i.path) || excluded(&i.path, &self.excluded) {
                 continue;
             }
             if let Some(prev) = remote.insert(i.path.clone(), i) {
                 duplicate.insert(prev.path);
             }
         }
-        let (local, bad) = scan(&self.root, &self.excluded, &self.ignore);
+        let (local, local_dirs, bad) = scan(&self.root, &self.excluded, &self.ignore);
         if self.cancelled() {
             self.set_progress(Progress::default());
             report.cancelled = true;
             return report;
         }
+        // Both listings are whole, so a folder missing from one side really is missing there.
+        let dir_cands: BTreeSet<String> = local_dirs
+            .iter()
+            .chain(&cloud_dirs)
+            .cloned()
+            .chain(self.db.all_dir_rows().unwrap_or_default())
+            .collect();
+        let dir_work = self.plan_dirs(
+            dir_cands,
+            &bad,
+            &|p| {
+                if local_dirs.contains(p) {
+                    Some(true)
+                } else {
+                    self.local_dir(p)
+                }
+            },
+            &|p| Some(cloud_dirs.contains(p)),
+        );
+        drop((local_dirs, cloud_dirs));
         for b in &bad {
             self.db.log(
                 "error",
@@ -754,7 +845,79 @@ impl<R: Remote> Engine<R> {
                 from: None,
             });
         }
-        self.run(work, report)
+        self.run(work, dir_work, report)
+    }
+
+    /// Which side has this folder, as `plan_dirs` wants it: `None` when it cannot be told (a link or file holds the
+    /// name, a symlinked parent, an I/O error), never read as "not there".
+    fn local_dir(&self, p: &str) -> Option<bool> {
+        if under_symlink(&self.root, p) {
+            return None;
+        }
+        match fs::symlink_metadata(self.root.join(p)) {
+            Ok(m) => m.is_dir().then_some(true),
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Some(false),
+            Err(_) => None,
+        }
+    }
+
+    /// The folders to compare among `cands`, with what each side shows (`None` = could not tell: left alone). Also left
+    /// alone: unchecked folders, unreadable places (`blocked`), folders with a case-only twin among the candidates
+    /// (Dropbox and OneDrive take them for one folder; the files' own rules sort the names out), and folders the
+    /// rules hide, which `scan` never entered so they read as missing; their rows are dropped.
+    fn plan_dirs(
+        &self,
+        cands: BTreeSet<String>,
+        bad: &[String],
+        local: &dyn Fn(&str) -> Option<bool>,
+        cloud: &dyn Fn(&str) -> Option<bool>,
+    ) -> Vec<DirWork> {
+        let mut out = Vec::new();
+        let mut seen: Vec<DirWork> = Vec::new();
+        for p in cands {
+            if !safe_rel(&p) || excluded(&p, &self.excluded) || blocked(&p, bad) {
+                continue;
+            }
+            if self.ignore.matches_dir(&p) {
+                // A rule now hides a folder we synced: the files in it left the cloud (`DeleteRemote`), and the empty
+                // folders go with them, as the rule is the user's wish. The local folder stays. A mirror or a restore
+                // never writes the cloud: only the row goes.
+                // Only a folder with a row is touched at all (a read): a hidden tree of thousands of cloud folders
+                // would otherwise cost a write for each at every full scan.
+                if self.db.dir_synced(&p).unwrap_or(false) {
+                    if self.download_only || self.restore {
+                        let _ = self.db.forget_dir_row(&p);
+                    } else {
+                        out.push(DirWork {
+                            path: p,
+                            local: false,
+                            cloud: true,
+                            hidden: true,
+                        });
+                    }
+                }
+                continue;
+            }
+            if let (Some(local), Some(cloud)) = (local(&p), cloud(&p)) {
+                seen.push(DirWork {
+                    path: p,
+                    local,
+                    cloud,
+                    hidden: false,
+                });
+            }
+        }
+        // Twins by case only count when a side really has them: the old spelling of a folder renamed by case is a row
+        // with nothing behind it and must be forgotten, not read as a clash (it would be reported at every walk).
+        let mut spellings: HashMap<String, usize> = HashMap::new();
+        for d in seen.iter().filter(|d| d.local || d.cloud) {
+            *spellings.entry(d.path.to_lowercase()).or_default() += 1;
+        }
+        out.extend(
+            seen.into_iter()
+                .filter(|d| spellings.get(&d.path.to_lowercase()).is_none_or(|n| *n <= 1)),
+        );
+        out
     }
 
     /// The folders among `dirs` that get a listing: the top ones only (copying a tree in makes the feed report every new
@@ -762,16 +925,23 @@ impl<R: Remote> Engine<R> {
     /// symlink or not a clean relative path. Compared with `ancestor/`, not by sorting: `a b` sorts between `a` and
     /// `a/b`.
     fn feed_dirs_to_list(&self, dirs: &[String]) -> Vec<String> {
-        let mut sorted: Vec<&String> = dirs.iter().collect();
-        sorted.sort();
-        let mut top: Vec<&String> = Vec::new();
-        for d in sorted {
-            if !top
-                .iter()
-                .any(|a| d.strip_prefix(a.as_str()).is_some_and(|r| r.starts_with('/')))
-            {
-                top.push(d);
+        let mut top = top_dirs(dirs.to_vec());
+        // Too many to list one by one (an archive unpacked in the cloud): list their parents instead, one level up at a
+        // time from the deepest, which is still a part of the cloud, never more than the full scan would read. Only a
+        // set that reaches the top level stays long, and `sync_paths_in` then asks for the full scan.
+        while top.len() > FEED_DIRS_MAX {
+            let deepest = top.iter().map(|d| d.matches('/').count()).max().unwrap_or(0);
+            if deepest == 0 {
+                break;
             }
+            top = top_dirs(
+                top.into_iter()
+                    .map(|d| match d.matches('/').count() == deepest {
+                        true => d.rsplit_once('/').map_or(String::new(), |(p, _)| p.to_string()),
+                        false => d,
+                    })
+                    .collect(),
+            );
         }
         top.into_iter()
             .filter(|d| {
@@ -780,7 +950,6 @@ impl<R: Remote> Engine<R> {
                     && !under_symlink(&self.root, d)
                     && !self.ignore.matches_dir(d)
             })
-            .cloned()
             .collect()
     }
 
@@ -797,14 +966,18 @@ impl<R: Remote> Engine<R> {
         self.case_renames.clear();
         let mut report = Report::default();
         let to_list = self.feed_dirs_to_list(dirs);
-        // Dozens of folders at once (an archive unpacked in the cloud) cost as many listings as the whole cloud has
-        // folders to read at all: one full scan does that with progress and in parallel. Nothing has been touched yet.
+        // Still dozens of folders after climbing to their parents (all at the top level): they cost as many listings
+        // as the cloud has folders to read at all, which one full scan does with progress and in parallel. Nothing has
+        // been touched yet.
         if to_list.len() > FEED_DIRS_MAX {
             report.wants_full = true;
             return report;
         }
         let mut all = BTreeSet::new();
         let mut bad: Vec<String> = Vec::new();
+        // Folders to compare: a reported folder and the ones below it, and the synced folders under every reported path
+        // (a folder deleted here, or in the cloud, is reported as itself).
+        let mut dir_cands: BTreeSet<String> = BTreeSet::new();
         for p in paths {
             if !safe_rel(p) {
                 continue;
@@ -823,7 +996,9 @@ impl<R: Remote> Engine<R> {
                     if !self.ignore.matches_dir(p) {
                         // Paths here are from `abs`, not the root, so the rules cannot judge them in `scan`: the
                         // unchecked folders and `skippable` filter below.
-                        let (files, unreadable) = scan(&abs, &[], &Rules::default());
+                        let (files, dirs, unreadable) = scan(&abs, &[], &Rules::default());
+                        dir_cands.insert(p.clone());
+                        dir_cands.extend(dirs.into_iter().map(|d| format!("{p}/{d}")));
                         all.extend(files.into_keys().map(|f| format!("{p}/{f}")));
                         bad.extend(
                             unreadable
@@ -840,26 +1015,50 @@ impl<R: Remote> Engine<R> {
             // A folder that is gone locally: everything we knew under it.
             all.extend(self.db.under(p).unwrap_or_default());
             all.insert(p.clone());
+            dir_cands.extend(self.db.dir_rows_under(p).unwrap_or_default());
+            // A new rule hides a folder: its files are queued as paths, and its (now empty) cloud folders must follow.
+            // The folders under it are not reported (an empty one has no file): the rows know them.
+            for a in p
+                .match_indices('/')
+                .map(|(i, _)| &p[..i])
+                .chain([p.as_str()])
+                .filter(|a| self.ignore.matches_dir(a))
+            {
+                dir_cands.insert(a.to_string());
+                dir_cands.extend(self.db.dir_rows_under(a).unwrap_or_default());
+            }
         }
         // What the cloud holds in the folders it said changed, listed in one request each, `PARALLEL` at a time. The
         // cache goes first: a folder moved or renamed in the cloud would otherwise still answer under its old path
         // (see `forget_cache`).
         let mut listed: HashMap<String, Item> = HashMap::new();
+        // The folders those listings hold, and the listed ones themselves: a recursive listing is complete, so a
+        // folder under a listed one that it does not show is gone from the cloud.
+        let (mut listed_dirs, mut listed_roots): (HashSet<String>, Vec<String>) = (HashSet::new(), Vec::new());
         if !to_list.is_empty() {
             self.remote.forget_cache();
+        }
+        for d in &to_list {
+            dir_cands.extend(self.db.dir_rows_under(d).unwrap_or_default());
         }
         for (d, res) in list_folders(&self.remote, &to_list, &self.cancel) {
             match res {
                 Ok(items) => {
+                    listed_roots.push(d.clone());
+                    listed_dirs.insert(d.clone());
+                    dir_cands.insert(d.clone());
                     for it in items {
-                        if !it.is_dir && safe_rel(&it.path) {
+                        if it.is_dir && safe_rel(&it.path) {
+                            dir_cands.insert(it.path.clone());
+                            listed_dirs.insert(it.path);
+                        } else if !it.is_dir && safe_rel(&it.path) {
                             listed.insert(it.path.clone(), it);
                         }
                     }
                 }
                 // Created and deleted again before we looked (`.git` temp folders, tool caches): the feed reported
                 // it, the cloud no longer has it. Same proof as in `lookup`: the folder's own `stat` must say gone.
-                Err(e) if folder_gone(&self.remote, &d, &e) => {}
+                Err(e) if folder_gone(&self.remote, &d, &e) => listed_roots.push(d),
                 Err(e) => {
                     // Not knowing what is in it is not "nothing". Only this folder is listed again by the retry, not
                     // the whole cloud (a full scan is minutes on a big one).
@@ -981,7 +1180,53 @@ impl<R: Remote> Engine<R> {
                 }
             }
         }
-        self.run(work, report)
+        let covered = |p: &str| {
+            listed_roots
+                .iter()
+                .any(|d| p == d || p.strip_prefix(d.as_str()).is_some_and(|r| r.starts_with('/')))
+        };
+        // A folder no listing covered is asked for like a file (`lookup`: one listing per parent where that is cheaper).
+        let ask: Vec<String> = dir_cands
+            .iter()
+            .filter(|p| {
+                !covered(p)
+                    && safe_rel(p)
+                    && !excluded(p, &self.excluded)
+                    && !self.ignore.matches_dir(p)
+                    && !blocked(p, &bad)
+                    && self.local_dir(p).is_some()
+            })
+            .cloned()
+            .collect();
+        let mut in_cloud: HashMap<&str, bool> = HashMap::new();
+        for (i, res) in lookup(&self.remote, &self.db, &ask, &self.cancel) {
+            match res {
+                Ok(Some(it)) if it.is_dir => {
+                    in_cloud.insert(&ask[i], true);
+                }
+                Ok(None) => {
+                    in_cloud.insert(&ask[i], false);
+                }
+                // A file holds the name, or only another spelling of it: not ours to judge.
+                Ok(Some(_)) => {}
+                // Only another spelling of the name is there (a folder renamed by case alone, seen from its old
+                // name): a name we had and no longer have here is simply not in the cloud under that spelling.
+                Err(e) if e == CLASH_WHY => {
+                    if self.local_dir(&ask[i]) == Some(false) {
+                        in_cloud.insert(&ask[i], false);
+                    }
+                }
+                Err(e) => report.fail(&ask[i], &e),
+            }
+        }
+        let dir_work = self.plan_dirs(dir_cands, &bad, &|p| self.local_dir(p), &|p| {
+            if covered(p) {
+                Some(listed_dirs.contains(p))
+            } else {
+                in_cloud.get(p).copied()
+            }
+        });
+        self.run(work, dir_work, report)
     }
 
     /// The paths of one run: what inotify reported (minus the echo of our own writes) plus what the cloud's feed
@@ -1012,7 +1257,7 @@ impl<R: Remote> Engine<R> {
 
     /// Paths that changed locally since the DB was written: how edits made while the app was closed are found.
     pub fn local_changes(&self) -> Vec<String> {
-        let (mut local, bad) = scan(&self.root, &self.excluded, &self.ignore);
+        let (mut local, local_dirs, bad) = scan(&self.root, &self.excluded, &self.ignore);
         local.retain(|p, _| !self.skippable(p));
         // A map, not a scan per file: this runs every couple of minutes on trees of 100k files.
         let known: HashMap<String, Base> = self
@@ -1033,10 +1278,29 @@ impl<R: Remote> Engine<R> {
                 .into_keys()
                 .filter(|p| !local.contains_key(p) && !blocked(p, &bad)),
         );
+        // Folders made or removed while the app was closed (an empty one has no file to show it).
+        let rows: HashSet<String> = self.db.all_dir_rows().unwrap_or_default().into_iter().collect();
+        let mut dirs: Vec<String> = local_dirs.iter().filter(|d| !rows.contains(*d)).cloned().collect();
+        dirs.extend(rows.into_iter().filter(|d| {
+            !local_dirs.contains(d) && !excluded(d, &self.excluded) && !self.ignore.matches_dir(d) && !blocked(d, &bad)
+        }));
+        if let Ok(mut seen) = self.dir_reported.lock() {
+            let now = std::time::Instant::now();
+            // Only folders still unsettled are remembered, and the time is set when one first shows up (never
+            // refreshed), so a stuck folder is reported again after the interval and a settled one is forgotten.
+            seen.retain(|k, t| dirs.contains(k) && now.duration_since(*t) < DIR_REPORT_EVERY);
+            out.extend(dirs.into_iter().filter(|d| {
+                let new = !seen.contains_key(d);
+                seen.entry(d.clone()).or_insert(now);
+                new
+            }));
+        } else {
+            out.extend(dirs);
+        }
         out.into_iter().collect()
     }
 
-    fn run(&mut self, mut work: VecDeque<Work>, mut report: Report) -> Report {
+    fn run(&mut self, mut work: VecDeque<Work>, dirs: Vec<DirWork>, mut report: Report) -> Report {
         let mut plan = Vec::new();
         // A mirror trashes local-only files, and a new account has no DB rows to measure the guard against: count
         // the local files of this run too, or pointing it at a full folder would trash everything unchecked.
@@ -1064,7 +1328,8 @@ impl<R: Remote> Engine<R> {
             let base = match self.db.base(&w.path) {
                 Ok(b) => b,
                 Err(e) => {
-                    report.errors.push(format!("{}: {e}", w.path));
+                    // One path's row could not be read: retried by that path, not by a scan of the whole cloud.
+                    report.fail(&w.path, &e.to_string());
                     continue;
                 }
             };
@@ -1124,6 +1389,18 @@ impl<R: Remote> Engine<R> {
         let mut plan = self.pair_moves(plan);
         self.pair_copies(&mut plan);
         self.pair_uploads(&mut plan);
+        // A cloud folder that could not be listed may hold the new name of a folder renamed in the cloud: its old files
+        // read as deleted, with nothing to pair them to, and the guard cannot judge a small share of a big account. They
+        // wait, in the retry with the folder, instead of being trashed and downloaded again.
+        if !report.failed_dirs.is_empty() {
+            plan.retain(|(w, a, _)| {
+                let keep = *a != Action::DeleteLocal;
+                if !keep {
+                    report.fail(&w.path, "a cloud folder could not be listed, so the delete waits");
+                }
+                keep
+            });
+        }
         // Nothing was done yet: a cancel here costs nothing, and the guard must not judge a plan that was cut short.
         if self.cancelled() {
             self.set_progress(Progress::default());
@@ -1148,38 +1425,7 @@ impl<R: Remote> Engine<R> {
             None => delete_guard_ok(deletes, known, GUARD_PERCENT) && !self.folder_wiped(&plan),
         };
         if !allowed {
-            let sample = plan
-                .iter()
-                .filter(|(_, a, _)| matches!(a, Action::DeleteLocal | Action::DeleteRemote))
-                .take(SAMPLE)
-                .map(|(w, ..)| w.path.clone())
-                .collect();
-            // To tell an empty listing (cloud_seen 0) from a different cloud the next time this trips.
-            let remote_deletes = plan.iter().filter(|(_, a, _)| *a == Action::DeleteRemote).count();
-            let line = format!(
-                "{deletes} deletes ({remote_deletes} in the cloud) of {known} known; {paths} paths in this run, {cloud_seen} seen in the cloud"
-            );
-            eprintln!("delete guard: {line}");
-            // Which files, and which side: without it a trip cannot be diagnosed afterwards.
-            let mut listed = line.clone();
-            for (i, (w, a, _)) in plan
-                .iter()
-                .filter(|(_, a, _)| matches!(a, Action::DeleteLocal | Action::DeleteRemote))
-                .enumerate()
-            {
-                let side = if *a == Action::DeleteLocal { "local" } else { "cloud" };
-                eprintln!(
-                    "delete guard:   {side}: {} (local {}, cloud {})",
-                    w.path,
-                    w.local.is_some(),
-                    w.remote.is_some()
-                );
-                if i < SAMPLE {
-                    listed.push_str(&format!("\n{side}: {}", w.path));
-                }
-            }
-            self.db.log("stopped", "", None, &listed);
-            report.aborted = Some((deletes, known, sample));
+            self.report_stop(&plan, known, (paths, cloud_seen), &mut report);
             self.set_progress(Progress::default());
             return report;
         }
@@ -1190,8 +1436,6 @@ impl<R: Remote> Engine<R> {
         let mut plan: VecDeque<_> = plan.into();
         let (mut done, mut total) = (0, plan.len());
         let mut transfers = Vec::new();
-        // Cloud paths that were deleted or moved away this run: their folders may be empty now.
-        let mut gone: Vec<String> = Vec::new();
         while let Some((w, action, base)) = plan.pop_front() {
             if self.cancelled() {
                 break;
@@ -1234,11 +1478,8 @@ impl<R: Remote> Engine<R> {
             match self.exec(&w, action, base) {
                 Ok(extra) => {
                     log_done(&self.db, &w, action, &mut report);
-                    if action == Action::DeleteRemote {
-                        gone.push(w.path.clone());
-                    }
-                    // A conflict leaves the renamed local copy to be uploaded as a new file.
-                    if let Some(e) = extra {
+                    // A conflict leaves its copies to be uploaded.
+                    for e in extra {
                         plan.push_back((e, Action::Upload, None));
                         total += 1;
                     }
@@ -1247,12 +1488,58 @@ impl<R: Remote> Engine<R> {
             }
         }
         // A folder renamed here goes as one cloud call; what that cannot prove stays one move per file.
-        done += self.move_dirs(&mut transfers, (done, total), &mut report, &mut gone);
-        self.run_transfers(transfers, done, total, &mut report, &mut gone);
-        self.prune_cloud_dirs(&gone);
+        let uploads: Vec<String> = transfers
+            .iter()
+            .filter(|(_, a)| matches!(a, Action::Upload | Action::MoveRemote))
+            .map(|(w, _)| w.path.clone())
+            .collect();
+        done += self.move_dirs(&mut transfers, (done, total), &mut report);
+        self.run_transfers(transfers, done, total, &mut report);
+        // After the files: a folder the user deleted is empty by now, and a new one may already exist from a move.
+        self.run_dirs(dirs, &uploads, &mut report);
         self.set_progress(Progress::default());
         report.cancelled = self.cancelled();
         report
+    }
+
+    /// Records a run the delete guard stopped: stderr, the activity log and `Report.aborted`.
+    /// `seen` is (paths in the run, files seen in the cloud).
+    fn report_stop(
+        &self,
+        plan: &[(Work, Action, Option<Base>)],
+        known: usize,
+        seen: (usize, usize),
+        report: &mut Report,
+    ) {
+        let (paths, cloud_seen) = seen;
+        let dels = || {
+            plan.iter()
+                .filter(|(_, a, _)| matches!(a, Action::DeleteLocal | Action::DeleteRemote))
+        };
+        let deletes = dels().count();
+        let sample = dels().take(SAMPLE).map(|(w, ..)| w.path.clone()).collect();
+        // To tell an empty listing (cloud_seen 0) from a different cloud the next time this trips.
+        let remote_deletes = plan.iter().filter(|(_, a, _)| *a == Action::DeleteRemote).count();
+        let line = format!(
+            "{deletes} deletes ({remote_deletes} in the cloud) of {known} known; {paths} paths in this run, {cloud_seen} seen in the cloud"
+        );
+        eprintln!("delete guard: {line}");
+        // Which files, and which side: without it a trip cannot be diagnosed afterwards.
+        let mut listed = line.clone();
+        for (i, (w, a, _)) in dels().enumerate() {
+            let side = if *a == Action::DeleteLocal { "local" } else { "cloud" };
+            eprintln!(
+                "delete guard:   {side}: {} (local {}, cloud {})",
+                w.path,
+                w.local.is_some(),
+                w.remote.is_some()
+            );
+            if i < SAMPLE {
+                listed.push_str(&format!("\n{side}: {}", w.path));
+            }
+        }
+        self.db.log("stopped", "", None, &listed);
+        report.aborted = Some((deletes, known, sample));
     }
 
     /// True when the plan deletes every known file of one top-level folder of `MIN_FILES` or more: a disk mounted
@@ -1275,35 +1562,122 @@ impl<R: Remote> Engine<R> {
             .any(|(top, n)| n >= MIN_FILES && self.db.under(top).is_ok_and(|k| !k.is_empty() && n >= k.len()))
     }
 
-    /// Removes the cloud folders that deleting or moving files out left empty. Sync has no folders of its own, so
-    /// without this the old folder of a moved or emptied one stays in the cloud for ever. Deepest first, so a chain of
-    /// empty folders goes in one pass. `rmdir` only ever removes an empty folder (a full one is an error, ignored
-    /// here), never the synced root, never an unchecked folder.
-    fn prune_cloud_dirs(&self, gone: &[String]) {
-        let mut dirs: Vec<&str> = gone
+    /// Folders, after the files (see `decide_dir`). A removal only ever takes an **empty** folder (`remove_dir`,
+    /// `rmdir`): what is inside went through the file plan and the delete guard first, and a folder that still holds
+    /// something (a file saved meanwhile, a `.DS_Store`) stays and is just forgotten, so nothing retries for ever and
+    /// whatever is in it syncs as files. Removals go deepest first, creations shallowest first. A folder a run
+    /// emptied is *not* removed: only a folder the user deleted is (the official clients behave the same).
+    fn run_dirs(&mut self, dirs: Vec<DirWork>, uploads: &[String], report: &mut Report) {
+        let depth = |p: &str| p.matches('/').count();
+        // A folder with a file that went up this run is in the cloud already (an upload makes its folders): a first sync
+        // of 10k folders must not cost 10k more requests. A failed or postponed upload proves nothing.
+        let unproven: HashSet<&String> = report.failed.iter().chain(&report.later).collect();
+        let made: HashSet<String> = uploads
             .iter()
-            .flat_map(|p| p.rmatch_indices('/').map(move |(i, _)| &p[..i]))
-            .filter(|d| !excluded(d, &self.excluded))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
+            .filter(|u| !unproven.contains(u))
+            .flat_map(|u| u.match_indices('/').map(|(i, _)| u[..i].to_string()))
             .collect();
-        dirs.sort_by_key(|d| std::cmp::Reverse(d.matches('/').count()));
+        let mut removals = Vec::new();
+        let mut creations = Vec::new();
         for d in dirs {
-            let _ = self.remote.remove_empty_dir(d);
+            let synced = match self.db.dir_synced(&d.path) {
+                Ok(s) => s,
+                Err(e) => {
+                    report.fail(&d.path, &e.to_string());
+                    continue;
+                }
+            };
+            let action = if d.hidden {
+                DirAction::RemoveCloud
+            } else {
+                decide_dir(d.local, d.cloud, synced, self.download_only, self.restore)
+            };
+            let res = match action {
+                DirAction::None => Ok(()),
+                DirAction::Adopt => self.db.add_dir_row(&d.path),
+                DirAction::Forget => self.db.forget_dir_row(&d.path),
+                a @ (DirAction::RemoveLocal | DirAction::RemoveCloud) => {
+                    removals.push((d.path, a));
+                    continue;
+                }
+                a => {
+                    creations.push((d.path, a));
+                    continue;
+                }
+            };
+            if let Err(e) = res {
+                report.fail(&d.path, &e.to_string());
+            }
+        }
+        removals.sort_by_key(|(p, _)| std::cmp::Reverse(depth(p)));
+        creations.sort_by_key(|(p, _)| depth(p));
+        for (path, action) in removals.into_iter().chain(creations) {
+            if self.cancelled() {
+                return;
+            }
+            let res = if action == DirAction::MakeCloud && made.contains(&path) {
+                self.db.add_dir_row(&path).map_err(|e| e.to_string())
+            } else {
+                self.dir_action(&path, action)
+            };
+            if let Err(e) = res {
+                self.db.log("error", &path, None, &e);
+                report.fail(&path, &e);
+            }
+        }
+    }
+
+    fn dir_action(&self, path: &str, action: DirAction) -> Result<()> {
+        let abs = self.root.join(path);
+        let row = |r: rusqlite::Result<()>| r.map_err(|e| e.to_string());
+        match action {
+            DirAction::RemoveLocal => {
+                // Behind a symlinked parent the path is outside what we sync. Not empty, already gone or taken by a
+                // file: it stays or is gone, and is forgotten (see `run_dirs`). Any other failure (no permission) is
+                // retried: a forgotten row would make the folder go back up to the cloud it was deleted from.
+                if !under_symlink(&self.root, path)
+                    && let Err(e) = fs::remove_dir(&abs)
+                    && !matches!(
+                        e.kind(),
+                        ErrorKind::NotFound | ErrorKind::NotADirectory | ErrorKind::DirectoryNotEmpty
+                    )
+                {
+                    return Err(e.to_string());
+                }
+                row(self.db.forget_dir_row(path))
+            }
+            DirAction::RemoveCloud => {
+                // "Not empty" is the answer for a folder that holds something we cannot see (or a file added meanwhile):
+                // it stays and is just forgotten. Any other failure with the folder still there is retried, or the
+                // folder the user deleted would come back at the next scan.
+                // The wording differs by provider, so a failure that does not say it is checked by looking inside.
+                if let Err(e) = self.remote.remove_empty_dir(path)
+                    && !e.to_lowercase().contains("not empty")
+                    && self.remote.stat(path)?.is_some()
+                    && self.remote.list_dir(path)?.is_empty()
+                {
+                    return Err(e);
+                }
+                row(self.db.forget_dir_row(path))
+            }
+            DirAction::MakeLocal => {
+                if under_symlink(&self.root, path) {
+                    return Ok(());
+                }
+                fs::create_dir_all(&abs).map_err(|e| e.to_string())?;
+                row(self.db.add_dir_row(path))
+            }
+            DirAction::MakeCloud => {
+                self.remote.make_dir(path)?;
+                row(self.db.add_dir_row(path))
+            }
+            _ => Ok(()),
         }
     }
 
     /// The uploads and downloads of a run, `PARALLEL` at a time. Only the cloud calls and file moves run in the
     /// workers; every DB write, log line and counter stays on this thread (the DB has a single connection).
-    /// `gone`: gets the cloud path a finished move left (for `prune_cloud_dirs`).
-    fn run_transfers(
-        &mut self,
-        jobs: Vec<(Work, Action)>,
-        done: usize,
-        total: usize,
-        report: &mut Report,
-        gone: &mut Vec<String>,
-    ) {
+    fn run_transfers(&mut self, jobs: Vec<(Work, Action)>, done: usize, total: usize, report: &mut Report) {
         if jobs.is_empty() {
             return;
         }
@@ -1376,9 +1750,6 @@ impl<R: Remote> Engine<R> {
                 match saved {
                     Ok(true) => {
                         log_done(db, &w, action, report);
-                        if let (Action::MoveRemote, Some(f)) = (action, &w.from) {
-                            gone.push(f.path.clone());
-                        }
                     }
                     Ok(false) => {}
                     Err(e) => log_failed(db, &w, &e, report),
@@ -1388,7 +1759,8 @@ impl<R: Remote> Engine<R> {
         });
     }
 
-    fn exec(&mut self, w: &Work, action: Action, base: Option<Base>) -> Result<Option<Work>> {
+    /// What else must go up after the action: a conflict leaves its copies (see `Action::Conflict`).
+    fn exec(&mut self, w: &Work, action: Action, base: Option<Base>) -> Result<Vec<Work>> {
         let db = |e: rusqlite::Error| e.to_string();
         let (path, rid) = (w.path.as_str(), w.remote.as_ref().map_or("", |r| r.id.as_str()));
         refuse(&self.root, self.download_only, path, action)?;
@@ -1435,17 +1807,44 @@ impl<R: Remote> Engine<R> {
                     .map(|n| conflict_name(path, &date, n))
                     .find(|c| !self.root.join(c).exists())
                     .unwrap_or_default();
+                // The older of the two gets the `(conflict)` name: the newer one is most likely what the user wants
+                // under the real name. Within `NEWER_BY_MS` (a provider's whole seconds) the cloud keeps it.
+                if w.local.is_some_and(|l| l.mtime > r.mtime + NEWER_BY_MS) {
+                    // The cloud's older version goes beside it; the local one stays and goes up over the cloud's.
+                    fetch_to(&self.remote, &self.root, path, &aside, None, r, None)?;
+                    // The row reads "local still as the cloud's, then edited": whatever stops the upload below, the
+                    // next scan sees an ordinary local edit, not another conflict with another copy of the old file.
+                    let base = Base {
+                        local: sig_item(r),
+                        remote: sig_item(r),
+                    };
+                    self.db.set(path, &base, rid).map_err(db)?;
+                    return Ok(vec![
+                        Work {
+                            local: local_sig(&self.root, path),
+                            remote: Some(r.clone()),
+                            from: None,
+                            path: path.to_string(),
+                        },
+                        Work {
+                            local: local_sig(&self.root, &aside),
+                            remote: None,
+                            from: None,
+                            path: aside,
+                        },
+                    ]);
+                }
                 fs::rename(self.root.join(path), self.root.join(&aside)).map_err(|e| e.to_string())?;
                 self.download(path, None, r)?;
-                return Ok(Some(Work {
+                return Ok(vec![Work {
                     local: local_sig(&self.root, &aside),
                     remote: None,
                     from: None,
                     path: aside,
-                }));
+                }]);
             }
         }
-        Ok(None)
+        Ok(Vec::new())
     }
 
     fn download(&mut self, path: &str, expect_local: Option<Sig>, r: &Item) -> Result<()> {
@@ -1453,22 +1852,34 @@ impl<R: Remote> Engine<R> {
         self.db.set(path, &b, &id).map_err(|e| e.to_string())
     }
 
-    /// Moves a file to `.fastsync/trash/<time>/<path>` (same filesystem, so a rename), then removes the empty
-    /// folders it leaves behind.
+    /// Moves a file to `.fastsync/trash/<time>/<path>`. Its folder stays, empty or not (folders are synced).
     fn trash(&self, rel: &str) -> std::io::Result<()> {
-        let batch = trash_dir(&self.root).join(now_secs().to_string());
-        let mut dest = batch.join(rel);
-        // `rename` replaces a file: the same path trashed twice in one second must not eat the first copy.
-        for n in 1.. {
-            if fs::symlink_metadata(&dest).is_err() {
-                break;
-            }
-            dest = batch.join(format!("{rel}.{n}"));
+        trash_move(&self.root, &self.root.join(rel), rel)
+    }
+}
+
+/// Moves the file `src` to `.fastsync/trash/<time>/<rel>`: a rename, or copy + remove when `src` is on another file
+/// system (a disk mounted inside the synced folder).
+fn trash_move(root: &Path, src: &Path, rel: &str) -> std::io::Result<()> {
+    let batch = trash_dir(root).join(now_secs().to_string());
+    let mut dest = batch.join(rel);
+    // `rename` replaces a file: the same path trashed twice in one second must not eat the first copy.
+    for n in 1.. {
+        if fs::symlink_metadata(&dest).is_err() {
+            break;
         }
-        fs::create_dir_all(dest.parent().unwrap_or(&self.root))?;
-        fs::rename(self.root.join(rel), dest)?;
-        prune_empty(&self.root, rel);
-        Ok(())
+        dest = batch.join(format!("{rel}.{n}"));
+    }
+    fs::create_dir_all(dest.parent().unwrap_or(root))?;
+    match fs::rename(src, &dest) {
+        Err(e) if e.kind() == ErrorKind::CrossesDevices => {
+            copy_with_time(src, &dest)?;
+            // The copy is only the trash copy once the original is gone.
+            fs::remove_file(src).inspect_err(|_| {
+                let _ = fs::remove_file(&dest);
+            })
+        }
+        r => r,
     }
 }
 
@@ -1579,7 +1990,6 @@ fn transfer<R: Remote>(
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             fs::rename(root.join(&from.path), &dest).map_err(|e| e.to_string())?;
-            prune_empty(root, &from.path);
             let l = local_sig(root, &w.path).ok_or("moved file not found")?;
             Ok((
                 Base {
@@ -1723,7 +2133,8 @@ fn make_link<R: Remote>(
     }
 }
 
-/// Removes the empty folders a file left behind, up to (not including) the synced folder.
+/// Removes the empty folders a file left behind, up to (not including) the synced folder. Only for a folder the user
+/// unticked (it leaves the disk); elsewhere an emptied folder stays, like the official clients keep it.
 fn prune_empty(root: &Path, rel: &str) {
     let mut dir = root.join(rel);
     while dir.pop() && dir != root && fs::remove_dir(&dir).is_ok() {}
@@ -1734,6 +2145,19 @@ fn fetch<R: Remote>(
     remote: &R,
     root: &Path,
     path: &str,
+    expect_local: Option<Sig>,
+    r: &Item,
+    copy_of: Option<&Moved>,
+) -> Result<(Base, String)> {
+    fetch_to(remote, root, path, path, expect_local, r, copy_of)
+}
+
+/// `fetch` of the cloud file `path` into the local file `local` (another name only for a conflict copy of it).
+fn fetch_to<R: Remote>(
+    remote: &R,
+    root: &Path,
+    path: &str,
+    local: &str,
     expect_local: Option<Sig>,
     r: &Item,
     copy_of: Option<&Moved>,
@@ -1751,10 +2175,10 @@ fn fetch<R: Remote>(
             remote.download(path, &tmp)?;
         }
         // The user edited it while it downloaded: keep their edit, the next run sorts it out.
-        if local_sig(root, path) != expect_local {
+        if local_sig(root, local) != expect_local {
             return Err(CHANGED.into());
         }
-        let dest = root.join(path);
+        let dest = root.join(local);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
@@ -1766,18 +2190,49 @@ fn fetch<R: Remote>(
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                     Err("a file or link with this name appeared here, not replaced".into())
                 }
-                // A file system without hard links: the plain rename (the old, tiny window).
-                Err(_) => fs::rename(&tmp, &dest).map_err(|e| e.to_string()),
+                // A file system without hard links, or another one than `.fastsync/tmp` (a disk mounted inside the
+                // folder): the plain rename (the old, tiny window).
+                Err(_) => rename_over(&tmp, &dest),
             }
         } else {
-            fs::rename(&tmp, &dest).map_err(|e| e.to_string())
+            // Overwriting a file we synced: take it out of the way first and look at it, so an edit saved between the
+            // check above and now is put back (or trashed), never replaced.
+            let old = tmp_dir.join(format!("{}-{}-{n}.old", std::process::id(), now_secs()));
+            if fs::rename(&dest, &old).is_err() {
+                // Cannot be set aside (another file system): the plain rename, with its tiny window.
+                return rename_over(&tmp, &dest);
+            }
+            let kept = fs::symlink_metadata(&old).is_ok_and(|m| m.is_file() && Some(sig_of(&m)) == expect_local);
+            let result = if kept {
+                let put = match fs::hard_link(&tmp, &dest) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                        Err("a file with this name appeared here, not replaced".into())
+                    }
+                    Err(_) => rename_over(&tmp, &dest),
+                };
+                // Nothing new went in: the old file goes back (unless the name is taken again), so a failure never
+                // leaves the folder without it.
+                if put.is_err() {
+                    let _ = fs::hard_link(&old, &dest);
+                }
+                put
+            } else {
+                // Edited meanwhile: the edit goes back, or to the trash when the name is taken again.
+                if fs::hard_link(&old, &dest).is_err() {
+                    trash_move(root, &old, local).map_err(|e| e.to_string())?;
+                }
+                Err(CHANGED.into())
+            };
+            let _ = fs::remove_file(&old);
+            result
         }
     })();
     // Whatever happened, no temp copy stays behind: a retried failure would otherwise leave one full-size file per
     // try until the next start. (After a rename there is nothing to remove.)
     let _ = fs::remove_file(&tmp);
     placed?;
-    let l = local_sig(root, path).ok_or("downloaded file not found")?;
+    let l = local_sig(root, local).ok_or("downloaded file not found")?;
     Ok((
         Base {
             local: l,
@@ -1785,6 +2240,37 @@ fn fetch<R: Remote>(
         },
         r.id.clone(),
     ))
+}
+
+/// `fs::rename`, or, when `dest` is on another file system than `tmp` (a disk mounted inside the folder), a copy to a
+/// hidden name beside `dest` (ignored by `scan`: `.part`) and a rename from there.
+fn rename_over(tmp: &Path, dest: &Path) -> Result<()> {
+    match fs::rename(tmp, dest) {
+        Err(e) if e.kind() == ErrorKind::CrossesDevices => {
+            let mut name = dest.file_name().unwrap_or_default().to_os_string();
+            name.push(".fastsync.part");
+            let part = dest.with_file_name(name);
+            copy_with_time(tmp, &part)
+                .and_then(|()| fs::rename(&part, dest))
+                .inspect_err(|_| {
+                    let _ = fs::remove_file(&part);
+                })
+        }
+        r => r,
+    }
+    .map_err(|e| e.to_string())
+}
+
+/// `fs::copy` that also keeps the modified time (the sync compares it).
+fn copy_with_time(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::copy(src, dst)?;
+    if let Ok(t) = fs::metadata(src).and_then(|m| m.modified()) {
+        let _ = fs::File::options()
+            .write(true)
+            .open(dst)
+            .and_then(|f| f.set_modified(t));
+    }
+    Ok(())
 }
 
 /// Copies the synced local file `from` to `tmp` with the cloud file's time. The source must be unchanged before and

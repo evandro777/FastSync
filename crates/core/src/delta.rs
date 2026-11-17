@@ -12,7 +12,7 @@ pub type Token = Box<dyn Fn() -> Result<String> + Send>;
 
 /// One changed entry. Dropbox reports paths (`path`, relative to the synced folder); Drive and OneDrive report
 /// ids, so the name and the parent id are needed to find the path.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Change {
     pub id: String,
     pub name: String,
@@ -468,14 +468,20 @@ pub struct Impact {
     /// these, which is one request, instead of the whole cloud, which is minutes. Every folder FastSync uploads into
     /// comes back through the feed this way.
     pub dirs: Vec<String>,
-    /// A folder was created, moved or renamed and only the whole cloud can tell what changed (Drive and OneDrive
-    /// report ids, so the new paths are unknown), or a big batch of deletions that may be half of a move.
+    /// A known folder was moved, renamed or deleted and only the whole cloud can tell what changed (Drive and OneDrive
+    /// report ids, so the new paths are unknown).
     pub full_scan: bool,
+    /// Folders created in this batch (Drive/OneDrive: id, path), to be added to the folder map the runner keeps, so the
+    /// next batch finds their children and a later echo of the folder is not read as a move.
+    pub new_dirs: Vec<(String, String)>,
+    /// A big batch of deletions: it may be the first half of a folder renamed in the cloud, whose new name arrives in
+    /// the next batch. The runner holds the run for one poll so both halves are one run, where the moves are paired.
+    pub mass_delete: bool,
 }
 
-/// Deletions in one batch that make the engine look at the whole cloud: a folder renamed in the cloud can arrive as its
-/// deletions first and the new name in a later batch, which only a full scan sees at once and pairs as a move. A
-/// smaller batch goes by path: at worst a split move of fewer files is trashed here and downloaded again.
+/// Deletions in one batch that the runner holds for one poll (`Impact.mass_delete`): a folder renamed in the cloud can
+/// arrive as its deletions first and the new name in a later batch. A smaller batch goes by path at once: at worst a
+/// split move of fewer files is trashed here and downloaded again.
 const SPLIT_MOVE_MIN: usize = 50;
 
 /// `dirs` maps folder id -> path inside the synced folder; `root` is the synced folder's own id; `path_of_id`
@@ -486,12 +492,46 @@ pub fn impact(
     root: Option<&str>,
     path_of_id: impl Fn(&str) -> Option<String>,
 ) -> Impact {
-    // shortcut: a smaller batch of deletions goes by path (see `SPLIT_MOVE_MIN`); raise the cost of a split move
-    // only if folders of more than 50 files are often renamed in the cloud and the re-download shows.
     let mut out = Impact {
-        full_scan: changes.iter().filter(|c| c.removed).count() >= SPLIT_MOVE_MIN,
+        mass_delete: changes.iter().filter(|c| c.removed).count() >= SPLIT_MOVE_MIN,
         ..Default::default()
     };
+    // Folders this batch creates under a folder we know (or under each other): their paths follow from the parent's, so
+    // they are listed alone like Dropbox's, not a reason to read the whole cloud. Every folder FastSync uploads comes
+    // back through the feed this way. Repeated until no more resolve, as a child may come before its parent.
+    let mut fresh: HashMap<String, String> = HashMap::new();
+    loop {
+        let mut grew = false;
+        for c in changes
+            .iter()
+            .filter(|c| c.path.is_none() && c.is_dir && !c.removed && !dirs.contains_key(&c.id))
+        {
+            if fresh.contains_key(&c.id) {
+                continue;
+            }
+            let base = if Some(c.parent.as_str()) == root {
+                Some(String::new())
+            } else {
+                dirs.get(&c.parent).or_else(|| fresh.get(&c.parent)).cloned()
+            };
+            if let Some(base) = base {
+                let path = if base.is_empty() {
+                    c.name.clone()
+                } else {
+                    format!("{base}/{}", c.name)
+                };
+                out.paths.push(path.clone());
+                out.dirs.push(path.clone());
+                fresh.insert(c.id.clone(), path);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    out.new_dirs = fresh.iter().map(|(i, p)| (i.clone(), p.clone())).collect();
+    out.new_dirs.sort();
     for c in changes {
         if let Some(p) = &c.path {
             // A new or moved Dropbox folder: what is inside it is not reported, so that folder is listed (and the
@@ -505,7 +545,7 @@ pub fn impact(
         let parent = if Some(c.parent.as_str()) == root {
             Some("")
         } else {
-            dirs.get(&c.parent).map(String::as_str)
+            dirs.get(&c.parent).or_else(|| fresh.get(&c.parent)).map(String::as_str)
         };
         // A deleted folder arrives without its folder facet (Drive `removed`, OneDrive `deleted`), so a known folder
         // id counts whatever the entry says it is.
@@ -524,7 +564,12 @@ pub fn impact(
             }
             continue;
         }
+        // Listed above, with everything inside it.
+        if fresh.contains_key(&c.id) {
+            continue;
+        }
         if c.is_dir {
+            // A folder that is gone or came from nowhere we know: only the whole cloud can say where it went.
             out.full_scan |= parent.is_some();
             continue;
         }
@@ -685,7 +730,9 @@ mod tests {
             Impact {
                 paths: vec!["a.txt".into(), "docs/b.txt".into()],
                 dirs: vec![],
-                full_scan: false
+                full_scan: false,
+                mass_delete: false,
+                new_dirs: vec![]
             }
         );
         // Renamed inside the folder: the new and the old path.
@@ -696,7 +743,38 @@ mod tests {
         );
         // Deleted: only the id is reported, the DB knows the path.
         assert_eq!(impact(&[removed], &dirs, Some("R"), known).paths, ["docs/was.txt"]);
-        assert!(impact(&[new_dir], &dirs, Some("R"), known).full_scan);
+        // A new folder under a known one is listed alone (and remembered), not a scan of the whole cloud; one inside
+        // it, reported before it in the same batch, resolves too, and so does a file inside that.
+        let sub = impact(std::slice::from_ref(&new_dir), &dirs, Some("R"), known);
+        assert!(!sub.full_scan);
+        assert_eq!(
+            (sub.dirs, sub.paths, sub.new_dirs),
+            (
+                vec!["docs/sub".to_string()],
+                vec!["docs/sub".to_string()],
+                vec![("N".to_string(), "docs/sub".to_string())]
+            )
+        );
+        let deep = Change {
+            is_dir: true,
+            ..ch("M", "deep", "N")
+        };
+        let inside = impact(&[deep, new_dir, ch("h", "c.txt", "M")], &dirs, Some("R"), known);
+        assert!(!inside.full_scan);
+        assert_eq!(inside.dirs, ["docs/sub", "docs/sub/deep"]);
+        assert_eq!(inside.paths, ["docs/sub", "docs/sub/deep", "docs/sub/deep/c.txt"]);
+        assert_eq!(inside.new_dirs.len(), 2);
+        // The same folder reported again once it is known (an echo of the upload that made it): nothing to do.
+        let dirs_now: HashMap<String, String> = inside.new_dirs.iter().cloned().chain(dirs.clone()).collect();
+        let echo = Change {
+            is_dir: true,
+            ..ch("N", "sub", "D")
+        };
+        let again = impact(&[echo], &dirs_now, Some("R"), known);
+        assert_eq!(
+            (again.full_scan, again.paths, again.dirs, again.new_dirs),
+            (false, vec![], vec![], vec![])
+        );
         assert!(
             !impact(&[other_dir], &dirs, Some("R"), known).full_scan,
             "a folder elsewhere in the drive is not ours"
@@ -762,7 +840,9 @@ mod tests {
                 })
                 .collect()
         };
-        assert!(!impact(&deleted(SPLIT_MOVE_MIN - 1), &HashMap::new(), None, none).full_scan);
-        assert!(impact(&deleted(SPLIT_MOVE_MIN), &HashMap::new(), None, none).full_scan);
+        assert!(!impact(&deleted(SPLIT_MOVE_MIN - 1), &HashMap::new(), None, none).mass_delete);
+        let big = impact(&deleted(SPLIT_MOVE_MIN), &HashMap::new(), None, none);
+        // Held for one poll by the runner, never a whole-cloud listing by itself.
+        assert!(big.mass_delete && !big.full_scan);
     }
 }

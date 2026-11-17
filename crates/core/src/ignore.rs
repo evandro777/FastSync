@@ -80,6 +80,51 @@ impl Rules {
     }
 }
 
+/// What a change of the rules can do to the names they hide (`Rules::change`).
+#[derive(Debug, PartialEq)]
+pub enum Change {
+    /// Only hiding rules were added (or nothing changed): nothing that was hidden is visible now, so no cloud or local
+    /// listing is needed, only the synced files that now match.
+    HidesMore,
+    /// Anchored folders or files (`gen/api`, no wildcard) lost their hiding rule: what lies under these names may be
+    /// visible now, nothing else.
+    Unhides(Vec<String>),
+}
+
+impl Rules {
+    /// How `new` differs from `self` (the old rules), or `None` when that cannot be said without looking at everything
+    /// (an un-hidden name that is not a literal path, a rule that was reordered or turned into a `!`). The last matching
+    /// rule decides, so order matters: an added hiding rule can never show a name, a removed one shows only what it
+    /// matched, and anything else is a full scan.
+    pub fn change(&self, new: &Rules) -> Option<Change> {
+        if let Some(added) = extra(&self.0, &new.0) {
+            return added.iter().all(|r| !r.negate).then_some(Change::HidesMore);
+        }
+        let removed = extra(&new.0, &self.0)?;
+        let literal =
+            |r: &Rule| !r.negate && !r.glob.iter().any(|c| matches!(c, '*' | '?' | '[' | '\\')) && !r.glob.is_empty();
+        removed
+            .iter()
+            .all(|r| literal(r))
+            .then(|| Change::Unhides(removed.iter().map(|r| r.glob.iter().collect()).collect()))
+    }
+}
+
+/// The rules of `big` that are left when `small` is taken out in order, or `None` when `small` is not in `big` in that
+/// order. Greedy matching finds a subsequence whenever there is one.
+fn extra<'a>(small: &[Rule], big: &'a [Rule]) -> Option<Vec<&'a Rule>> {
+    let mut want = small.iter().peekable();
+    let mut left = Vec::new();
+    for r in big {
+        if want.peek() == Some(&r) {
+            want.next();
+        } else {
+            left.push(r);
+        }
+    }
+    want.peek().is_none().then_some(left)
+}
+
 /// (pattern left, text left) pairs that are known not to match. Every call below gets a suffix of the same pattern and
 /// text, so the two lengths name the state exactly.
 type Failed = std::collections::HashSet<(usize, usize)>;
@@ -209,6 +254,31 @@ mod tests {
     fn a_trailing_slash_matches_folders_only() {
         assert!(m("build/", "build/out.bin") && m("build/", "a/build/out.bin"));
         assert!(!m("build/", "build"));
+    }
+
+    #[test]
+    fn a_change_of_rules_says_what_it_can_show_or_asks_for_everything() {
+        let change = |old: &str, new: &str| Rules::parse(old).change(&Rules::parse(new));
+        // Only hiding rules added (anywhere), or only a comment changed: nothing becomes visible.
+        assert_eq!(change("*.log\n", "*.log\n*.tmp\n"), Some(Change::HidesMore));
+        assert_eq!(
+            change("a/b\n!keep\n", "x\na/b\n*.tmp\n!keep\n"),
+            Some(Change::HidesMore)
+        );
+        assert_eq!(change("*.log\n", "# note\n*.log\n"), Some(Change::HidesMore));
+        // A literal anchored rule removed: only what lies under that name can show.
+        assert_eq!(
+            change("gen/api\n/build/\nx\n", "x\n"),
+            Some(Change::Unhides(vec!["gen/api".into(), "build".into()]))
+        );
+        // Everything else needs the whole cloud: a wildcard or unanchored name removed, a `!` added or removed, a
+        // reorder (the last rule wins: the same lines can show a file that was hidden), a mix.
+        assert_eq!(change("*.log\n", ""), None);
+        assert_eq!(change("node_modules/\n", ""), None);
+        assert_eq!(change("", "!keep\n"), None);
+        assert_eq!(change("a/b\n!a/b/c\n", "a/b\n"), None);
+        assert_eq!(change("!keep.log\n*.log\n", "*.log\n!keep.log\n"), None);
+        assert_eq!(change("a/b\n", "c/d\n"), None);
     }
 
     #[test]

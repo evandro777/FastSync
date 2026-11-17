@@ -7,7 +7,7 @@ use zbus::{
 };
 
 /// What a click does: gets the action's key (`default` is a click on the notification itself).
-type Handler = Box<dyn Fn(&str) + Send>;
+type Handler = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Best effort: no session bus or no notification server means no notification, never an error. `actions` are
 /// (key, label) buttons; `default` is also sent so a click on the body is reported (its label is not shown).
@@ -15,9 +15,9 @@ pub fn send(
     summary: &str,
     body: &str,
     actions: Vec<(&'static str, String)>,
-    on_action: impl Fn(&str) + Send + 'static,
+    on_action: impl Fn(&str) + Send + Sync + 'static,
 ) {
-    if let Err(e) = try_send(summary, body, actions, Box::new(on_action)) {
+    if let Err(e) = try_send(summary, body, actions, std::sync::Arc::new(on_action)) {
         eprintln!("no notification ({e})");
     }
 }
@@ -43,20 +43,16 @@ fn listen(bus: &Connection) -> zbus::Result<()> {
     std::thread::spawn(move || {
         for m in clicks {
             if let Ok((id, key)) = m.body().deserialize::<(u32, String)>() {
-                // Taken out while it runs: a handler may send a notification itself.
+                // Cloned out, the lock is not held while it runs (a handler may send a notification itself). It
+                // stays in the map for a second button; only `NotificationClosed` removes it, so a close during
+                // the click cannot leave one behind.
                 let h = HANDLERS
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .as_mut()
-                    .and_then(|h| h.remove(&id));
+                    .as_ref()
+                    .and_then(|h| h.get(&id).cloned());
                 if let Some(h) = h {
                     h(&key);
-                    // A second button on the same notification may still be clicked.
-                    HANDLERS
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get_or_insert_default()
-                        .insert(id, h);
                 }
             }
         }
@@ -127,7 +123,7 @@ mod tests {
             "FastSync test",
             "If you see this, notifications work.",
             vec![],
-            Box::new(|_| {}),
+            std::sync::Arc::new(|_| {}),
         )
         .unwrap();
     }

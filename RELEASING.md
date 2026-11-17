@@ -4,8 +4,7 @@ Releases are Git tags. CI builds the AppImage (+ `.zsync`) and the Flatpak, publ
 
 1. Pick the version (`0.2.0`). Update:
     - [Cargo.toml](./Cargo.toml) → `version`
-    - [io.github.evandro777.FastSync.metainfo.xml](./packaging/io.github.evandro777.FastSync.metainfo.xml) → add a `<release version="0.2.0" date="YYYY-MM-DD">` entry with notes (newest first)
-      (newest first). `flatpak.yml` fails the tag without it.
+    - [io.github.evandro777.FastSync.metainfo.xml](./packaging/io.github.evandro777.FastSync.metainfo.xml) → add a `<release version="0.2.0" date="YYYY-MM-DD">` entry with notes (newest first). `flatpak.yml` fails the tag without it.
 2. Run `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test && cargo audit`
     - It will update `Cargo.lock` follows the new version (CI uses `--locked` and fails on a stale lock). Commit both.
 3. Stage the files, commit and push, and Merge to `master` through a pull request, wait for CI.
@@ -43,8 +42,8 @@ Actions and settings, that needs to be done once.
     - `flatpak/signing-key.b64` is the **public** half, committed, users check signatures with it.
     - CI needs the **private** half to sign each release, so store it as a secret named `FLATPAK_GPG_PRIVATE_KEY`
 - Settings → Secrets and variables → Actions → New repository secret
-    - `Name`: `FLATPAK_GPG_PRIVATE_KEY`
-    - `Secret`: Paste the contents of the private key, whole file, from `-----BEGIN PGP PRIVATE KEY BLOCK-----` to the `END` line, as the secret's value
+    - Name: `FLATPAK_GPG_PRIVATE_KEY`
+    - Secret: Paste the contents of the private key, whole file, from `-----BEGIN PGP PRIVATE KEY BLOCK-----` to the `END` line, as the secret's value
     - **Never commit the private file!** GitHub will not show the secret again, so keep a private backup (a password manager); if the key is lost, a new key breaks every user's existing remote and they must re-add it.
 
 ### Embedded OAuth client (Google Drive, Dropbox and OneDrive)

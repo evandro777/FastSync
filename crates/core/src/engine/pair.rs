@@ -256,7 +256,6 @@ impl<R: Remote> Engine<R> {
         jobs: &mut Vec<(Work, Action)>,
         (done, total): (usize, usize),
         report: &mut Report,
-        gone: &mut Vec<String>,
     ) -> usize {
         let mut groups: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
         for (i, (w, a)) in jobs.iter().enumerate() {
@@ -323,10 +322,7 @@ impl<R: Remote> Engine<R> {
                 let base = Base { local: l, remote: sig };
                 // The new row first, as in `run_transfers`.
                 match self.db.set(&w.path, &base, &id).and_then(|()| self.db.forget(&f.path)) {
-                    Ok(()) => {
-                        log_done(&self.db, w, Action::MoveRemote, report);
-                        gone.push(f.path.clone());
-                    }
+                    Ok(()) => log_done(&self.db, w, Action::MoveRemote, report),
                     Err(e) => log_failed(&self.db, w, &e.to_string(), report),
                 }
                 finished.insert(i);

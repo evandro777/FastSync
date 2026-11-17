@@ -33,12 +33,7 @@ fn sync_through_rclone_both_ways() {
     let exclude = fastsync_core::rclone::exclusions("onedrive");
     let mut engine = Engine::new(
         local.clone(),
-        RcloneRemote {
-            rc,
-            fs: fs_name,
-            exclude,
-            dropbox: false,
-        },
+        RcloneRemote::new(rc, fs_name, exclude, false),
         Db::memory().unwrap(),
     );
 
@@ -102,19 +97,26 @@ fn sync_through_rclone_both_ways() {
     assert_eq!(fs::metadata(local.join("renamed/down.txt")).unwrap().ino(), ino);
     assert!(!local.join("sub").exists());
 
-    // A folder emptied by a delete goes in the cloud too (`operations/rmdir`); one that still holds a file stays.
+    // A folder emptied by a delete stays on both sides; one the user then deletes goes in the cloud too
+    // (`operations/rmdir`), and a new empty folder is made there (`operations/mkdir`).
     fs::create_dir_all(local.join("gone/deep")).unwrap();
     fs::write(local.join("gone/deep/x.txt"), "x").unwrap();
     fs::write(local.join("gone/stay.txt"), "stay").unwrap();
+    fs::create_dir_all(local.join("empty/nested")).unwrap();
     let r = engine.full_scan();
     assert!(r.errors.is_empty(), "{r:?}");
+    assert!(remote.join("empty/nested").is_dir());
     fs::remove_file(local.join("gone/deep/x.txt")).unwrap();
     let r = engine.full_scan();
     assert!(r.errors.is_empty() && r.aborted.is_none(), "{r:?}");
     assert!(
-        !remote.join("gone/deep").exists(),
+        remote.join("gone/deep").is_dir(),
         "the emptied folder stays in the cloud"
     );
+    fs::remove_dir(local.join("gone/deep")).unwrap();
+    let r = engine.full_scan();
+    assert!(r.errors.is_empty() && r.aborted.is_none(), "{r:?}");
+    assert!(!remote.join("gone/deep").exists());
     assert!(remote.join("gone/stay.txt").exists());
     let _ = fs::remove_dir_all(&base);
 }
@@ -136,12 +138,7 @@ fn many_new_files_in_a_new_cloud_folder_upload_through_rclone() {
     let rc = Arc::new(Rclone::start(&base.join("rclone.conf")).expect("rclone rcd starts"));
     let mut engine = Engine::new(
         local.clone(),
-        RcloneRemote {
-            rc,
-            fs: remote.to_string_lossy().to_string(),
-            exclude: vec![],
-            dropbox: false,
-        },
+        RcloneRemote::new(rc, remote.to_string_lossy().to_string(), vec![], false),
         Db::memory().unwrap(),
     );
     fs::create_dir_all(local.join("tmp")).unwrap();
@@ -173,12 +170,7 @@ fn a_renamed_folder_and_a_local_copy_go_through_rclone() {
     let rc = Arc::new(Rclone::start(&base.join("rclone.conf")).expect("rclone rcd starts"));
     let mut engine = Engine::new(
         local.clone(),
-        RcloneRemote {
-            rc,
-            fs: remote.to_string_lossy().to_string(),
-            exclude: vec![],
-            dropbox: false,
-        },
+        RcloneRemote::new(rc, remote.to_string_lossy().to_string(), vec![], false),
         Db::memory().unwrap(),
     );
     for (p, text) in [
@@ -254,12 +246,12 @@ fn a_listing_split_by_folder_equals_the_recursive_one() {
     }
     fs::write(remote.join("root.txt"), "r").unwrap();
     let rc = Arc::new(Rclone::start(&base.join("rclone.conf")).expect("rclone rcd starts"));
-    let r = RcloneRemote {
+    let r = RcloneRemote::new(
         rc,
-        fs: remote.to_string_lossy().to_string(),
-        exclude: fastsync_core::rclone::exclusions("onedrive"),
-        dropbox: false,
-    };
+        remote.to_string_lossy().to_string(),
+        fastsync_core::rclone::exclusions("onedrive"),
+        false,
+    );
     let seen = Mutex::new(Vec::new());
     let mut split = r
         .list_progress(&|d, t| seen.lock().unwrap().push((d, t)), &|| false)

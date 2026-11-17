@@ -47,6 +47,7 @@ impl Db {
              CREATE INDEX IF NOT EXISTS files_lsize ON files(l_size);
              CREATE INDEX IF NOT EXISTS files_lpath ON files(lower(path));
              CREATE TABLE IF NOT EXISTS dirs(id TEXT PRIMARY KEY, path TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS folders(path TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
              CREATE TABLE IF NOT EXISTS log(
                id INTEGER PRIMARY KEY, ts INT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL DEFAULT '',
@@ -54,8 +55,26 @@ impl Db {
         )?;
         // The first release is version 1. A later release that changes a table reads this to migrate: `CREATE TABLE IF
         // NOT EXISTS` above never adds a column to an existing file.
-        if c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? == 0 {
-            c.execute_batch("PRAGMA user_version=1")?;
+        let version = c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?;
+        if version < 2 {
+            // 2: folders are synced. A file's folders were on both sides when it was synced, so they start as synced
+            // too: without it a folder deleted here before the upgrade would be made again from the cloud's copy.
+            let mut seen = std::collections::BTreeSet::new();
+            {
+                let mut st = c.prepare("SELECT path FROM files")?;
+                for p in st.query_map([], |r| r.get::<_, String>(0))? {
+                    let p = p?;
+                    for (i, _) in p.match_indices('/') {
+                        seen.insert(p[..i].to_string());
+                    }
+                }
+            }
+            let tx = c.unchecked_transaction()?;
+            for d in &seen {
+                tx.execute("INSERT OR IGNORE INTO folders(path) VALUES(?)", [d])?;
+            }
+            tx.execute_batch("PRAGMA user_version=2")?;
+            tx.commit()?;
         }
         Ok(Self(c))
     }
@@ -172,6 +191,40 @@ impl Db {
         Ok(())
     }
 
+    /// Folders both sides had after the last sync (empty or not). Kept apart from `files` so the guard's counts and
+    /// every "known files" query stay about files.
+    pub fn dir_synced(&self, path: &str) -> Result<bool> {
+        self.0
+            .query_row("SELECT 1 FROM folders WHERE path=?", [path], |_| Ok(()))
+            .optional()
+            .map(|r| r.is_some())
+    }
+
+    pub fn add_dir_row(&self, path: &str) -> Result<()> {
+        self.0
+            .execute("INSERT OR IGNORE INTO folders(path) VALUES(?)", [path])?;
+        Ok(())
+    }
+
+    pub fn forget_dir_row(&self, path: &str) -> Result<()> {
+        self.0.execute("DELETE FROM folders WHERE path=?", [path])?;
+        Ok(())
+    }
+
+    /// The folder itself and every folder row below it.
+    pub fn dir_rows_under(&self, dir: &str) -> Result<Vec<String>> {
+        let mut st = self
+            .0
+            .prepare("SELECT path FROM folders WHERE path=?1 OR (path >= ?2 AND path < ?3)")?;
+        st.query_map([dir.to_string(), format!("{dir}/"), format!("{dir}0")], |r| r.get(0))?
+            .collect()
+    }
+
+    pub fn all_dir_rows(&self) -> Result<Vec<String>> {
+        let mut st = self.0.prepare("SELECT path FROM folders")?;
+        st.query_map([], |r| r.get(0))?.collect()
+    }
+
     /// The path of a remote file id, for providers whose delta reports deletions by id only.
     pub fn path_of_id(&self, id: &str) -> Result<Option<String>> {
         self.0
@@ -187,6 +240,16 @@ impl Db {
             tx.execute("INSERT OR REPLACE INTO dirs(id,path) VALUES(?,?)", [id, path])?;
         }
         tx.commit()
+    }
+
+    /// Adds folders the feed reported as new (`INSERT OR IGNORE`: a row from a full scan is never overwritten by an
+    /// older answer, and writing the same folder twice is harmless).
+    pub fn add_dirs(&self, dirs: &[(String, String)]) -> Result<()> {
+        for (id, path) in dirs {
+            self.0
+                .execute("INSERT OR IGNORE INTO dirs(id,path) VALUES(?,?)", [id, path])?;
+        }
+        Ok(())
     }
 
     pub fn dirs(&self) -> Result<Vec<(String, String)>> {
@@ -288,10 +351,43 @@ mod tests {
     }
 
     #[test]
-    fn a_new_db_is_schema_version_1() {
+    fn a_new_db_is_schema_version_2() {
         let db = Db::memory().unwrap();
         let v: i64 = db.0.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, 2);
+    }
+
+    #[test]
+    fn a_version_1_db_starts_with_the_folders_of_its_files_as_synced() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE files(
+               path TEXT PRIMARY KEY, l_size INT, l_mtime INT, r_size INT, r_mtime INT, r_id TEXT NOT NULL DEFAULT '');
+             INSERT INTO files VALUES('a/b/c.txt',1,1,1,1,''),('top.txt',1,1,1,1,''),('a/d.txt',1,1,1,1,'');
+             PRAGMA user_version=1;",
+        )
+        .unwrap();
+        let db = Db::init(c).unwrap();
+        let mut got = db.all_dir_rows().unwrap();
+        got.sort();
+        assert_eq!(got, ["a", "a/b"]);
+        assert!(db.dir_synced("a/b").unwrap() && !db.dir_synced("top.txt").unwrap());
+        // Files are untouched, and a second open does not seed again.
+        assert_eq!(db.count().unwrap(), 3);
+    }
+
+    #[test]
+    fn folder_rows_are_apart_from_files() {
+        let db = Db::memory().unwrap();
+        for d in ["a", "a/b", "ab", "a b"] {
+            db.add_dir_row(d).unwrap();
+        }
+        assert_eq!(db.count().unwrap(), 0);
+        let mut got = db.dir_rows_under("a").unwrap();
+        got.sort();
+        assert_eq!(got, ["a", "a/b"]);
+        db.forget_dir_row("a").unwrap();
+        assert!(!db.dir_synced("a").unwrap());
     }
 
     #[test]
