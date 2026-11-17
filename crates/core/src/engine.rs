@@ -113,6 +113,8 @@ pub struct Report {
     pub cancelled: bool,
     /// Paths whose action failed (`fail`): the runner retries just these, not the whole cloud.
     pub failed: Vec<String>,
+    /// Cloud folders the feed reported that could not be listed: the runner retries just these (`fail_dir`).
+    pub failed_dirs: Vec<String>,
     /// The run did nothing and asks for a full scan instead (too many folders reported at once to list one by one).
     pub wants_full: bool,
     /// Paths left for later without an error: the file changed under the transfer (an editor saved it). The edit
@@ -130,6 +132,13 @@ impl Report {
     pub fn fail(&mut self, path: &str, why: &str) {
         self.errors.push(format!("{path}: {why}"));
         self.failed.push(path.to_string());
+        self.accounted += 1;
+    }
+
+    /// The cloud folder `dir` could not be listed: on the card, and retried by itself (one listing of that folder).
+    pub fn fail_dir(&mut self, dir: &str, why: &str) {
+        self.errors.push(format!("{dir}: {why}"));
+        self.failed_dirs.push(dir.to_string());
         self.accounted += 1;
     }
 
@@ -317,6 +326,12 @@ fn local_sig(root: &Path, rel: &str) -> Option<Sig> {
 /// More reported folders than this are not listed one by one: the run asks for a full scan instead.
 const FEED_DIRS_MAX: usize = 30;
 
+/// True when a failed listing of the cloud folder `dir` really means it is gone. "Not found" alone is not enough (a
+/// glitch once passed as an empty root): the folder's own `stat` has to say so too, and the root is never gone.
+fn folder_gone<R: Remote>(remote: &R, dir: &str, err: &str) -> bool {
+    !dir.is_empty() && err.to_lowercase().contains("not found") && matches!(remote.stat(dir), Ok(None))
+}
+
 /// `Remote::list_under` for each folder, `PARALLEL` at a time, in the order given. A cancel stops before the next
 /// folder; the answers then miss folders, which only matters to a run that is being cancelled anyway.
 fn list_folders<R: Remote>(
@@ -445,11 +460,7 @@ fn lookup<R: Remote>(
                                 // "Not found" must not by itself read as "everything in it is gone" (a glitch did once
                                 // for the root): the folder's own `stat` has to say it is gone too. One request
                                 // instead of one per file, which took a minute for 84 deleted files.
-                                Err(e)
-                                    if !dir.is_empty()
-                                        && e.to_lowercase().contains("not found")
-                                        && matches!(remote.stat(dir), Ok(None)) =>
-                                {
+                                Err(e) if folder_gone(remote, dir, &e) => {
                                     got.extend(idx.iter().map(|&i| (i, Ok(None))));
                                 }
                                 Err(_) => got.extend(idx.iter().map(|&i| (i, remote.stat(&paths[i])))),
@@ -780,7 +791,7 @@ impl<R: Remote> Engine<R> {
 
     /// `sync_paths`, also listing the cloud folders `dirs` (a new or moved folder whose contents the feed did not
     /// report): one recursive request for each instead of a scan of the whole cloud. A folder that cannot be listed is
-    /// a global error, so the retry is a full scan and the feed's cursor is not saved.
+    /// a failure of its own (`Report::failed_dirs`): the runner lists just that folder again and the cursor may move on.
     pub fn sync_paths_in(&mut self, paths: &[String], dirs: &[String]) -> Report {
         crate::debug::log(|| format!("scan     {} changed path(s), {} folder(s)", paths.len(), dirs.len()));
         self.case_renames.clear();
@@ -846,11 +857,15 @@ impl<R: Remote> Engine<R> {
                         }
                     }
                 }
+                // Created and deleted again before we looked (`.git` temp folders, tool caches): the feed reported
+                // it, the cloud no longer has it. Same proof as in `lookup`: the folder's own `stat` must say gone.
+                Err(e) if folder_gone(&self.remote, &d, &e) => {}
                 Err(e) => {
-                    // Not knowing what is in it is not "nothing": only a full scan can look again.
+                    // Not knowing what is in it is not "nothing". Only this folder is listed again by the retry, not
+                    // the whole cloud (a full scan is minutes on a big one).
                     self.db
                         .log("error", &d, None, &format!("listing the folder failed: {e}"));
-                    report.errors.push(format!("{d}: {e}"));
+                    report.fail_dir(&d, &e);
                 }
             }
         }

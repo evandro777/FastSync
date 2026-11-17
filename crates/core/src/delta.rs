@@ -95,9 +95,37 @@ impl Http {
 fn finish(r: std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<(u16, Value)> {
     let mut resp = r.map_err(|e| e.to_string())?;
     let status = resp.status().as_u16();
+    let wait = (status == 429)
+        .then(|| {
+            resp.headers()
+                .get("retry-after")?
+                .to_str()
+                .ok()?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+        .flatten();
     let text = resp.body_mut().read_to_string().map_err(|e| e.to_string())?;
     // Dropbox answers a 400 in plain text: keep it as a string so `fail` can show why.
-    Ok((status, serde_json::from_str(&text).unwrap_or(Value::String(text))))
+    let mut body = serde_json::from_str(&text).unwrap_or(Value::String(text));
+    if let Some(n) = wait {
+        // The header goes into the body so `fail` can put it in the message (the error type is a string).
+        body = match body {
+            Value::Object(mut o) => {
+                o.insert("_retry_after".into(), n.into());
+                Value::Object(o)
+            }
+            other => json!({"error_summary": s(&other), "_retry_after": n}),
+        };
+    }
+    Ok((status, body))
+}
+
+/// The wait a service asked for in a failed answer, read back from `fail`'s message: `(retry after 30 s)`.
+pub fn retry_hint(msg: &str) -> Option<Duration> {
+    let n = msg.split_once("(retry after ")?.1.split_once(" s)")?.0;
+    n.parse().ok().map(Duration::from_secs)
 }
 
 fn s(v: &Value) -> String {
@@ -118,8 +146,14 @@ fn fail<T>(what: &str, status: u16, body: &Value) -> Result<T> {
     .filter(|t| !t.is_empty())
     .collect::<Vec<_>>()
     .join(", ");
+    // Dropbox says it in the body, the others in the `Retry-After` header (`finish` copies it into `_retry_after`).
+    let wait = body["_retry_after"]
+        .as_u64()
+        .or(body["error"]["retry_after"].as_u64())
+        .map(|n| format!(" (retry after {n} s)"))
+        .unwrap_or_default();
     Err(format!(
-        "{what}: HTTP {status} {}",
+        "{what}: HTTP {status} {}{wait}",
         why.chars().take(200).collect::<String>()
     ))
 }
@@ -535,6 +569,17 @@ mod tests {
         assert!(dropbox_reset(409, &json!({"error_summary": "reset/..."})));
         assert!(!dropbox_reset(400, &Value::String("Error in call: bad request".into())));
         assert!(!dropbox_reset(401, &foreign));
+    }
+
+    #[test]
+    fn a_rate_limit_carries_the_wait_the_service_asked_for() {
+        let dropbox = json!({"error_summary": "too_many_requests/", "error": {"retry_after": 300}});
+        let header = json!({"error": {"message": "slow down"}, "_retry_after": 45});
+        let msg = |b: &Value| fail::<()>("changes", 429, b).unwrap_err();
+        assert_eq!(retry_hint(&msg(&dropbox)), Some(Duration::from_secs(300)));
+        assert_eq!(retry_hint(&msg(&header)), Some(Duration::from_secs(45)));
+        assert_eq!(retry_hint(&msg(&json!({"error_summary": "nope"}))), None);
+        assert_eq!(retry_hint("whatever (retry after soon s)"), None);
     }
 
     #[test]

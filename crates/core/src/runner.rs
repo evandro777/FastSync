@@ -203,6 +203,8 @@ struct Retry {
     full: bool,
     /// Paths to look at again by themselves (`Report::failed` and `Report::later`).
     paths: BTreeSet<String>,
+    /// Cloud folders the feed reported that could not be listed (`Report::failed_dirs`): listed again by themselves.
+    dirs: BTreeSet<String>,
     /// The text last written to the DB, so an idle loop writes nothing.
     saved: Option<String>,
 }
@@ -214,19 +216,32 @@ impl Retry {
         let Ok(Some(text)) = db.meta("retry") else {
             return r;
         };
-        // A value that cannot be read is a full scan, the safe side.
-        match serde_json::from_str::<(bool, BTreeSet<String>)>(&text) {
-            Ok((full, paths)) => (r.full, r.paths) = (full, paths),
+        // A value that cannot be read is a full scan, the safe side. Without failed folders it is the 2-tuple of
+        // before, so a retry saved by an older release still loads.
+        match serde_json::from_str::<(bool, BTreeSet<String>, BTreeSet<String>)>(&text)
+            .or_else(|_| serde_json::from_str::<(bool, BTreeSet<String>)>(&text).map(|(f, p)| (f, p, BTreeSet::new())))
+        {
+            Ok((full, paths, dirs)) => (r.full, r.paths, r.dirs) = (full, paths, dirs),
             Err(_) => r.full = true,
         }
         r.saved = Some(text);
         r.at = Some(Instant::now());
         r
     }
+    /// Nothing to retry.
+    fn idle(&self) -> bool {
+        !self.full && self.paths.is_empty() && self.dirs.is_empty()
+    }
+    /// The folders a run listed are done (a failure is added again by `record`). Called before it.
+    fn dirs_ran(&mut self, ran_dirs: &[String]) {
+        for d in ran_dirs {
+            self.dirs.remove(d);
+        }
+    }
     /// False when the DB could not take it: the caller then keeps the feed's cursor back, or a restart would lose the
     /// failed paths the cursor moved past.
     fn save(&mut self, db: &Db) -> bool {
-        if !self.full && self.paths.is_empty() {
+        if self.idle() {
             if self.saved.is_none() {
                 return true;
             }
@@ -236,7 +251,13 @@ impl Retry {
             }
             return ok;
         }
-        let Ok(text) = serde_json::to_string(&(self.full, &self.paths)) else {
+        // The 2-tuple when no folder failed, so the stored text stays what older releases read and wrote.
+        let text = if self.dirs.is_empty() {
+            serde_json::to_string(&(self.full, &self.paths))
+        } else {
+            serde_json::to_string(&(self.full, &self.paths, &self.dirs))
+        };
+        let Ok(text) = text else {
             return false;
         };
         if self.saved.as_deref() == Some(&text) {
@@ -269,7 +290,7 @@ impl Retry {
         let global = r.has_global_failure();
         if did_full && !global {
             // Everything was compared again: what failed is now exactly `r.failed`.
-            (self.full, self.paths) = (false, BTreeSet::new());
+            (self.full, self.paths, self.dirs) = (false, BTreeSet::new(), BTreeSet::new());
         } else {
             for p in ran {
                 self.paths.remove(p);
@@ -277,11 +298,12 @@ impl Retry {
         }
         self.full |= global;
         self.paths.extend(r.failed.iter().chain(&r.later).cloned());
-        if self.paths.len() > RETRY_PATHS_MAX {
-            (self.full, self.paths) = (true, BTreeSet::new());
+        self.dirs.extend(r.failed_dirs.iter().cloned());
+        if self.paths.len() + self.dirs.len() > RETRY_PATHS_MAX {
+            (self.full, self.paths, self.dirs) = (true, BTreeSet::new(), BTreeSet::new());
         }
-        let failed = global || !r.failed.is_empty();
-        if !self.full && self.paths.is_empty() {
+        let failed = global || !r.failed.is_empty() || !r.failed_dirs.is_empty();
+        if self.idle() {
             (self.fails, self.later_fails, self.at) = (0, 0, None);
         } else if failed {
             self.fails = self.fails.saturating_add(1);
@@ -308,7 +330,7 @@ impl Retry {
     /// Makes the retry a full scan: a stopped run's decision (delete or restore) is only carried out and cleared by a
     /// clean whole comparison, not by the paths that failed in it.
     fn escalate(&mut self, now: Instant) {
-        (self.full, self.paths) = (true, BTreeSet::new());
+        (self.full, self.paths, self.dirs) = (true, BTreeSet::new(), BTreeSet::new());
         if self.at.is_none() {
             self.fails = self.fails.max(1);
             self.at = Some(now + retry_after(self.fails));
@@ -646,11 +668,13 @@ fn work(
         // Taken here, not in the run: a paused or held account must not spin on a retry that is already due (the full
         // scan flag and the queued paths stay until it can run). The paths join the feed's: never dropped as an echo of
         // our own write, which a failed cloud change (the local copy untouched) would be.
-        match retry.take_due(Instant::now()) {
-            Some(Due::Full) => mark(&mut full, &mut why, "retry"),
-            Some(Due::Paths(p)) => feed_paths.extend(p),
-            None => {}
-        }
+        take_retry(
+            &mut retry,
+            Instant::now(),
+            (&mut full, &mut why),
+            &mut feed_paths,
+            &mut feed_dirs,
+        );
         if paused {
             continue;
         }
@@ -662,7 +686,7 @@ fn work(
             feed_dirs.clear();
             continue;
         }
-        if !(full || walk || !pending.is_empty() || !feed_paths.is_empty()) {
+        if !run_wanted(full, walk, &pending, &feed_paths, &feed_dirs) {
             continue;
         }
         // The count the card showed caps what "Delete them" may delete; a bigger plan stops again.
@@ -689,7 +713,8 @@ fn work(
                     walk,
                 );
                 let dirs: Vec<String> = std::mem::take(&mut feed_dirs).into_iter().collect();
-                if paths.is_empty() {
+                // Folders alone are a run too: their listing is what it is for.
+                if paths.is_empty() && dirs.is_empty() {
                     // The 2-minute walk that finds nothing must not flash "Syncing".
                     (Report::default(), paths, dirs, false)
                 } else {
@@ -772,6 +797,7 @@ fn work(
             held = None;
         }
         if report.aborted.is_none() {
+            retry.dirs_ran(&ran_dirs);
             // A stopped run's decision is not carried out by the paths that failed in it: only a clean full scan
             // does that, so with one pending the retry is a full scan.
             retry.finish_run(&report, &ran, did_full, resolution.is_some(), Instant::now());
@@ -890,6 +916,37 @@ fn mark(full: &mut bool, why: &mut &'static str, cause: &'static str) {
     *full = true;
 }
 
+/// A due retry joins the queues: a full scan, or the failed paths (with the feed's, so never dropped as an echo of our
+/// own write) and the failed cloud folders (listed alone). Once: `take_due` clears the timer, the run's `record`
+/// sets it again if something failed.
+fn take_retry(
+    retry: &mut Retry,
+    now: Instant,
+    (full, why): (&mut bool, &mut &'static str),
+    feed_paths: &mut BTreeSet<String>,
+    feed_dirs: &mut BTreeSet<String>,
+) {
+    match retry.take_due(now) {
+        Some(Due::Full) => mark(full, why, "retry"),
+        Some(Due::Paths(p)) => {
+            feed_paths.extend(p);
+            feed_dirs.extend(retry.dirs.iter().cloned());
+        }
+        None => {}
+    }
+}
+
+/// True when anything is queued that a run must look at. A cloud folder alone is enough: its listing is the run.
+fn run_wanted(
+    full: bool,
+    walk: bool,
+    pending: &BTreeSet<String>,
+    feed_paths: &BTreeSet<String>,
+    feed_dirs: &BTreeSet<String>,
+) -> bool {
+    full || walk || !pending.is_empty() || !feed_paths.is_empty() || !feed_dirs.is_empty()
+}
+
 fn after_cancel(did_full: bool, ran: Vec<String>) -> (bool, Vec<String>) {
     if did_full { (true, Vec::new()) } else { (false, ran) }
 }
@@ -967,12 +1024,18 @@ fn poller(mut feed: Box<dyn delta::RemoteChanges>, cursor: Option<String>, tx: S
                     sleep(feed.idle());
                 }
                 Err(e) => {
-                    let _ = tx.send(Event::Warn(e));
-                    // Exponential: 30 s, 60 s, ... 10 min. Quota errors (rclone's shared Google client id) get
-                    // worse if every client keeps retrying at a fixed pace.
                     let n = failures.map_or(0, |n: u32| n + 1);
                     failures = Some(n);
-                    sleep(Duration::from_secs((30u64 << n.min(5)).min(600)));
+                    // The third failure in a row, not the first: a 429 or a network blip is the service asking us to
+                    // wait, and the back-off below already does. Shown on the card and logged as a problem, it stayed
+                    // for hours after it had healed.
+                    // Exponential: 30 s, 60 s, ... 10 min. Quota errors (rclone's shared Google client id) get
+                    // worse if every client keeps retrying at a fixed pace. Never sooner than the service asked.
+                    let asked = delta::retry_hint(&e).unwrap_or_default().as_secs();
+                    if n >= 2 {
+                        let _ = tx.send(Event::Warn(e));
+                    }
+                    sleep(Duration::from_secs((30u64 << n.min(5)).max(asked).min(600)));
                 }
             }
         }
@@ -1235,6 +1298,85 @@ mod tests {
         db.break_meta();
         r.record(&failed(&["a", "b"]), &[], false, t0);
         assert!(!r.save(&db), "the caller must not save the cursor then");
+    }
+
+    fn failed_dir(d: &str) -> Report {
+        let mut r = Report::default();
+        r.fail_dir(d, "boom");
+        r
+    }
+
+    #[test]
+    fn a_folder_that_could_not_be_listed_is_retried_alone_and_does_not_hold_the_cursor() {
+        let (mut r, t0) = (Retry::default(), Instant::now());
+        let rep = failed_dir("a/b");
+        assert!(!rep.has_global_failure(), "one folder is no reason to list the cloud");
+        r.record(&rep, &[], false, t0);
+        assert!(!r.full && r.dirs.contains("a/b") && r.may_confirm(&rep));
+        assert_eq!(r.take_due(t0 + RETRY_AFTER), Some(Due::Paths(vec![])));
+        // Listed again and fine: gone from the retry.
+        r.dirs_ran(&s(&["a/b"]));
+        r.record(&Report::default(), &[], false, t0 + RETRY_AFTER);
+        assert!(r.idle());
+        // A clean full scan ends it too.
+        r.record(&failed_dir("c"), &[], false, t0);
+        r.record(&Report::default(), &[], true, t0 + RETRY_AFTER);
+        assert!(r.idle());
+    }
+
+    #[test]
+    fn failed_folders_survive_a_restart_and_a_retry_saved_by_an_older_release_still_loads() {
+        let db = Db::memory().unwrap();
+        let (mut r, t0) = (Retry::default(), Instant::now());
+        r.record(&failed_dir("a/b"), &[], false, t0);
+        assert!(r.save(&db));
+        let back = Retry::load(&db);
+        assert_eq!(back.dirs.iter().collect::<Vec<_>>(), ["a/b"]);
+        // Without folders the text is the old two-part one, and that loads as before.
+        db.set_meta("retry", r#"[false,["x.txt"]]"#).unwrap();
+        let old = Retry::load(&db);
+        assert!(!old.full && old.paths.contains("x.txt") && old.dirs.is_empty());
+    }
+
+    #[test]
+    fn a_due_retry_queues_its_failed_folders_and_a_folder_alone_starts_a_run() {
+        let (mut r, t0) = (Retry::default(), Instant::now());
+        r.record(&failed_dir("a/b"), &[], false, t0);
+        let (mut full, mut why) = (false, "rescan");
+        let (mut paths, mut dirs) = (BTreeSet::new(), BTreeSet::new());
+        // Not due yet: nothing queued, nothing to run.
+        take_retry(&mut r, t0, (&mut full, &mut why), &mut paths, &mut dirs);
+        assert!(!run_wanted(full, false, &BTreeSet::new(), &paths, &dirs));
+        take_retry(&mut r, t0 + RETRY_AFTER, (&mut full, &mut why), &mut paths, &mut dirs);
+        assert!(!full && paths.is_empty(), "no full scan for one folder");
+        assert!(dirs.contains("a/b"));
+        assert!(run_wanted(full, false, &BTreeSet::new(), &paths, &dirs));
+    }
+
+    #[test]
+    fn a_due_full_retry_marks_a_full_scan() {
+        let (mut r, t0) = (Retry::default(), Instant::now());
+        r.record(&global(), &[], true, t0);
+        let (mut full, mut why) = (false, "rescan");
+        take_retry(
+            &mut r,
+            t0 + RETRY_AFTER,
+            (&mut full, &mut why),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+        );
+        assert!(full);
+        assert_eq!(why, "retry");
+    }
+
+    #[test]
+    fn a_db_that_cannot_take_a_failed_folder_keeps_the_cursor_back() {
+        let db = Db::memory().unwrap();
+        let (mut r, t0) = (Retry::default(), Instant::now());
+        db.break_meta();
+        let rep = failed_dir("a/b");
+        r.record(&rep, &[], false, t0);
+        assert!(!r.persist(&db, &rep, Some("cursor")));
     }
 
     #[test]

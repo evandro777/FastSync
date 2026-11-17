@@ -428,6 +428,89 @@ fn not_found_while_the_folder_still_exists_is_not_read_as_gone() {
     assert!(e.db.base(&paths[0]).unwrap().is_some());
 }
 
+/// A cloud whose recursive folder listing (`list_under`) says "not found" for a missing folder, as rclone does, or
+/// fails with `err` whatever the folder.
+struct Under(DirRemote, Option<&'static str>);
+impl Remote for Under {
+    fn list(&self) -> Result<Vec<Item>> {
+        self.0.list()
+    }
+    fn list_under(&self, dir: &str) -> Result<Vec<Item>> {
+        if let Some(e) = self.1 {
+            return Err(e.into());
+        }
+        if !self.0.0.join(dir).is_dir() {
+            return Err("error in ListJSON: directory not found".into());
+        }
+        self.0.list_under(dir)
+    }
+    fn stat(&self, rel: &str) -> Result<Option<Item>> {
+        self.0.stat(rel)
+    }
+    fn upload(&self, root: &Path, rel: &str) -> Result<()> {
+        self.0.upload(root, rel)
+    }
+    fn download(&self, rel: &str, dest: &Path) -> Result<()> {
+        self.0.download(rel, dest)
+    }
+    fn delete(&self, rel: &str) -> Result<()> {
+        self.0.delete(rel)
+    }
+}
+
+fn under_engine(name: &str, err: Option<&'static str>) -> (Fixture, Engine<Under>) {
+    let f = Fixture::new(name);
+    let e = Engine::new(
+        f.engine.root.clone(),
+        Under(DirRemote(f.engine.remote.0.clone()), err),
+        Db::memory().unwrap(),
+    );
+    (f, e)
+}
+
+#[test]
+fn a_reported_folder_already_gone_from_the_cloud_is_no_problem() {
+    let (_f, mut e) = under_engine("feed-gone", None);
+    let r = e.sync_paths_in(&["tmp".into()], &["tmp".into()]);
+    assert!(r.errors.is_empty() && r.failed_dirs.is_empty(), "{r:?}");
+}
+
+#[test]
+fn a_reported_folder_that_fails_to_list_is_retried_alone_not_by_a_full_scan() {
+    let (f, mut e) = under_engine("feed-boom", Some("network down"));
+    write(f.remote("d/x.txt"), "x", 100);
+    let r = e.sync_paths_in(&["d".into()], &["d".into()]);
+    assert_eq!(r.failed_dirs, ["d"], "{r:?}");
+    assert!(!r.has_global_failure() && r.errors.len() == 1, "{r:?}");
+    assert!(!f.local("d/x.txt").exists(), "nothing was read as an empty cloud");
+}
+
+#[test]
+fn not_found_while_the_reported_folder_exists_is_a_failure_not_a_delete() {
+    // The listing says "not found" but `stat` finds the folder: a glitch, never "gone".
+    let (f, mut e) = under_engine("feed-glitch", Some("error in ListJSON: directory not found"));
+    write(f.remote("d/x.txt"), "x", 100);
+    let r = e.sync_paths_in(&["d".into()], &["d".into()]);
+    assert_eq!(r.failed_dirs, ["d"], "{r:?}");
+    assert!(f.remote("d/x.txt").exists());
+}
+
+#[test]
+fn a_retry_of_a_folder_alone_downloads_what_is_in_it() {
+    // No paths, only the folder: what the runner hands over when a failed folder listing is retried.
+    let (f, mut e) = under_engine("feed-dir-only", None);
+    write(f.remote("d/x.txt"), "x", 100);
+    let r = e.sync_paths_in(&[], &["d".into()]);
+    assert!(r.errors.is_empty() && r.transferred == 1, "{r:?}");
+    assert_eq!(fs::read_to_string(f.local("d/x.txt")).unwrap(), "x");
+}
+
+#[test]
+fn the_root_is_never_gone() {
+    let (_f, e) = under_engine("feed-root", None);
+    assert!(!folder_gone(&e.remote, "", "directory not found"));
+}
+
 /// Records what `Engine.progress` says at the moment each upload starts.
 struct Spy(
     DirRemote,
@@ -1622,7 +1705,7 @@ fn a_folder_the_feed_reported_is_listed_alone_and_its_files_come_down() {
 }
 
 #[test]
-fn a_folder_that_cannot_be_listed_is_a_global_failure_never_an_empty_folder() {
+fn a_folder_that_cannot_be_listed_is_a_failure_of_its_own_never_an_empty_folder() {
     let f = Fixture::new("feed-dir-fail");
     write(f.local("new/a.txt"), "mine", 100);
     let mut e = Engine::new(
@@ -1635,7 +1718,9 @@ fn a_folder_that_cannot_be_listed_is_a_global_failure_never_an_empty_folder() {
         Db::memory().unwrap(),
     );
     let r = e.sync_paths_in(&["new".to_string()], &["new".to_string()]);
-    assert!(r.has_global_failure(), "only a full scan can look again: {r:?}");
+    // Shown as an error and listed again by itself; no full scan, and the cursor may move on.
+    assert_eq!(r.failed_dirs, ["new"], "{r:?}");
+    assert!(!r.has_global_failure() && r.errors.len() == 1, "{r:?}");
 }
 
 #[test]

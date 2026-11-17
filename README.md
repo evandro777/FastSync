@@ -17,6 +17,7 @@ Page: <https://evandro777.github.io/FastSync/>
 
 > [!WARNING]
 > This is an early version. It works, but it is not yet polished and may have bugs. Please back up your files before using it.
+> MEGA is not fully supported yet: it lacks a lot of features, and might have a lot of problems. Use it at your own risk.
 
 ## Features
 
