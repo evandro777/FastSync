@@ -479,6 +479,23 @@ pub struct Impact {
     pub mass_delete: bool,
 }
 
+/// True when rclone keeps the file name `name` of a `kind` account under another spelling than the service sends it
+/// (rclone's name encoding: OneDrive `10:30.txt` is stored as `10：30.txt`, Drive `a/b` as `a／b`). The feed reports the
+/// raw name, so a path built from it finds nothing in the cloud and the new file would wait for the next full scan.
+pub fn rclone_encodes(kind: &str, name: &str) -> bool {
+    let control = name.chars().any(char::is_control);
+    match kind {
+        "drive" => control || name.contains('/'),
+        "onedrive" => {
+            control
+                || name.contains(['/', '\\', '*', '<', '>', '?', ':', '|', '"'])
+                || name.starts_with([' ', '~'])
+                || name.ends_with([' ', '.'])
+        }
+        _ => false,
+    }
+}
+
 /// Deletions in one batch that the runner holds for one poll (`Impact.mass_delete`): a folder renamed in the cloud can
 /// arrive as its deletions first and the new name in a later batch. A smaller batch goes by path at once: at worst a
 /// split move of fewer files is trashed here and downloaded again.
@@ -593,6 +610,15 @@ pub fn impact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_rclone_spells_differently_are_told_apart_per_provider() {
+        assert!(rclone_encodes("onedrive", "10:30.txt") && rclone_encodes("onedrive", "a "));
+        assert!(rclone_encodes("drive", "Q1/Q2.pdf"));
+        // Drive keeps a colon as it is; plain names never need a listing.
+        assert!(!rclone_encodes("drive", "10:30.txt") && !rclone_encodes("onedrive", "report.txt"));
+        assert!(!rclone_encodes("dropbox", "10:30.txt"));
+    }
 
     #[test]
     fn a_dropbox_link_target_is_read_from_the_metadata() {

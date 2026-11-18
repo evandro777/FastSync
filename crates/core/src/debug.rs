@@ -8,34 +8,37 @@ pub fn enable() {
 }
 
 pub fn enabled() -> bool {
-    ON.load(Ordering::Relaxed) || std::env::var_os("FASTSYNC_DEBUG").is_some_and(|v| !v.is_empty() && v != "0")
+    // The environment is read once: this is asked for every file of a plan.
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    ON.load(Ordering::Relaxed)
+        || *ENV.get_or_init(|| std::env::var_os("FASTSYNC_DEBUG").is_some_and(|v| !v.is_empty() && v != "0"))
 }
 
-/// UTC (no time-zone code in the tree): `2026-11-16T14:03:09.123Z`.
+/// UTC (no time-zone code in the tree), in rclone's own shape (`rclone --log-format date,time,UTC`) so the two logs
+/// read as one: `2026/11/16 14:03:09`.
 fn stamp() -> String {
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    format!(
-        "{}.{:03}Z",
-        crate::engine::stamp(d.as_secs() as i64).replace(' ', "T"),
-        d.subsec_millis()
-    )
+    crate::engine::stamp(d.as_secs() as i64).replace('-', "/")
 }
 
-/// The message is built only when debugging is on.
+/// The message is built only when debugging is on. `DEBUG :` is rclone's level column.
 pub fn log(msg: impl FnOnce() -> String) {
     if enabled() {
-        eprintln!("{} {}", stamp(), msg());
+        eprintln!("{} DEBUG : {}", stamp(), msg());
     }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn stamp_has_the_iso_shape() {
+    fn stamp_has_rclones_shape() {
         let s = super::stamp();
-        assert_eq!((s.len(), &s[4..5], &s[10..11], &s[19..20]), (24, "-", "T", "."));
-        assert!(s.starts_with("20") && s.ends_with('Z'));
+        assert_eq!(
+            (s.len(), &s[4..5], &s[7..8], &s[10..11], &s[13..14]),
+            (19, "/", "/", " ", ":")
+        );
+        assert!(s.starts_with("20"));
     }
 }

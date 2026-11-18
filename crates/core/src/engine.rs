@@ -15,7 +15,7 @@ use crate::{
     decide::{
         Action, Base, DirAction, MIN_FILES, Sig, conflict_name, decide, decide_dir, decide_down, delete_guard_ok,
     },
-    ignore::Rules,
+    ignore::{RULES, Rules},
     rclone::{Item, now_secs},
 };
 
@@ -243,6 +243,9 @@ const COPY_MIN: u64 = 1 << 20;
 /// seconds): closer than that, the cloud's version keeps the name, as it always did.
 const NEWER_BY_MS: i64 = 2000;
 
+/// Adopted files per database transaction (see `run`).
+const ADOPT_BATCH: usize = 1000;
+
 pub struct Engine<R: Remote> {
     pub root: PathBuf,
     pub remote: R,
@@ -259,6 +262,9 @@ pub struct Engine<R: Remote> {
     pub ignore: Rules,
     /// One-way mirror: the cloud is never written; local edits and local-only files go to the trash.
     pub download_only: bool,
+    /// The cloud takes names that differ only by case for one file (Dropbox, OneDrive). Drive and MEGA keep both, so
+    /// there such names are plain files and nothing is renamed or skipped for them.
+    pub case_blind: bool,
     /// Read by the runner's ticker while `run` works.
     pub progress: std::sync::Arc<std::sync::Mutex<Progress>>,
     /// Set by Pause and Stop (from the UI thread) to end the run in progress: it finishes the transfers under way,
@@ -448,6 +454,7 @@ fn lookup<R: Remote>(
     db: &Db,
     paths: &[String],
     cancel: &std::sync::atomic::AtomicBool,
+    case_blind: bool,
 ) -> Vec<(usize, Result<Option<Item>>)> {
     let mut by_dir: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (i, p) in paths.iter().enumerate() {
@@ -481,7 +488,8 @@ fn lookup<R: Remote>(
                                 // says the name it holds, that is a clash, not the same file.
                                 let got_one = match remote.stat(&paths[*i]) {
                                     Ok(Some(it))
-                                        if it.path != paths[*i]
+                                        if case_blind
+                                            && it.path != paths[*i]
                                             && it.path.to_lowercase() == paths[*i].to_lowercase() =>
                                     {
                                         Err(CLASH_WHY.to_string())
@@ -498,7 +506,7 @@ fn lookup<R: Remote>(
                                     got.extend(idx.iter().map(|&i| match by_path.remove(&paths[i]) {
                                         Some(it) => (i, Ok(Some(it))),
                                         // Only another spelling of the name is there: the cloud treats it as one file.
-                                        None if lower.contains(&paths[i].to_lowercase()) => {
+                                        None if case_blind && lower.contains(&paths[i].to_lowercase()) => {
                                             (i, Err(CLASH_WHY.to_string()))
                                         }
                                         None => (i, Ok(None)),
@@ -535,6 +543,17 @@ fn lookup<R: Remote>(
 /// not) and the unreadable places. A folder missing from the result is "not looked at" as much as "not there":
 /// callers judge it with the same filters as for files.
 pub fn scan(root: &Path, skip: &[String], ignore: &Rules) -> (HashMap<String, Sig>, BTreeSet<String>, Vec<String>) {
+    scan_from(root, "", skip, ignore)
+}
+
+/// `scan` of the folder `dir`, which sits at `prefix` below the synced root: the returned paths start with `prefix`,
+/// so `skip` and `ignore` judge them like a walk from the root would.
+fn scan_from(
+    dir: &Path,
+    prefix: &str,
+    skip: &[String],
+    ignore: &Rules,
+) -> (HashMap<String, Sig>, BTreeSet<String>, Vec<String>) {
     type Out<'a> = (&'a mut HashMap<String, Sig>, &'a mut BTreeSet<String>);
     fn go(dir: &Path, prefix: &str, (skip, ignore): (&[String], &Rules), (out, dirs): Out, bad: &mut Vec<String>) {
         let rd = match fs::read_dir(dir) {
@@ -584,7 +603,7 @@ pub fn scan(root: &Path, skip: &[String], ignore: &Rules) -> (HashMap<String, Si
         }
     }
     let (mut out, mut dirs, mut bad) = (HashMap::new(), BTreeSet::new(), Vec::new());
-    go(root, "", (skip, ignore), (&mut out, &mut dirs), &mut bad);
+    go(dir, prefix, (skip, ignore), (&mut out, &mut dirs), &mut bad);
     (out, dirs, bad)
 }
 
@@ -631,6 +650,7 @@ impl<R: Remote> Engine<R> {
             excluded: Vec::new(),
             ignore: Rules::default(),
             download_only: false,
+            case_blind: true,
             progress: Default::default(),
             cancel: Default::default(),
             case_renames: Vec::new(),
@@ -994,17 +1014,13 @@ impl<R: Remote> Engine<R> {
                     // A folder the rules hide is not walked (`npm install` in an ignored `node_modules/` reports
                     // a folder event per directory); what was synced there before the rule comes from `db.under`.
                     if !self.ignore.matches_dir(p) {
-                        // Paths here are from `abs`, not the root, so the rules cannot judge them in `scan`: the
-                        // unchecked folders and `skippable` filter below.
-                        let (files, dirs, unreadable) = scan(&abs, &[], &Rules::default());
+                        // Walked with the prefix `p`, so the unchecked folders and the rules hide whole folders
+                        // (a `node_modules/` of 200k files copied in is not read); `skippable` still filters files.
+                        let (files, dirs, unreadable) = scan_from(&abs, p, &self.excluded, &self.ignore);
                         dir_cands.insert(p.clone());
-                        dir_cands.extend(dirs.into_iter().map(|d| format!("{p}/{d}")));
-                        all.extend(files.into_keys().map(|f| format!("{p}/{f}")));
-                        bad.extend(
-                            unreadable
-                                .into_iter()
-                                .map(|b| if b.is_empty() { p.clone() } else { format!("{p}/{b}") }),
-                        );
+                        dir_cands.extend(dirs);
+                        all.extend(files.into_keys());
+                        bad.extend(unreadable);
                     }
                 }
                 // Anything but "not there" (permission denied, I/O error) says nothing about the file. A folder that
@@ -1116,10 +1132,11 @@ impl<R: Remote> Engine<R> {
                 path: p,
             });
         }
-        let mut answers: HashMap<String, Result<Option<Item>>> = lookup(&self.remote, &self.db, &ask, &self.cancel)
-            .into_iter()
-            .map(|(i, r)| (ask[i].clone(), r))
-            .collect();
+        let mut answers: HashMap<String, Result<Option<Item>>> =
+            lookup(&self.remote, &self.db, &ask, &self.cancel, self.case_blind)
+                .into_iter()
+                .map(|(i, r)| (ask[i].clone(), r))
+                .collect();
         // A case-insensitive cloud answers for the new name of a rename by case alone with the old file itself: the new
         // name has no cloud copy of its own, or it would be adopted and the old name deleted with it. Only when the
         // answer really is the old file: a cloud that allows both names may hold another file under the new one, and
@@ -1199,7 +1216,7 @@ impl<R: Remote> Engine<R> {
             .cloned()
             .collect();
         let mut in_cloud: HashMap<&str, bool> = HashMap::new();
-        for (i, res) in lookup(&self.remote, &self.db, &ask, &self.cancel) {
+        for (i, res) in lookup(&self.remote, &self.db, &ask, &self.cancel, self.case_blind) {
             match res {
                 Ok(Some(it)) if it.is_dir => {
                     in_cloud.insert(&ask[i], true);
@@ -1401,6 +1418,23 @@ impl<R: Remote> Engine<R> {
                 keep
             });
         }
+        // The rules file travels like any file, and a rule that hides synced files deletes their cloud copies. Another
+        // machine that sees those deletes before the new rules reads them as ordinary deletes and trashes its files.
+        // So the rules go up before the deletes, and a run that brings new rules in waits with its local deletes: the
+        // next run reads the rules and makes them `Forget`.
+        let rules_in = plan
+            .iter()
+            .any(|(w, a, _)| w.path == RULES && matches!(a, Action::Download | Action::Conflict));
+        if rules_in {
+            // `later`, not `fail`: a normal event on the other machines, no red card; the retry still picks it up.
+            plan.retain(|(w, a, _)| {
+                let keep = *a != Action::DeleteLocal;
+                if !keep {
+                    report.later.push(w.path.clone());
+                }
+                keep
+            });
+        }
         // Nothing was done yet: a cancel here costs nothing, and the guard must not judge a plan that was cut short.
         if self.cancelled() {
             self.set_progress(Progress::default());
@@ -1433,12 +1467,43 @@ impl<R: Remote> Engine<R> {
         // run. One that changed meanwhile stays where it is, and its upload is dropped.
         let dropped = self.apply_case_renames(&mut report);
         plan.retain(|(w, ..)| !dropped.contains(&w.path));
+        // After the guard (a stopped run must not publish its rules), before the deletes they cause: see above.
+        let hides = plan
+            .iter()
+            .any(|(w, a, _)| *a == Action::DeleteRemote && self.ignore.matches(&w.path));
+        if hides
+            && let Some(i) = plan
+                .iter()
+                .position(|(w, a, _)| w.path == RULES && *a == Action::Upload)
+        {
+            let (w, a, _) = plan.remove(i);
+            let total = plan.len() + 1;
+            self.run_transfers(vec![(w, a)], 0, total, &mut report);
+            // Not up: the deletes it explains wait for the retry too.
+            if report.failed.iter().chain(&report.later).any(|p| p == RULES) {
+                plan.retain(|(w, a, _)| {
+                    let keep = !(*a == Action::DeleteRemote && self.ignore.matches(&w.path));
+                    if !keep {
+                        report.later.push(w.path.clone());
+                    }
+                    keep
+                });
+            }
+        }
         let mut plan: VecDeque<_> = plan.into();
         let (mut done, mut total) = (0, plan.len());
         let mut transfers = Vec::new();
+        // Adopt only writes a row: a first sync onto a folder that is already there makes one per file, and a commit
+        // each cost ~20 KB of journal. They share a transaction of `ADOPT_BATCH` rows; a crash loses at most a batch,
+        // whose files are then adopted again.
+        let mut open_rows = 0usize;
         while let Some((w, action, base)) = plan.pop_front() {
             if self.cancelled() {
                 break;
+            }
+            if action != Action::Adopt && open_rows > 0 {
+                self.commit_rows(&mut report);
+                open_rows = 0;
             }
             // Uploads and downloads wait on the cloud's latency, not on this machine: they run side by side below.
             // Everything else (deletes, conflicts, DB-only rows) stays one at a time, so folders are never removed
@@ -1475,6 +1540,15 @@ impl<R: Remote> Engine<R> {
                 });
             }
             done += 1;
+            if action == Action::Adopt && open_rows == 0 && self.db.begin() {
+                open_rows = 1;
+            } else if open_rows > 0 {
+                open_rows += 1;
+            }
+            if open_rows >= ADOPT_BATCH {
+                self.commit_rows(&mut report);
+                open_rows = 0;
+            }
             match self.exec(&w, action, base) {
                 Ok(extra) => {
                     log_done(&self.db, &w, action, &mut report);
@@ -1486,6 +1560,9 @@ impl<R: Remote> Engine<R> {
                 }
                 Err(e) => log_failed(&self.db, &w, &e, &mut report),
             }
+        }
+        if open_rows > 0 {
+            self.commit_rows(&mut report);
         }
         // A folder renamed here goes as one cloud call; what that cannot prove stays one move per file.
         let uploads: Vec<String> = transfers
@@ -1500,6 +1577,14 @@ impl<R: Remote> Engine<R> {
         self.set_progress(Progress::default());
         report.cancelled = self.cancelled();
         report
+    }
+
+    /// Ends the transaction of adopted rows. A failure rolls the batch back (`Db::commit`): those files are adopted
+    /// again by the next scan, and the run says so instead of losing later writes silently.
+    fn commit_rows(&self, report: &mut Report) {
+        if let Err(e) = self.db.commit() {
+            report.errors.push(format!("state database: {e}"));
+        }
     }
 
     /// Records a run the delete guard stopped: stderr, the activity log and `Report.aborted`.
@@ -2197,8 +2282,11 @@ fn fetch_to<R: Remote>(
         } else {
             // Overwriting a file we synced: take it out of the way first and look at it, so an edit saved between the
             // check above and now is put back (or trashed), never replaced.
-            let old = tmp_dir.join(format!("{}-{}-{n}.old", std::process::id(), now_secs()));
-            if fs::rename(&dest, &old).is_err() {
+            // In the trash, not in `tmp`: the next start empties `tmp`, so a quit or crash while the user's file sat
+            // there would lose it for good. Same file system as `tmp`.
+            let aside = trash_dir(root).join("set-aside");
+            let old = aside.join(format!("{}-{}-{n}.old", std::process::id(), now_secs()));
+            if fs::create_dir_all(&aside).is_err() || fs::rename(&dest, &old).is_err() {
                 // Cannot be set aside (another file system): the plain rename, with its tiny window.
                 return rename_over(&tmp, &dest);
             }

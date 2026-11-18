@@ -18,13 +18,16 @@ use crate::{
     rclone::Item,
 };
 
+/// Largest local file an `Upload` over a same-size cloud file is hashed for (see `adopt_identical`).
+const UPLOAD_COMPARE_MAX: u64 = 256 << 20;
+
 /// The file name and the folder of a `/` path: candidates for a move or copy share one of them.
-fn name(p: &str) -> String {
-    p.rsplit('/').next().unwrap_or(p).to_string()
+fn name(p: &str) -> &str {
+    p.rsplit('/').next().unwrap_or(p)
 }
 
-fn parent(p: &str) -> String {
-    p.rsplit_once('/').map_or(String::new(), |(d, _)| d.to_string())
+fn parent(p: &str) -> &str {
+    p.rsplit_once('/').map_or("", |(d, _)| d)
 }
 
 /// The folders a file's move renamed: what is left of both paths once their common ending (the file name and any
@@ -50,7 +53,10 @@ impl<R: Remote> Engine<R> {
     pub(super) fn pair_moves(&self, plan: Vec<Planned>) -> Vec<Planned> {
         // Old paths by size: only a delete that was safe to make anyway (we synced it, the local copy untouched; the
         // cloud copy present and the local one gone) can become a move.
-        let mut olds: HashMap<u64, Vec<usize>> = HashMap::new();
+        // Indexed by (size, file name) and (size, folder): a folder of 20k same-sized files renamed must not compare
+        // every new path with every old one.
+        let mut by_name: HashMap<(u64, &str), Vec<usize>> = HashMap::new();
+        let mut by_parent: HashMap<(u64, &str), Vec<usize>> = HashMap::new();
         for (i, (w, a, base)) in plan.iter().enumerate() {
             let size = match (a, w.local, &w.remote, base) {
                 (Action::DeleteLocal, Some(l), _, Some(b)) if b.local == l => Some(l.size),
@@ -58,10 +64,11 @@ impl<R: Remote> Engine<R> {
                 _ => None,
             };
             if let Some(s) = size {
-                olds.entry(s).or_default().push(i);
+                by_name.entry((s, name(&w.path))).or_default().push(i);
+                by_parent.entry((s, parent(&w.path))).or_default().push(i);
             }
         }
-        if olds.is_empty() {
+        if by_name.is_empty() {
             return plan;
         }
         let mut taken = vec![false; plan.len()];
@@ -77,21 +84,17 @@ impl<R: Remote> Engine<R> {
                 (Action::Upload, Some(l), None) => (l.size, false),
                 _ => continue,
             };
-            let mut cands: Vec<usize> = olds
-                .get(&size)
+            let usable = |&o: &usize| !taken[o] && (plan[o].1 == Action::DeleteLocal) == local_move;
+            // The same file name first: a folder rename keeps the names, so that is nearly always the match.
+            let same_name = by_name.get(&(size, name(&w.path))).into_iter().flatten().copied();
+            let same_parent = by_parent
+                .get(&(size, parent(&w.path)))
                 .into_iter()
                 .flatten()
                 .copied()
-                .filter(|&o| {
-                    let (ow, oa, _) = &plan[o];
-                    !taken[o]
-                        && (*oa == Action::DeleteLocal) == local_move
-                        && (name(&ow.path) == name(&w.path) || parent(&ow.path) == parent(&w.path))
-                })
-                .collect();
-            // The same file name first: a folder rename keeps the names, so that is nearly always the match.
-            cands.sort_by_key(|&o| name(&plan[o].0.path) != name(&w.path));
-            for o in cands.into_iter().take(PAIR_TRIES) {
+                .filter(|&o| name(&plan[o].0.path) != name(&w.path));
+            let cands: Vec<usize> = same_name.chain(same_parent).filter(usable).take(PAIR_TRIES).collect();
+            for o in cands {
                 let (ow, _, old_base) = &plan[o];
                 let same_name = name(&ow.path) == name(&w.path);
                 let same = if local_move {
@@ -270,7 +273,8 @@ impl<R: Remote> Engine<R> {
             // A folder renamed by case alone (`Docs` -> `docs`) is not a move file by file: a case-insensitive cloud
             // answers for `docs/a.txt` with the file in `Docs`, so only the folder's own rename changes its name. Even
             // one file in it is worth that.
-            let case_only = a.to_lowercase() == b.to_lowercase();
+            // Only where the cloud takes both spellings for one folder (Drive and MEGA keep two folders).
+            let case_only = self.case_blind && a.to_lowercase() == b.to_lowercase();
             if (idx.len() < 2 && !case_only) || self.cancelled() {
                 continue;
             }
@@ -395,11 +399,22 @@ impl<R: Remote> Engine<R> {
     /// service's hash proves equal becomes `Adopt`. Each check reads a whole local file, so they run `PARALLEL` at a
     /// time (and show their count). A check that itself fails (an unreadable file, rclone busy) is not "different": the
     /// file is skipped with an error and tried again, instead of becoming a conflict copy of identical bytes.
+    ///
+    /// The same goes for an `Upload` over an existing cloud file of the same size (only the local stamp changed: a
+    /// `touch`, another instance's write of the same bytes): equal hashes make it `Adopt`, so nothing is sent. Here a
+    /// failed check is no error, the file just goes up as before; a file over `UPLOAD_COMPARE_MAX` is not checked.
     pub(super) fn adopt_identical(&self, plan: &mut [Planned], report: &mut Report) {
         let todo: Vec<usize> = (0..plan.len())
             .filter(|&i| {
                 let (w, a, _) = &plan[i];
-                *a == Action::Conflict && matches!((w.local, &w.remote), (Some(l), Some(r)) if l.size == r.size)
+                // An upload's check is only a saving, so a big file (a database or VM image edited in place, same
+                // size every time) skips it: reading it all would hold every other transfer of the run back.
+                let wanted = match *a {
+                    Action::Conflict => true,
+                    Action::Upload => w.local.is_some_and(|l| l.size <= UPLOAD_COMPARE_MAX),
+                    _ => false,
+                };
+                wanted && matches!((w.local, &w.remote), (Some(l), Some(r)) if l.size == r.size)
             })
             .collect();
         if todo.is_empty() {
@@ -446,6 +461,9 @@ impl<R: Remote> Engine<R> {
             plan[i].1 = Action::Adopt;
         }
         for (i, e) in unknown.into_inner().unwrap_or_default() {
+            if plan[i].1 == Action::Upload {
+                continue;
+            }
             let path = plan[i].0.path.clone();
             let why = format!("could not compare with the cloud copy, will retry: {e}");
             self.db.log("error", &path, None, &why);

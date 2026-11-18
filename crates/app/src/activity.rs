@@ -65,6 +65,19 @@ fn conflicts_are_problems_too() {
 fn row(tr: &Tr, e: &LogEntry) -> LogRow {
     let kind = kind_of(&e.kind);
     let when = ago(tr, e.ts);
+    if kind == 7 && e.msg == "start" {
+        return LogRow {
+            kind,
+            title: tr.invoke_log_scan_start(),
+            meta: e
+                .path
+                .strip_prefix("full:")
+                .map_or("".into(), |w| tr.invoke_log_scan_why(w.into())),
+            when: when.into(),
+            detail: "".into(),
+            path: "".into(),
+        };
+    }
     if kind == 7 {
         let mut n = e.msg.split(' ').map(|v| v.parse::<i32>().unwrap_or(0));
         let (changed, failed) = (n.next().unwrap_or(0), n.next().unwrap_or(0));
@@ -241,6 +254,7 @@ pub fn fixture(ui: &Main, mode: usize) {
             "Photos/holiday/IMG_2042.jpg",
         ),
         e(26, "scan", "full:feed", Some(2100), "2 0"),
+        e(28, "scan", "full:feed", None, "start"),
         e(40, "scan", "full:reset", Some(9400), "0 0"),
         e(
             3 * 3600,

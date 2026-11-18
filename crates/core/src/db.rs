@@ -48,6 +48,7 @@ impl Db {
              CREATE INDEX IF NOT EXISTS files_lpath ON files(lower(path));
              CREATE TABLE IF NOT EXISTS dirs(id TEXT PRIMARY KEY, path TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS folders(path TEXT PRIMARY KEY);
+             CREATE INDEX IF NOT EXISTS folders_lpath ON folders(lower(path));
              CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
              CREATE TABLE IF NOT EXISTS log(
                id INTEGER PRIMARY KEY, ts INT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL DEFAULT '',
@@ -77,6 +78,20 @@ impl Db {
             tx.commit()?;
         }
         Ok(Self(c))
+    }
+
+    /// Opens a transaction for a long run of small writes (each commit of the first sync onto a folder that is already
+    /// there costs several index pages). `false`: none was opened, so no `commit` follows.
+    pub fn begin(&self) -> bool {
+        self.0.execute_batch("BEGIN").is_ok()
+    }
+
+    /// A failed `COMMIT` can leave the transaction open, and every later write (the cursor, the retry list) would join
+    /// it unseen and be lost at exit: it is rolled back, and the error is returned so the run can say so.
+    pub fn commit(&self) -> Result<()> {
+        self.0.execute_batch("COMMIT").inspect_err(|_| {
+            let _ = self.0.execute_batch("ROLLBACK");
+        })
     }
 
     /// One line of the activity log. Best effort: a log that cannot be written must never stop a sync.
@@ -117,6 +132,12 @@ impl Db {
     /// non-ASCII letters alone, so those namesakes are found by the caller's own folder listing only.
     pub fn paths_ci(&self, lower: &str) -> Result<Vec<String>> {
         let mut st = self.0.prepare("SELECT path FROM files WHERE lower(path)=?")?;
+        st.query_map([lower], |r| r.get(0))?.collect()
+    }
+
+    /// `paths_ci` for the synced folders (`folders_lpath`).
+    pub fn dirs_ci(&self, lower: &str) -> Result<Vec<String>> {
+        let mut st = self.0.prepare("SELECT path FROM folders WHERE lower(path)=?")?;
         st.query_map([lower], |r| r.get(0))?.collect()
     }
 

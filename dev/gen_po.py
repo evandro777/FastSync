@@ -81,6 +81,7 @@ T = [
     ("AccountCard", "{} problems in total, see the activity log", ["{} problemas no total, veja o registro de atividades"]),
     ("Tr", "Last problem: {}",["Último problema: {}"]),
     ("Tr", "Full check: {} changed, {} failed, {} s", ["Verificação completa: {} alterados, {} com falha, {} s"]),
+    ("Tr", "Full check started", ["Verificação completa iniciada"]),
     ("Tr", "first check or the cloud's change list restarted", ["primeira verificação ou a lista de mudanças da nuvem reiniciou"]),
     ("Tr", "a folder changed in the cloud", ["uma pasta mudou na nuvem"]),
     ("Tr", "scheduled", ["agendada"]),

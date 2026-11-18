@@ -200,6 +200,9 @@ impl<R: Remote> Engine<R> {
         cloud: &dyn Fn(&str) -> bool,
         report: &mut Report,
     ) -> Settled {
+        if !self.case_blind {
+            return Settled::default();
+        }
         let mut groups: HashMap<String, Vec<&str>> = HashMap::new();
         for n in names {
             groups.entry(n.to_lowercase()).or_default().push(n);

@@ -889,6 +889,27 @@ fn the_same_bytes_with_different_times_are_adopted_not_split_into_a_conflict() {
     assert_eq!(f.engine.full_scan().transferred, 0, "and the next scan finds nothing");
 }
 
+#[test]
+fn a_touched_file_with_the_same_bytes_is_not_uploaded_again_but_an_edit_of_the_same_size_is() {
+    let mut f = Fixture::new("touched");
+    write(f.local("a.txt"), "same bytes", 5000);
+    write(f.local("b.txt"), "old text!!", 5000);
+    assert!(f.engine.full_scan().errors.is_empty());
+    // Only the stamp changes (a `touch`, another instance writing the same bytes): nothing to send.
+    write(f.local("a.txt"), "same bytes", 9000);
+    // Same size, other bytes: a real edit still goes up.
+    write(f.local("b.txt"), "new text!!", 9000);
+    let r = f.engine.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(r.transferred, 1, "only b.txt");
+    assert_eq!(fs::read_to_string(f.remote("b.txt")).unwrap(), "new text!!");
+    assert_eq!(
+        f.engine.full_scan().transferred,
+        0,
+        "a.txt's row was updated, so the next scan is quiet"
+    );
+}
+
 /// A cloud whose byte check always fails, as when rclone cannot read the local file.
 struct CannotCompare(DirRemote);
 
@@ -939,6 +960,20 @@ fn a_failed_byte_check_skips_the_file_with_an_error_instead_of_splitting_it() {
     assert_eq!(fs::read_to_string(f.local("a.pdf")).unwrap(), "same bytes");
     assert!(e.db.base("a.pdf").unwrap().is_none(), "not recorded as synced either");
     assert!(f.local("new.txt").exists(), "the rest of the run goes on");
+}
+
+#[test]
+fn a_failed_byte_check_of_a_plain_upload_still_uploads_without_an_error() {
+    let f = Fixture::new("upload-cannot-compare");
+    let remote = CannotCompare(DirRemote(f.engine.remote.0.clone()));
+    let mut e = Engine::new(f.engine.root.clone(), remote, Db::memory().unwrap());
+    write(f.local("a.txt"), "old text!!", 5000);
+    assert!(e.full_scan().errors.is_empty());
+    write(f.local("a.txt"), "new text!!", 9000);
+    let r = e.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(r.transferred, 1, "{r:?}");
+    assert_eq!(fs::read_to_string(f.remote("a.txt")).unwrap(), "new text!!");
 }
 
 #[test]
@@ -1857,6 +1892,7 @@ fn a_cloud_folder_listing_with_only_another_spelling_of_the_name_is_a_clash() {
         &Db::memory().unwrap(),
         &all,
         &std::sync::atomic::AtomicBool::new(false),
+        true,
     );
     let clash = answers.iter().find(|(i, _)| all[*i] == "d/report.txt").unwrap();
     assert_eq!(clash.1, Err(CLASH_WHY.to_string()));
@@ -2333,6 +2369,20 @@ fn a_second_file_differing_only_by_case_becomes_a_case_conflict_in_both_places()
 }
 
 #[test]
+fn a_cloud_that_keeps_both_spellings_gets_both_files_as_they_are() {
+    // Drive and MEGA: `Makefile` and `makefile` are two files, so nothing is renamed or skipped.
+    let mut f = Fixture::new("case-sensitive-cloud");
+    f.engine.case_blind = false;
+    write(f.local("Makefile"), "one", 100);
+    write(f.local("makefile"), "two", 100);
+    let r = f.engine.full_scan();
+    assert!(r.errors.is_empty() && r.conflicts.is_empty(), "{r:?}");
+    assert_eq!(fs::read_to_string(f.remote("Makefile")).unwrap(), "one");
+    assert_eq!(fs::read_to_string(f.remote("makefile")).unwrap(), "two");
+    assert_eq!(f.engine.full_scan().transferred, 0);
+}
+
+#[test]
 fn a_new_file_beside_a_cloud_only_namesake_is_renamed_before_it_can_overwrite_it() {
     // The cloud has `Report.txt` (not downloaded yet, no row); here `report.txt` appears. A watcher run only
     // sees the new name: the cloud's answer for it is the other spelling.
@@ -2789,6 +2839,30 @@ fn old_trash_batches_are_purged_and_the_rest_stays() {
 }
 
 #[test]
+fn a_file_left_in_set_aside_by_a_crash_goes_into_a_dated_trash_batch() {
+    let f = Fixture::new("set-aside");
+    let root = f.engine.root.clone();
+    write(f.local(".fastsync/trash/set-aside/1-2-3.old"), "the user's file", 100);
+    assert_eq!(crate::trash::recover_set_aside(&root), 1);
+    assert!(!f.local(".fastsync/trash/set-aside").exists());
+    // Counted and aged like any trashed file now.
+    assert_eq!(trash_usage(&root).0, 1);
+    assert_eq!(crate::trash::recover_set_aside(&root), 0);
+}
+
+#[test]
+fn a_failed_commit_is_rolled_back_so_later_writes_are_not_swallowed() {
+    let db = Db::memory().unwrap();
+    assert!(db.begin());
+    db.set_meta("a", "1").unwrap();
+    assert!(db.commit().is_ok());
+    // Nothing open: COMMIT fails, and the connection stays in autocommit, so this write is kept.
+    assert!(db.commit().is_err());
+    db.set_meta("b", "2").unwrap();
+    assert_eq!(db.meta("b").unwrap().as_deref(), Some("2"));
+}
+
+#[test]
 fn download_only_mirrors_the_cloud_and_never_writes_to_it() {
     let mut f = Fixture::new("mirror");
     f.engine.download_only = true;
@@ -3044,6 +3118,99 @@ fn a_new_rule_removes_the_cloud_copy_and_keeps_the_local_one() {
     f.engine.ignore = Rules::default();
     f.engine.full_scan();
     assert!(f.remote("a.log").exists());
+}
+
+#[test]
+fn thousands_of_adopted_files_all_get_their_row_across_several_transactions() {
+    let mut f = Fixture::new("adopt-batches");
+    for i in 0..ADOPT_BATCH * 2 + 100 {
+        write(f.local(&format!("d/{i}.txt")), "x", 100);
+    }
+    f.engine.full_scan();
+    // A new database, as for an account whose folder already matches the cloud: every file is adopted.
+    f.engine.db = Db::memory().unwrap();
+    let r = f.engine.full_scan();
+    assert!(r.errors.is_empty() && r.transferred == 0, "{r:?}");
+    assert_eq!(f.engine.db.count().unwrap(), ADOPT_BATCH * 2 + 100);
+}
+
+#[test]
+fn a_walk_from_a_subfolder_applies_the_rules_and_unchecked_folders_to_root_paths() {
+    let f = Fixture::new("scan-from");
+    write(f.local("d/keep.txt"), "k", 100);
+    write(f.local("d/build/o.bin"), "b", 100);
+    write(f.local("d/off/x.txt"), "x", 100);
+    let (files, dirs, bad) = scan_from(&f.local("d"), "d", &["d/off".to_string()], &Rules::parse("build/"));
+    assert_eq!(files.keys().collect::<Vec<_>>(), ["d/keep.txt"]);
+    assert_eq!(dirs.into_iter().collect::<Vec<_>>(), Vec::<String>::new());
+    assert!(bad.is_empty());
+}
+
+/// Writes down the order of uploads and deletes.
+struct Ordered(DirRemote, std::sync::Mutex<Vec<String>>);
+impl Remote for Ordered {
+    fn list(&self) -> Result<Vec<Item>> {
+        self.0.list()
+    }
+    fn stat(&self, rel: &str) -> Result<Option<Item>> {
+        self.0.stat(rel)
+    }
+    fn upload(&self, root: &Path, rel: &str) -> Result<()> {
+        self.1.lock().unwrap().push(format!("up {rel}"));
+        self.0.upload(root, rel)
+    }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.0.make_dir(rel)
+    }
+    fn download(&self, rel: &str, dest: &Path) -> Result<()> {
+        self.0.download(rel, dest)
+    }
+    fn delete(&self, rel: &str) -> Result<()> {
+        self.1.lock().unwrap().push(format!("del {rel}"));
+        self.0.delete(rel)
+    }
+}
+
+#[test]
+fn new_rules_go_up_before_the_cloud_deletes_they_cause() {
+    let f = Fixture::new("ignore-order");
+    let remote = DirRemote(f.engine.remote.0.clone());
+    let mut e = Engine::new(
+        f.engine.root.clone(),
+        Ordered(remote, Default::default()),
+        Db::memory().unwrap(),
+    );
+    write(f.local("a.log"), "l", 100);
+    e.full_scan();
+    e.remote.1.lock().unwrap().clear();
+    // Another machine that sees the delete before the rules would trash its own copy.
+    write(f.local(RULES), "*.log", 50);
+    e.ignore = Rules::parse("*.log");
+    let r = e.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(
+        *e.remote.1.lock().unwrap(),
+        [format!("up {RULES}"), "del a.log".to_string()]
+    );
+}
+
+#[test]
+fn a_run_that_brings_new_rules_in_leaves_its_local_deletes_for_the_next_run() {
+    let mut f = Fixture::new("ignore-arrives");
+    write(f.local("a.log"), "l", 100);
+    f.engine.full_scan();
+    // Another machine added the rule: its run deleted the cloud copy and uploaded the rules.
+    fs::remove_file(f.remote("a.log")).unwrap();
+    write(f.remote(RULES), "*.log", 50);
+    let r = f.engine.full_scan();
+    assert!(f.local("a.log").exists(), "not trashed: {r:?}");
+    assert_eq!(r.later, ["a.log"]);
+    assert!(r.errors.is_empty(), "no red card: {r:?}");
+    // The runner reads the new rules before the next run: the file is then just forgotten, still here.
+    f.engine.ignore = Rules::parse("*.log");
+    let r = f.engine.full_scan();
+    assert!(f.local("a.log").exists() && r.errors.is_empty(), "{r:?}");
+    assert!(f.engine.db.base("a.log").unwrap().is_none());
 }
 
 #[test]

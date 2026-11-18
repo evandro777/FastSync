@@ -186,6 +186,9 @@ const RETRY_PATHS_MAX: usize = 5000;
 /// pause after a batch and the run's own 3 s burst wait, with room to spare.
 const MASS_DELETE_HOLD: Duration = Duration::from_secs(60);
 
+/// How long a run waits after a synced file was removed here, for the same file to be written again (see `work`).
+const LOCAL_DELETE_HOLD: Duration = Duration::from_secs(10);
+
 /// What a change of the rules asks the engine to look at, as `(paths, cloud folders)`, or `None` when only a scan of
 /// everything can say (`Rules::change`, or a DB that cannot be read). Synced files the new rules hide are paths (the
 /// run turns them into cloud deletes, which the delete guard counts); names a removed rule used to hide are paths and
@@ -216,6 +219,15 @@ fn rules_since_last_scan(db: &Db, picker: &str, new: &Rules) -> Option<(Vec<Stri
         return None;
     }
     rules_delta(&Rules::parse(old_rules), new, db)
+}
+
+/// True when one of the watcher's `paths` is a synced file or folder that is gone from the disk: the run then waits
+/// `LOCAL_DELETE_HOLD` (a tool that removes a file and writes it again must not delete the cloud copy).
+fn removes_synced(root: &Path, db: &Db, paths: &[String]) -> bool {
+    paths.iter().any(|f| {
+        std::fs::symlink_metadata(root.join(f)).is_err()
+            && (db.base(f).ok().flatten().is_some() || db.dir_synced(f).is_ok_and(|s| s))
+    })
 }
 
 /// True when a run may start despite a hold (`Impact::mass_delete`): no hold, or the next batch came, or a full scan
@@ -550,6 +562,16 @@ fn work<R: Remote + 'static>(
     std::fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
     // Half-downloaded files of a run that was killed: nothing else ever removes them.
     let _ = std::fs::remove_dir_all(root.join(crate::engine::HIDDEN).join("tmp"));
+    // A user's file that sat aside while a download replaced it when the app quit: back into the trash, and said.
+    let rescued = crate::trash::recover_set_aside(&root);
+    if rescued > 0 {
+        db.log(
+            "error",
+            "",
+            None,
+            &format!("{rescued} file(s) set aside by an interrupted download are in .fastsync/trash"),
+        );
+    }
     // A login made before shortcuts were skipped: see `Rclone::skip_shortcuts`. Before anything is listed.
     if acct.kind == "drive" {
         rc.skip_shortcuts(&acct.id)?;
@@ -557,6 +579,11 @@ fn work<R: Remote + 'static>(
     let cursor = db.meta("cursor").ok().flatten();
     let mut engine = Engine::new(root.clone(), make_remote(&acct, &rc), db);
     engine.excluded = acct.excluded.clone();
+    // The vault is kept out of full listings by a filter; the feed's folder listings have none (see `list_under`).
+    if acct.kind == "onedrive" {
+        engine.excluded.push("Personal Vault".into());
+    }
+    engine.case_blind = matches!(acct.kind.as_str(), "dropbox" | "onedrive");
     engine.download_only = acct.download_only;
     engine.cancel = cancel.clone();
     // The unchecked list the last full scan was made with. When it differs (the user just saved the folder picker),
@@ -579,7 +606,8 @@ fn work<R: Remote + 'static>(
     // Local edits. If inotify cannot watch the tree (the watch limit), the walk timer runs more often.
     let watcher_tx = tx.clone();
     let watch_root = root.clone();
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+    // Not following symlinks: a link to `~` would otherwise put a watch on every folder of the home directory.
+    let handler = move |res: notify::Result<notify::Event>| {
         let ev = match res {
             Ok(ev) => ev,
             // A folder created after start-up found no watch left: say so, the 2-minute walk covers it meanwhile.
@@ -597,8 +625,9 @@ fn work<R: Remote + 'static>(
         if !paths.is_empty() {
             let _ = watcher_tx.send(Event::Local(paths));
         }
-    })
-    .map_err(|e| e.to_string())?;
+    };
+    let mut watcher = notify::RecommendedWatcher::new(handler, notify::Config::default().with_follow_symlinks(false))
+        .map_err(|e| e.to_string())?;
     let watching = watcher.watch(&root, RecursiveMode::Recursive);
     if let Err(e) = &watching {
         if matches!(e.kind, notify::ErrorKind::MaxFilesWatch) {
@@ -665,6 +694,10 @@ fn work<R: Remote + 'static>(
     let mut why: &'static str = "rescan";
     // The first loop turn waits for an event: this one makes it run the scan.
     if scan_at_start {
+        crate::debug::log(|| {
+            "scan     full scan queued: the unchecked folders or the ignore rules differ from the last finished scan"
+                .into()
+        });
         let _ = tx.send(Event::Full);
     }
     // A run of paths (not a full scan) that carries out a change of the rules, and so may confirm the `excluded` key.
@@ -721,18 +754,38 @@ fn work<R: Remote + 'static>(
         let mut released = false;
         for ev in events {
             match ev {
-                Event::Local(p) => pending.extend(p),
+                Event::Local(p) => {
+                    // A synced file removed here: an editor or tool that removes and writes it again a few seconds
+                    // later (past the burst wait above) must not get its cloud copy deleted and sent again.
+                    if hold_until.is_none() && removes_synced(&root, &engine.db, &p) {
+                        hold_until = Some(Instant::now() + LOCAL_DELETE_HOLD);
+                    }
+                    pending.extend(p);
+                }
                 Event::Remote(changes, cur) => {
                     // The saved folder map plus the folders earlier batches created and not yet saved.
                     let mut dirs: std::collections::HashMap<String, String> =
                         engine.db.dirs().unwrap_or_default().into_iter().collect();
                     dirs.extend(dir_adds.iter().cloned());
                     let db = &engine.db;
-                    let i = delta::impact(&changes, &dirs, root_id.as_deref(), |id| {
+                    let mut i = delta::impact(&changes, &dirs, root_id.as_deref(), |id| {
                         db.path_of_id(id).ok().flatten()
                     });
+                    if kind == "dropbox" {
+                        respell_dropbox(db, &mut i.paths);
+                        respell_dropbox(db, &mut i.dirs);
+                    }
                     dir_adds.extend(i.new_dirs.iter().cloned());
-                    if i.full_scan {
+                    // A new file or folder whose name rclone spells differently: the path built from the feed's raw
+                    // name would find nothing, so only a full listing can bring it.
+                    let respelled = changes.iter().any(|c| {
+                        c.path.is_none()
+                            && !c.removed
+                            && !dirs.contains_key(&c.id)
+                            && delta::rclone_encodes(&kind, &c.name)
+                            && db.path_of_id(&c.id).ok().flatten().is_none()
+                    });
+                    if i.full_scan || respelled {
                         mark(&mut full, &mut why, "feed");
                     }
                     // A big batch of deletions waits one poll for the new name of a folder renamed in the cloud; the
@@ -910,6 +963,8 @@ fn work<R: Remote + 'static>(
             // Raised when this closure ends, however it ends: `scope` joins the ticker before it lets a panic out.
             let _end = EndRun(&over);
             if full {
+                crate::debug::log(|| format!("scan     full scan, cause: {why}"));
+                log_scan_start(&engine.db, why);
                 on_status(syncing());
                 (engine.full_scan(), Vec::new(), Vec::new(), true)
             } else {
@@ -929,6 +984,15 @@ fn work<R: Remote + 'static>(
                     // A stop here may be a folder renamed in the cloud whose new name did not arrive within the hold
                     // (`MASS_DELETE_HOLD`): only a full scan, which pairs them, can see that.
                     if r.aborted.is_some() || r.wants_full {
+                        crate::debug::log(|| {
+                            let what = if r.aborted.is_some() {
+                                "the delete guard stopped it"
+                            } else {
+                                "too many folders"
+                            };
+                            format!("scan     full scan, cause: moves ({what}: a run of paths could not finish)")
+                        });
+                        log_scan_start(&engine.db, "moves");
                         (engine.full_scan(), paths, dirs, true)
                     } else {
                         (r, paths, dirs, false)
@@ -1137,8 +1201,14 @@ impl Drop for EndRun<'_> {
     }
 }
 
-/// What a cut-short run leaves to do: `(scan everything, paths to look at again)`. A cut-off full scan starts over; a
-/// run of some paths only needs those paths again, not a listing of the whole cloud.
+/// The row a full scan leaves when it *starts* (msg `start`; the finished one comes after it): a long scan, or one that
+/// never ends, still shows why it began. The quiet 5-minute `tick` is left out, as at the end (it would add ~288 a day).
+fn log_scan_start(db: &Db, cause: &str) {
+    if cause != "tick" {
+        db.log("scan", &format!("full:{cause}"), None, "start");
+    }
+}
+
 /// Asks for a full scan; the first cause stays the one the log shows.
 fn mark(full: &mut bool, why: &mut &'static str, cause: &'static str) {
     if !*full {
@@ -1178,6 +1248,8 @@ fn run_wanted(
     full || walk || !pending.is_empty() || !feed_paths.is_empty() || !feed_dirs.is_empty()
 }
 
+/// What a cut-short run leaves to do: `(scan everything, paths to look at again)`. A cut-off full scan starts over; a
+/// run of some paths only needs those paths again, not a listing of the whole cloud.
 fn after_cancel(did_full: bool, ran: Vec<String>) -> (bool, Vec<String>) {
     if did_full { (true, Vec::new()) } else { (false, ran) }
 }
@@ -1209,6 +1281,44 @@ fn clean(r: &Report) -> bool {
     r.errors.len() <= r.skipped && r.aborted.is_none() && !r.cancelled
 }
 
+/// Dropbox's feed spells only the last part of a path reliably (`path_display`: its folders may be in the case of an
+/// older name). The engine compares exact paths, so `docs/Work/b.txt` for the synced `Docs/Work/b.txt` would find no
+/// row, and a new `docs/New` would be made beside `Docs/`. The folder part is put into the spelling the DB knows
+/// (only when that is the one case-insensitive match); the last part stays as reported.
+fn respell_dropbox(db: &Db, paths: &mut Vec<String>) {
+    fn canon(db: &Db, dir: &str, cache: &mut std::collections::HashMap<String, String>) -> String {
+        if let Some(c) = cache.get(dir) {
+            return c.clone();
+        }
+        let given = match dir.rsplit_once('/') {
+            Some((up, name)) => format!("{}/{name}", canon(db, up, cache)),
+            None => dir.to_string(),
+        };
+        let known = db.dirs_ci(&given.to_ascii_lowercase()).unwrap_or_default();
+        let same: Vec<&String> = known
+            .iter()
+            .filter(|k| k.to_lowercase() == given.to_lowercase())
+            .collect();
+        let c = match same.as_slice() {
+            [one] => (*one).clone(),
+            _ => given,
+        };
+        cache.insert(dir.to_string(), c.clone());
+        c
+    }
+    let mut cache = std::collections::HashMap::new();
+    for p in paths.iter_mut() {
+        if let Some((dir, last)) = p.rsplit_once('/') {
+            let c = canon(db, dir, &mut cache);
+            if c != dir {
+                *p = format!("{c}/{last}");
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+}
+
 /// Runs the provider's feed: long polls (Dropbox) or polls every 30 s, and hands the changes to the worker.
 fn poller(mut feed: Box<dyn delta::RemoteChanges>, cursor: Option<String>, tx: Sender<Event>, stop: Arc<AtomicBool>) {
     std::thread::spawn(move || {
@@ -1219,6 +1329,8 @@ fn poller(mut feed: Box<dyn delta::RemoteChanges>, cursor: Option<String>, tx: S
             }
         };
         // Drive and OneDrive report parents by id: the id of the cloud's root tells the synced tree's files apart.
+        // Same back-off and warning rule as the poll below: started offline, a Warn every 30 s filled the log.
+        let mut root_failures = 0u32;
         while !stop.load(Ordering::Relaxed) {
             match feed.root_id() {
                 Ok(id) => {
@@ -1226,8 +1338,12 @@ fn poller(mut feed: Box<dyn delta::RemoteChanges>, cursor: Option<String>, tx: S
                     break;
                 }
                 Err(e) => {
-                    let _ = tx.send(Event::Warn(e));
-                    sleep(Duration::from_secs(30));
+                    let asked = delta::retry_hint(&e).unwrap_or_default().as_secs();
+                    if root_failures >= 2 {
+                        let _ = tx.send(Event::Warn(e));
+                    }
+                    sleep(Duration::from_secs((30u64 << root_failures.min(5)).max(asked).min(600)));
+                    root_failures += 1;
                 }
             }
         }
@@ -1288,6 +1404,60 @@ fn poller(mut feed: Box<dyn delta::RemoteChanges>, cursor: Option<String>, tx: S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_synced_path_gone_from_the_disk_starts_the_local_delete_hold() {
+        let root = std::env::temp_dir().join(format!("fastsync-removes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("here")).unwrap();
+        std::fs::write(root.join("kept.txt"), "x").unwrap();
+        let db = Db::memory().unwrap();
+        let sig = crate::decide::Sig { size: 1, mtime: 1 };
+        for p in ["kept.txt", "gone.txt"] {
+            db.set(
+                p,
+                &crate::decide::Base {
+                    local: sig,
+                    remote: sig,
+                },
+                "",
+            )
+            .unwrap();
+        }
+        db.add_dir_row("here").unwrap();
+        db.add_dir_row("gone-dir").unwrap();
+        let s = |p: &str| vec![p.to_string()];
+        assert!(removes_synced(&root, &db, &s("gone.txt")), "a synced file that is gone");
+        assert!(
+            removes_synced(&root, &db, &s("gone-dir")),
+            "a synced folder that is gone"
+        );
+        assert!(!removes_synced(&root, &db, &s("kept.txt")), "still there");
+        assert!(!removes_synced(&root, &db, &s("here")), "a folder still there");
+        assert!(
+            !removes_synced(&root, &db, &s("never-synced.txt")),
+            "no row, nothing to protect"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dropbox_feed_paths_get_the_folder_spelling_the_db_knows() {
+        let db = Db::memory().unwrap();
+        db.add_dir_row("Docs").unwrap();
+        db.add_dir_row("Docs/Work").unwrap();
+        let mut p: Vec<String> = ["docs/work/b.txt", "docs/New", "other/x", "top.txt"]
+            .map(String::from)
+            .into();
+        respell_dropbox(&db, &mut p);
+        // The last part stays as reported; an unknown folder is left alone.
+        assert_eq!(p, ["Docs/New", "Docs/Work/b.txt", "other/x", "top.txt"]);
+        // Two known spellings: no guess.
+        db.add_dir_row("docs").unwrap();
+        let mut p = vec!["DOCS/a.txt".to_string()];
+        respell_dropbox(&db, &mut p);
+        assert_eq!(p, ["DOCS/a.txt"]);
+    }
 
     #[test]
     fn a_change_of_rules_is_looked_at_by_path_unless_only_everything_can_say() {

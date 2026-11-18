@@ -55,14 +55,16 @@ fn a_late_first_cursor_does_not_start_a_second_full_scan() {
     };
     let runner = spawn_feed(acct, rc, |_, _| Some(Box::new(SlowStart)), |_| {}, |_, _| {});
     let db = account_dir("a1").unwrap().join("state.db");
-    let scans = || -> Vec<String> {
+    // Finished scans only; the row a scan leaves when it starts (msg `start`) is counted apart below.
+    let rows = |start: bool| -> Vec<String> {
         read_log(&db, 50)
             .unwrap_or_default()
             .into_iter()
-            .filter(|e| e.kind == "scan")
+            .filter(|e| e.kind == "scan" && (e.msg == "start") == start)
             .map(|e| e.path)
             .collect()
     };
+    let scans = || rows(false);
     let end = Instant::now() + Duration::from_secs(60);
     while scans().is_empty() {
         assert!(Instant::now() < end, "the first scan never ran");
@@ -71,6 +73,7 @@ fn a_late_first_cursor_does_not_start_a_second_full_scan() {
     // Long enough for a second scan to show up if one were queued behind the first.
     std::thread::sleep(Duration::from_secs(6));
     assert_eq!(scans(), ["full:rescan"], "one scan only");
+    assert_eq!(rows(true), ["full:rescan"], "and it logged why it began");
     // The clean scan confirms the first cursor, or the next start would scan everything again.
     let saved = fastsync_core::db::Db::open(&db).unwrap().meta("cursor").unwrap();
     assert_eq!(saved.as_deref(), Some("c1"), "the cursor was not saved");

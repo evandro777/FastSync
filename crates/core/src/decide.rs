@@ -205,23 +205,6 @@ pub fn delete_guard_ok(deletes: usize, known: usize, percent: usize) -> bool {
     deletes * 100 <= known * percent
 }
 
-/// Groups of paths that differ only by case. Dropbox and OneDrive treat them as one file, so syncing them would
-/// make one overwrite the other.
-pub fn case_collisions<'a>(paths: impl Iterator<Item = &'a str>) -> std::collections::HashSet<String> {
-    let mut seen: std::collections::HashMap<String, &str> = Default::default();
-    let mut bad = std::collections::HashSet::new();
-    for p in paths {
-        match seen.insert(p.to_lowercase(), p) {
-            Some(prev) if prev != p => {
-                bad.insert(p.to_string());
-                bad.insert(prev.to_string());
-            }
-            _ => {}
-        }
-    }
-    bad
-}
-
 /// What to do with one folder (empty or not: its files have their own rows).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirAction {
@@ -475,13 +458,6 @@ mod tests {
         // Nothing new at all: skipped, as before.
         let g = [fact("A.txt", true, true, true, 0), fact("a.txt", true, true, true, 0)];
         assert_eq!(resolve_case_group(&g).skip.len(), 2);
-    }
-
-    #[test]
-    fn case_only_names_collide() {
-        let bad = case_collisions(["a.txt", "A.txt", "b.txt", "dir/c", "dir/c"].into_iter());
-        assert_eq!(bad.len(), 2);
-        assert!(bad.contains("a.txt") && bad.contains("A.txt"));
     }
 
     #[test]

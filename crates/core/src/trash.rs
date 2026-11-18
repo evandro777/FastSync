@@ -12,6 +12,22 @@ pub fn trash_dir(root: &Path) -> PathBuf {
     root.join(HIDDEN).join("trash")
 }
 
+/// Moves what a quit or crash left in `trash/set-aside` (the user's file while a download replaced it) into a dated
+/// batch, `trash/<now>/recovered/`, where the age purge, the size count and Empty Trash handle it. Returns how many.
+pub fn recover_set_aside(root: &Path) -> usize {
+    let aside = trash_dir(root).join("set-aside");
+    let Ok(entries) = fs::read_dir(&aside) else { return 0 };
+    let dest = trash_dir(root).join(now_secs().to_string()).join("recovered");
+    let mut n = 0;
+    for e in entries.flatten() {
+        if fs::create_dir_all(&dest).is_ok() && fs::rename(e.path(), dest.join(e.file_name())).is_ok() {
+            n += 1;
+        }
+    }
+    let _ = fs::remove_dir(&aside);
+    n
+}
+
 /// (files, bytes) in the trash. Never follows a symlink: a link counts as a file of its own size.
 pub fn trash_usage(root: &Path) -> (u64, u64) {
     fn go(dir: &Path, total: &mut (u64, u64)) {

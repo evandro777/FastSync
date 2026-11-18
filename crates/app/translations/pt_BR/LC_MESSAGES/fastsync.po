@@ -244,6 +244,10 @@ msgid "Full check: {} changed, {} failed, {} s"
 msgstr "Verificação completa: {} alterados, {} com falha, {} s"
 
 msgctxt "Tr"
+msgid "Full check started"
+msgstr "Verificação completa iniciada"
+
+msgctxt "Tr"
 msgid "first check or the cloud's change list restarted"
 msgstr "primeira verificação ou a lista de mudanças da nuvem reiniciou"
 

@@ -56,6 +56,8 @@ fn spawn_rcd(config: &Path, port: u16, pass: &str) -> Result<Child> {
         .arg("--config")
         .arg(config)
         .args(["--log-level", if crate::debug::enabled() { "INFO" } else { "ERROR" }])
+        // UTC like `debug::stamp`, which copies this shape, so the two logs read as one (rclone's default is local).
+        .args(["--log-format", "date,time,UTC"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(if crate::debug::enabled() {

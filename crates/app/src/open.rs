@@ -4,6 +4,10 @@ use super::*;
 
 /// Opens a folder in the file manager. Waiting in a thread reaps the child; a dropped `Child` would stay a zombie.
 pub(crate) fn xdg_open(what: String) {
+    // A name starting with `-` would be read as an option; every real target is an absolute path or a URL.
+    if what.starts_with('-') {
+        return;
+    }
     std::thread::spawn(move || {
         if let Err(e) = std::process::Command::new("xdg-open").arg(&what).status() {
             eprintln!("cannot open {what}: {e}");

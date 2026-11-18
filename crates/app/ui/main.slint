@@ -54,6 +54,7 @@ export global Tr {
     public pure function log-last-ok(when: string) -> string { return @tr("Last file synced: {}", when); }
     public pure function log-last-bad(when: string) -> string { return @tr("Last problem: {}", when); }
     public pure function log-scan-full(changed: int, failed: int, secs: string) -> string { return @tr("Full check: {} changed, {} failed, {} s", changed, failed, secs); }
+    public pure function log-scan-start() -> string { return @tr("Full check started"); }
     public pure function log-scan-why(code: string) -> string {
         if code == "reset" { return @tr("first check or the cloud's change list restarted"); }
         if code == "feed" { return @tr("a folder changed in the cloud"); }
