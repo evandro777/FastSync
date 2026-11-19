@@ -27,7 +27,7 @@
   <launchable type="desktop-id">io.github.evandro777.FastSync.desktop</launchable>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="0.2.7" date="2026-11-18">
+    <release version="0.2.8" date="2026-11-19">
       <description>
         <p>More reliable, and faster with ignore rules.</p>
         <ul>
@@ -50,6 +50,7 @@
           <li>Changes to the ignore-rules file can no longer make another computer trash files.</li>
           <li>First syncs onto an existing folder are faster and safer.</li>
           <li>Drive and MEGA no longer treat names that differ only by case as clashes.</li>
+          <li>Sync folder renames, moves and copies in the cloud; guard and feed fixes.</li>
           <li>Bug fixes.</li>
         </ul>
       </description>

@@ -41,6 +41,8 @@ pub enum Status {
 enum Event {
     /// Local edits from inotify.
     Local(Vec<String>),
+    /// A rename the watcher saw as one event: `(from, to)`, sent just before the `Local` for the same paths.
+    Moved(String, String),
     /// The remote feed's changes and the cursor after them.
     Remote(Vec<Change>, String),
     /// The remote feed's cursor was (re)started: compare everything once.
@@ -411,11 +413,11 @@ impl Retry {
     /// `persist`, also writing the folders the feed's batches created (Drive/OneDrive) between the two: after the failed
     /// paths (a listing of one that failed is kept), before the cursor (a replayed batch would find the folder known and
     /// not list it again). Written only when the cursor is, so a batch that is replayed finds the map as it was.
-    fn persist_with(&mut self, db: &Db, r: &Report, cursor: Option<&str>, dirs: &[(String, String)]) -> bool {
+    fn persist_with(&mut self, db: &Db, r: &Report, cursor: Option<&str>, dirs: &[DirOp]) -> bool {
         let remembered = self.save(db);
         match cursor {
             Some(c) if remembered && self.may_confirm(r) => {
-                db.add_dirs(dirs).is_ok() && db.set_meta("cursor", c).is_ok()
+                save_dir_ops(db, dirs).is_ok() && db.set_meta("cursor", c).is_ok()
             }
             _ => false,
         }
@@ -425,6 +427,54 @@ impl Retry {
     fn may_confirm(&self, r: &Report) -> bool {
         r.aborted.is_none() && !r.cancelled && !r.has_global_failure() && !self.full
     }
+}
+
+/// What a feed batch says about a folder of the cloud (Drive/OneDrive report ids; the map is id -> path).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DirOp {
+    /// Created: `(id, path)`.
+    Add(String, String),
+    /// Renamed or moved: the folder and every folder below it get the new path.
+    Move(String, String),
+    /// Deleted: the folder and every folder below it leave the map.
+    Drop(String),
+}
+
+/// True when `p` is `q` or lies inside it.
+fn inside(p: &str, q: &str) -> bool {
+    p == q || p.strip_prefix(q).is_some_and(|r| r.starts_with('/'))
+}
+
+/// The folder map (id -> path) as `ops` leave it, in order: what the next batch is resolved against while the ops are
+/// not saved yet. The same rules as `save_dir_ops`, which does it to the DB.
+fn apply_dir_ops(dirs: &mut std::collections::HashMap<String, String>, ops: &[DirOp]) {
+    for op in ops {
+        match op {
+            // As the DB does it (`INSERT OR IGNORE`): a row from a full scan is never overwritten.
+            DirOp::Add(id, p) => {
+                dirs.entry(id.clone()).or_insert_with(|| p.clone());
+            }
+            DirOp::Move(old, new) => {
+                for p in dirs.values_mut().filter(|p| inside(p, old)) {
+                    *p = format!("{new}{}", &p[old.len()..]);
+                }
+            }
+            DirOp::Drop(old) => dirs.retain(|_, p| !inside(p, old)),
+        }
+    }
+}
+
+/// Writes `ops` to the DB in order. A failure leaves the batch to be replayed (the cursor is not saved), which every
+/// op survives: an add is `INSERT OR IGNORE`, a move or drop of a folder already moved or dropped finds nothing.
+fn save_dir_ops(db: &Db, ops: &[DirOp]) -> Result<(), rusqlite::Error> {
+    for op in ops {
+        match op {
+            DirOp::Add(id, p) => db.add_dirs(&[(id.clone(), p.clone())])?,
+            DirOp::Move(old, new) => db.move_dir_ids(old, new)?,
+            DirOp::Drop(old) => db.drop_dir_ids(old)?,
+        }
+    }
+    Ok(())
 }
 
 /// Set when inotify ran out of watches (any account); Preferences then shows how to raise the limit. Only a restart
@@ -622,6 +672,12 @@ fn work<R: Remote + 'static>(
             return;
         }
         let paths: Vec<String> = ev.paths.iter().filter_map(|p| rel(&watch_root, p)).collect();
+        // inotify's own pairing of a rename (both names, one event): the proof that this very file or folder moved.
+        if let EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::Both)) = ev.kind
+            && let [from, to] = paths.as_slice()
+        {
+            let _ = watcher_tx.send(Event::Moved(from.clone(), to.clone()));
+        }
         if !paths.is_empty() {
             let _ = watcher_tx.send(Event::Local(paths));
         }
@@ -679,6 +735,8 @@ fn work<R: Remote + 'static>(
     }
     // `pending`: paths from inotify; `feed_paths`: paths from the cloud's feed (see `Engine::paths_to_sync`).
     let (mut pending, mut feed_paths) = (BTreeSet::new(), BTreeSet::new());
+    // Renames the watcher saw, for the next run of paths only (`Engine.local_moves`).
+    let mut moves: Vec<(String, String)> = Vec::new();
     // Cloud folders the feed reported without their contents (a new or moved Dropbox folder): listed alone by the run.
     let mut feed_dirs: BTreeSet<String> = BTreeSet::new();
     // Only the rules file changed since the last settled scan, and the feed covers the cloud: the files it concerns are
@@ -717,8 +775,9 @@ fn work<R: Remote + 'static>(
     let mut alert_at = Instant::now();
     // Set by a feed batch of many deletions: no run before it (unless a scan is due), see `Impact::mass_delete`.
     let mut hold_until: Option<Instant> = None;
-    // Folders the feed reported as created (Drive/OneDrive: id, path), saved with the cursor that moves past them.
-    let mut dir_adds: Vec<(String, String)> = Vec::new();
+    // What the feed said about folders (Drive/OneDrive: created, renamed or moved, deleted), saved with the cursor that
+    // moves past it, in the order it came.
+    let mut dir_adds: Vec<DirOp> = Vec::new();
     loop {
         if !conflicts.is_empty() && Instant::now() >= alert_at {
             let all = std::mem::take(&mut conflicts);
@@ -762,11 +821,35 @@ fn work<R: Remote + 'static>(
                     }
                     pending.extend(p);
                 }
+                Event::Moved(from, to) => moves.push((from, to)),
                 Event::Remote(changes, cur) => {
-                    // The saved folder map plus the folders earlier batches created and not yet saved.
+                    // The saved folder map plus what earlier batches said and is not yet saved.
                     let mut dirs: std::collections::HashMap<String, String> =
                         engine.db.dirs().unwrap_or_default().into_iter().collect();
-                    dirs.extend(dir_adds.iter().cloned());
+                    apply_dir_ops(&mut dirs, &dir_adds);
+                    // The echo of our own uploads, moves and deletes is not looked at: 25 files moved here came back
+                    // as 58 paths and a lookup for each. Dropbox says path, size and time; Drive and OneDrive say the
+                    // id, size, time and content hash, which must equal what the row kept. The cursor moves on as usual.
+                    let changes = {
+                        let before = changes.len();
+                        let (dropped, kept): (Vec<Change>, Vec<Change>) = changes.into_iter().partition(|c| {
+                            if kind == "dropbox" {
+                                engine.feed_echo(c)
+                            } else {
+                                engine.feed_echo_id(c, &dirs, root_id.as_deref())
+                            }
+                        });
+                        crate::debug::log(|| {
+                            format!("feed     {} change(s), {} were our own echo", before, dropped.len())
+                        });
+                        // A listing an unfinished scan kept must still hear of them (a delete we have no row for is
+                        // not an action, but the kept folder may hold the file).
+                        let touched: Vec<String> = dropped.into_iter().filter_map(|c| c.path).collect();
+                        if !touched.is_empty() {
+                            engine.remote.forget_listed(Some(&touched));
+                        }
+                        kept
+                    };
                     let db = &engine.db;
                     let mut i = delta::impact(&changes, &dirs, root_id.as_deref(), |id| {
                         db.path_of_id(id).ok().flatten()
@@ -775,18 +858,27 @@ fn work<R: Remote + 'static>(
                         respell_dropbox(db, &mut i.paths);
                         respell_dropbox(db, &mut i.dirs);
                     }
-                    dir_adds.extend(i.new_dirs.iter().cloned());
                     // A new file or folder whose name rclone spells differently: the path built from the feed's raw
-                    // name would find nothing, so only a full listing can bring it.
+                    // name would find nothing, so only a full listing can bring it. Likewise a known folder renamed or
+                    // moved to such a name.
                     let respelled = changes.iter().any(|c| {
                         c.path.is_none()
                             && !c.removed
-                            && !dirs.contains_key(&c.id)
                             && delta::rclone_encodes(&kind, &c.name)
-                            && db.path_of_id(&c.id).ok().flatten().is_none()
+                            && ((!dirs.contains_key(&c.id) && db.path_of_id(&c.id).ok().flatten().is_none())
+                                || (c.is_dir
+                                    && i.dir_moves
+                                        .iter()
+                                        .any(|(_, new)| new.rsplit('/').next() == Some(&c.name))))
                     });
                     if i.full_scan || respelled {
                         mark(&mut full, &mut why, "feed");
+                    } else {
+                        // The folder map follows the feed: created, renamed or moved, deleted. (A full scan replaces
+                        // the whole map, so nothing is kept for it.)
+                        dir_adds.extend(i.new_dirs.iter().map(|(id, p)| DirOp::Add(id.clone(), p.clone())));
+                        dir_adds.extend(i.dir_moves.iter().map(|(o, n)| DirOp::Move(o.clone(), n.clone())));
+                        dir_adds.extend(i.dir_gone.iter().map(|p| DirOp::Drop(p.clone())));
                     }
                     // A big batch of deletions waits one poll for the new name of a folder renamed in the cloud; the
                     // next batch (any) ends the wait, and the guard still judges what is left.
@@ -845,7 +937,11 @@ fn work<R: Remote + 'static>(
                     // Only a held account has anything to resolve, and a mirror cannot put files back in the cloud.
                     if held.is_some() && !(d == Decision::Restore && acct.download_only) {
                         resolution = Some(d);
-                        mark(&mut full, &mut why, "decision");
+                        mark(
+                            &mut full,
+                            &mut why,
+                            if d == Decision::Restore { "restore" } else { "delete" },
+                        );
                     }
                 }
                 Event::Pause(p) => {
@@ -937,6 +1033,7 @@ fn work<R: Remote + 'static>(
         // approved. Everything that arrives meanwhile is read again by the full scan after the decision.
         if held.is_some() && resolution.is_none() {
             pending.clear();
+            moves.clear();
             feed_paths.clear();
             feed_dirs.clear();
             // The paths of a change of the rules are dropped with the rest: the scan after the decision does it all.
@@ -953,9 +1050,12 @@ fn work<R: Remote + 'static>(
             .filter(|d| *d == Decision::Delete)
             .and(held.as_ref().map(|h| h.deletes));
         engine.restore = resolution == Some(Decision::Restore);
+        engine.local_moves = std::mem::take(&mut moves);
         let progress = engine.progress.clone();
         let over = AtomicBool::new(false);
         let began = Instant::now();
+        // Why a full scan ran, for the log: the event that asked for one, or what a run of paths escalated for.
+        let mut cause = if full { why } else { "moves" };
         // The report, the paths and cloud folders the run looked at (none for a full scan) and whether it compared
         // everything.
         let (report, ran, ran_dirs, did_full) = std::thread::scope(|s| {
@@ -983,16 +1083,12 @@ fn work<R: Remote + 'static>(
                     let r = engine.sync_paths_in(&paths, &dirs);
                     // A stop here may be a folder renamed in the cloud whose new name did not arrive within the hold
                     // (`MASS_DELETE_HOLD`): only a full scan, which pairs them, can see that.
-                    if r.aborted.is_some() || r.wants_full {
+                    if r.aborted_local_deletes || r.wants_full {
+                        cause = if r.aborted_local_deletes { "guard" } else { "folders" };
                         crate::debug::log(|| {
-                            let what = if r.aborted.is_some() {
-                                "the delete guard stopped it"
-                            } else {
-                                "too many folders"
-                            };
-                            format!("scan     full scan, cause: moves ({what}: a run of paths could not finish)")
+                            format!("scan     full scan, cause: {cause} (a run of paths could not finish)")
                         });
-                        log_scan_start(&engine.db, "moves");
+                        log_scan_start(&engine.db, cause);
                         (engine.full_scan(), paths, dirs, true)
                     } else {
                         (r, paths, dirs, false)
@@ -1008,6 +1104,7 @@ fn work<R: Remote + 'static>(
             let touched: Vec<String> = ran.iter().chain(&ran_dirs).cloned().collect();
             engine.remote.forget_listed(Some(&touched));
         }
+        engine.local_moves.clear();
         pending.clear();
         feed_paths.clear();
         feed_dirs.clear();
@@ -1019,7 +1116,6 @@ fn work<R: Remote + 'static>(
         // A run that did nothing (the 2-minute walk) leaves no trace, or it would flood the log. The `scan` row holds
         // values only (path = mode, size = milliseconds, msg = "transfers problems"); the dialog words it.
         // A full scan is always logged with its cause, except the quiet 5-minute tick of providers without a feed.
-        let cause = if full { why } else { "moves" };
         if report.transferred > 0 || !report.errors.is_empty() || (did_full && cause != "tick") {
             engine.db.log(
                 "scan",
@@ -1780,7 +1876,8 @@ mod tests {
         let mut r = Retry::default();
         r.finish_run(&failed(&["a"]), &s(&["a"]), false, false, t0);
         let folder = [("id".to_string(), "docs".to_string())];
-        assert!(!r.persist_with(&db, &failed(&["a"]), cur, &folder));
+        let add = [DirOp::Add("id".into(), "docs".into())];
+        assert!(!r.persist_with(&db, &failed(&["a"]), cur, &add));
         assert_eq!(db.meta("cursor").unwrap().as_deref(), Some("cursor-1"));
         assert!(db.dirs().unwrap().is_empty(), "the folders wait with the cursor");
         // The folders a feed batch created are saved with the cursor that moves past them, and never over a row a full
@@ -1788,7 +1885,7 @@ mod tests {
         let db = Db::memory().unwrap();
         let mut r = Retry::default();
         r.finish_run(&Report::default(), &[], false, false, t0);
-        assert!(r.persist_with(&db, &Report::default(), cur, &folder));
+        assert!(r.persist_with(&db, &Report::default(), cur, &add));
         assert_eq!(db.dirs().unwrap(), folder);
         db.add_dirs(&[("id".to_string(), "elsewhere".to_string())]).unwrap();
         assert_eq!(db.dirs().unwrap(), folder);
@@ -1804,6 +1901,40 @@ mod tests {
         assert!(r.persist(&db, &Report::default(), cur));
         // No cursor to confirm (the feed had nothing): nothing is written.
         assert!(!r.persist(&db, &Report::default(), None));
+    }
+
+    #[test]
+    fn folder_ops_give_the_same_map_in_memory_and_in_the_db() {
+        let ops = [
+            DirOp::Add("A".into(), "docs".into()),
+            DirOp::Add("B".into(), "docs/sub".into()),
+            DirOp::Add("C".into(), "docs2".into()),
+            DirOp::Move("docs".into(), "papers".into()),
+            DirOp::Add("D".into(), "papers/sub/deep".into()),
+            DirOp::Drop("papers/sub".into()),
+        ];
+        let mut mem = std::collections::HashMap::new();
+        apply_dir_ops(&mut mem, &ops);
+        let db = Db::memory().unwrap();
+        save_dir_ops(&db, &ops).unwrap();
+        let mut saved = db.dirs().unwrap();
+        saved.sort();
+        let mut want: Vec<_> = mem.into_iter().collect();
+        want.sort();
+        assert_eq!(saved, want);
+        // `docs2` is not inside `docs`, and the dropped folder took what was below it.
+        assert_eq!(
+            saved,
+            [
+                ("A".to_string(), "papers".to_string()),
+                ("C".to_string(), "docs2".to_string())
+            ]
+        );
+        // Replayed after a failed batch: the same map.
+        save_dir_ops(&db, &ops[3..]).unwrap();
+        let mut again = db.dirs().unwrap();
+        again.sort();
+        assert_eq!(again[0], ("A".to_string(), "papers".to_string()));
     }
 
     #[test]

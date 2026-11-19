@@ -20,6 +20,13 @@ pub struct Change {
     pub path: Option<String>,
     pub removed: bool,
     pub is_dir: bool,
+    /// Size and modified time (epoch ms, as the listing reports them) of a file entry. They let the runner drop the
+    /// echo of what we synced ourselves (`Engine::feed_echo`, `feed_echo_id`).
+    pub size: Option<u64>,
+    pub mtime: Option<i64>,
+    /// The content hashes of a file entry (Drive and OneDrive; `(kind, value)` spelled like rclone's `Item.hash`: kind
+    /// `md5`, `sha1` or `quickxor`, value lowercase), the proof that an id's echo is the file we synced.
+    pub hashes: Vec<(String, String)>,
 }
 
 pub enum Poll {
@@ -185,11 +192,21 @@ impl RemoteChanges for Dropbox {
 
     fn poll(&mut self, cursor: &str) -> Result<Poll> {
         // The long poll endpoint takes no token and returns when something changed or after the timeout.
-        let (st, v) = self.http.post(
-            "https://notify.dropboxapi.com/2/files/list_folder/longpoll",
-            &json!({"cursor": cursor, "timeout": 30}),
-            false,
-        )?;
+        // 120 s, not the agent's 150: after a suspend the old connection is dead and only this limit ends the wait.
+        // Dropbox's jitter (30 s + up to 90 s) can make a live poll as slow as that: a timeout is then just
+        // "no changes", the cursor is unchanged.
+        let sent = self
+            .http
+            .agent
+            .post("https://notify.dropboxapi.com/2/files/list_folder/longpoll")
+            .config()
+            .timeout_global(Some(Duration::from_secs(120)))
+            .build()
+            .send_json(json!({"cursor": cursor, "timeout": 30}));
+        let (st, v) = match finish(sent) {
+            Err(e) if e.contains("timeout") => return Ok(Poll::Changes(Vec::new(), cursor.to_string())),
+            r => r?,
+        };
         if dropbox_reset(st, &v) {
             return Ok(Poll::Reset);
         }
@@ -253,6 +270,10 @@ pub fn dropbox_entries(v: &Value) -> Vec<Change> {
                 path: Some(path),
                 removed: tag == "deleted",
                 is_dir: tag == "folder",
+                size: (tag == "file").then(|| e["size"].as_u64()).flatten(),
+                mtime: (tag == "file")
+                    .then(|| e["client_modified"].as_str().and_then(crate::rclone::parse_time))
+                    .flatten(),
                 ..Default::default()
             })
         })
@@ -309,7 +330,7 @@ impl RemoteChanges for Drive {
         let (mut token, mut out) = (cursor.to_string(), Vec::new());
         loop {
             let url = format!(
-                "{DRIVE}/changes?pageToken={}&pageSize=1000&includeRemoved=true&fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(name,parents,mimeType,trashed))",
+                "{DRIVE}/changes?pageToken={}&pageSize=1000&includeRemoved=true&fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(name,parents,mimeType,trashed,size,modifiedTime,md5Checksum))",
                 crate::web::enc(&token)
             );
             let (st, v) = self.http.get(&url)?;
@@ -348,6 +369,14 @@ impl RemoteChanges for Drive {
     }
 }
 
+/// The `(kind, value)` pairs a feed entry has, lowercased as rclone's listing hash is (`Rclone::list`).
+fn hashes<const N: usize>(kinds: [(&str, &Value); N]) -> Vec<(String, String)> {
+    kinds
+        .into_iter()
+        .filter_map(|(k, v)| Some((k.to_string(), v.as_str().filter(|h| !h.is_empty())?.to_lowercase())))
+        .collect()
+}
+
 pub fn drive_changes(v: &Value) -> Vec<Change> {
     v["changes"]
         .as_array()
@@ -367,6 +396,10 @@ pub fn drive_changes(v: &Value) -> Vec<Change> {
                 removed: c["removed"].as_bool().unwrap_or(false) || f["trashed"].as_bool().unwrap_or(false),
                 is_dir: mime == DRIVE_FOLDER,
                 path: None,
+                // Drive sends `size` as a string. A folder has none.
+                size: f["size"].as_str().and_then(|n| n.parse().ok()),
+                mtime: f["modifiedTime"].as_str().and_then(crate::rclone::parse_time),
+                hashes: hashes([("md5", &f["md5Checksum"])]),
             })
         })
         .collect()
@@ -455,6 +488,14 @@ pub fn onedrive_items(v: &Value) -> Vec<Change> {
             removed: i.get("deleted").is_some(),
             is_dir: i.get("folder").is_some(),
             path: None,
+            size: i["size"].as_u64().filter(|_| i.get("file").is_some()),
+            mtime: i["fileSystemInfo"]["lastModifiedDateTime"]
+                .as_str()
+                .and_then(crate::rclone::parse_time),
+            hashes: hashes([
+                ("sha1", &i["file"]["hashes"]["sha1Hash"]),
+                ("quickxor", &i["file"]["hashes"]["quickXorHash"]),
+            ]),
         })
         .collect()
 }
@@ -477,6 +518,18 @@ pub struct Impact {
     /// A big batch of deletions: it may be the first half of a folder renamed in the cloud, whose new name arrives in
     /// the next batch. The runner holds the run for one poll so both halves are one run, where the moves are paired.
     pub mass_delete: bool,
+    /// Known folders (Drive/OneDrive) renamed or moved in this batch, `(old path, new path)`: both are in `paths` and
+    /// the new one in `dirs`, so the engine reads the new folder once and pairs the files into moves, and the runner
+    /// rewrites its folder map (`DirOp::Move`) with the cursor.
+    pub dir_moves: Vec<(String, String)>,
+    /// Known folders deleted in this batch: in `paths` (the engine finds the files under them in its rows) and dropped
+    /// from the runner's folder map.
+    pub dir_gone: Vec<String>,
+}
+
+/// True when `p` is `q` or lies inside it.
+fn within(p: &str, q: &str) -> bool {
+    p == q || p.strip_prefix(q).is_some_and(|r| r.starts_with('/'))
 }
 
 /// True when rclone keeps the file name `name` of a `kind` account under another spelling than the service sends it
@@ -549,6 +602,8 @@ pub fn impact(
     }
     out.new_dirs = fresh.iter().map(|(i, p)| (i.clone(), p.clone())).collect();
     out.new_dirs.sort();
+    // Known folders renamed, moved or deleted: `(old path, new path or None)`.
+    let mut dir_ops: Vec<(String, Option<String>)> = Vec::new();
     for c in changes {
         if let Some(p) = &c.path {
             // A new or moved Dropbox folder: what is inside it is not reported, so that folder is listed (and the
@@ -576,8 +631,16 @@ pub fn impact(
                     format!("{d}/{}", c.name)
                 }
             });
-            if c.removed || here.as_deref() != Some(known.as_str()) {
-                out.full_scan = true;
+            if c.removed {
+                dir_ops.push((known.clone(), None));
+            } else {
+                match here {
+                    Some(h) if h == *known => {}
+                    // A new parent we know: the two folders are read, not the whole cloud.
+                    Some(h) => dir_ops.push((known.clone(), Some(h))),
+                    // From or into a folder we know nothing of: only the whole cloud can say where it went.
+                    None => out.full_scan = true,
+                }
             }
             continue;
         }
@@ -599,6 +662,41 @@ pub fn impact(
         }
         // The old location of a renamed, moved or deleted file.
         out.paths.extend(path_of_id(&c.id));
+    }
+    // Two folder changes that touch each other (a folder and one inside it, a swap), or a folder created inside one
+    // that moves, have paths worked out from a map that this very batch makes stale: only the whole cloud is sure.
+    fn names(x: &(String, Option<String>)) -> [Option<&str>; 2] {
+        [Some(x.0.as_str()), x.1.as_deref()]
+    }
+    let touches = |a: &(String, Option<String>), b: &(String, Option<String>)| {
+        names(a)
+            .into_iter()
+            .flatten()
+            .any(|p| names(b).into_iter().flatten().any(|q| within(p, q) || within(q, p)))
+    };
+    let tangled = dir_ops
+        .iter()
+        .enumerate()
+        .any(|(i, a)| dir_ops[i + 1..].iter().any(|b| touches(a, b)))
+        || out.new_dirs.iter().any(|(_, p)| {
+            dir_ops
+                .iter()
+                .any(|(old, new)| within(p, old) || new.as_deref().is_some_and(|n| within(p, n)))
+        });
+    if tangled {
+        out.full_scan = true;
+    } else {
+        for (old, new) in dir_ops {
+            out.paths.push(old.clone());
+            match new {
+                Some(new) => {
+                    out.paths.push(new.clone());
+                    out.dirs.push(new.clone());
+                    out.dir_moves.push((old, new));
+                }
+                None => out.dir_gone.push(old),
+            }
+        }
     }
     out.paths.sort();
     out.paths.dedup();
@@ -684,6 +782,16 @@ mod tests {
     }
 
     #[test]
+    fn dropbox_file_entries_carry_size_and_time_as_the_listing_reports_them() {
+        let v = json!({"entries": [
+            {".tag": "file", "name": "a", "path_display": "/a", "size": 5, "client_modified": "1970-01-01T00:00:01Z"},
+            {".tag": "folder", "name": "d", "path_display": "/d", "size": 9},
+            {".tag": "file", "name": "b", "path_display": "/b"}]});
+        let got: Vec<_> = dropbox_entries(&v).iter().map(|c| (c.size, c.mtime)).collect();
+        assert_eq!(got, [(Some(5), Some(1000)), (None, None), (None, None)]);
+    }
+
+    #[test]
     fn drive_skips_docs_and_treats_trashed_as_removed() {
         let v = json!({"changes": [
             {"fileId": "1", "file": {"name": "a.txt", "parents": ["P"], "mimeType": "text/plain"}},
@@ -755,10 +863,7 @@ mod tests {
             i,
             Impact {
                 paths: vec!["a.txt".into(), "docs/b.txt".into()],
-                dirs: vec![],
-                full_scan: false,
-                mass_delete: false,
-                new_dirs: vec![]
+                ..Default::default()
             }
         );
         // Renamed inside the folder: the new and the old path.
@@ -805,24 +910,114 @@ mod tests {
             !impact(&[other_dir], &dirs, Some("R"), known).full_scan,
             "a folder elsewhere in the drive is not ours"
         );
-        // A deleted known folder: no folder facet, just its id.
+        // A deleted known folder: no folder facet, just its id. Its old path is looked at (the DB knows the files
+        // under it) and the folder leaves the map; no scan of the whole cloud.
         let gone_dir = Change {
             removed: true,
             ..ch("D", "", "")
         };
-        assert!(impact(&[gone_dir], &dirs, Some("R"), known).full_scan);
-        // A known folder reported again with the same name and parent (its content changed): no scan.
+        let g = impact(&[gone_dir], &dirs, Some("R"), known);
+        assert_eq!(
+            (g.full_scan, g.paths, g.dir_gone),
+            (false, vec!["docs".to_string()], vec!["docs".to_string()])
+        );
+        // A known folder reported again with the same name and parent (its content changed): nothing.
         let touched = Change {
             is_dir: true,
             ..ch("D", "docs", "R")
         };
-        assert!(!impact(&[touched], &dirs, Some("R"), known).full_scan);
-        // Renamed: scan.
+        assert_eq!(impact(&[touched], &dirs, Some("R"), known), Impact::default());
+        // Renamed: both names are looked at, the new one is read whole, and the map follows.
         let renamed = Change {
             is_dir: true,
             ..ch("D", "papers", "R")
         };
-        assert!(impact(&[renamed], &dirs, Some("R"), known).full_scan);
+        let r = impact(&[renamed], &dirs, Some("R"), known);
+        assert!(!r.full_scan);
+        assert_eq!(r.paths, ["docs", "papers"]);
+        assert_eq!(r.dirs, ["papers"]);
+        assert_eq!(r.dir_moves, [("docs".to_string(), "papers".to_string())]);
+        // Moved into a folder we know: the same. Into one we know nothing of: only the whole cloud can say.
+        let sub_dirs: HashMap<String, String> = [("D", "docs"), ("S", "docs/sub"), ("T", "other")]
+            .map(|(i, p)| (i.to_string(), p.to_string()))
+            .into();
+        let moved_dir = Change {
+            is_dir: true,
+            ..ch("S", "sub", "T")
+        };
+        let m = impact(&[moved_dir], &sub_dirs, Some("R"), known);
+        assert_eq!(m.dir_moves, [("docs/sub".to_string(), "other/sub".to_string())]);
+        let lost = Change {
+            is_dir: true,
+            ..ch("S", "sub", "ELSEWHERE")
+        };
+        assert!(impact(&[lost], &sub_dirs, Some("R"), known).full_scan);
+        // A folder and one inside it changed in the same batch (or a folder made inside one that moves): the paths
+        // would come from a map this batch makes stale, so the whole cloud is read.
+        let outer = Change {
+            is_dir: true,
+            ..ch("D", "papers", "R")
+        };
+        let inner = Change {
+            is_dir: true,
+            ..ch("S", "renamed", "D")
+        };
+        let t = impact(&[outer.clone(), inner], &sub_dirs, Some("R"), known);
+        assert!(t.full_scan && t.dir_moves.is_empty());
+        let made_inside = Change {
+            is_dir: true,
+            ..ch("N", "fresh", "D")
+        };
+        assert!(impact(&[outer, made_inside], &sub_dirs, Some("R"), known).full_scan);
+    }
+
+    #[test]
+    fn drive_and_onedrive_entries_carry_size_time_and_hashes_like_rclone_spells_them() {
+        let d = drive_changes(&json!({"changes": [
+            {"fileId": "1", "file": {"name": "a", "parents": ["P"], "mimeType": "text/plain", "size": "5",
+                "modifiedTime": "1970-01-01T00:00:01Z", "md5Checksum": "ABC123"}},
+            {"fileId": "2", "file": {"name": "d", "parents": ["P"], "mimeType": "application/vnd.google-apps.folder"}}]}));
+        assert_eq!(
+            (d[0].size, d[0].mtime, d[0].hashes.clone()),
+            (Some(5), Some(1000), vec![("md5".to_string(), "abc123".to_string())])
+        );
+        assert_eq!((d[1].size, d[1].hashes.len()), (None, 0));
+        let o = onedrive_items(&json!({"value": [
+            {"id": "1", "name": "a", "parentReference": {"id": "P"}, "size": 7,
+                "file": {"hashes": {"quickXorHash": "AbC=", "sha1Hash": "FF00"}},
+                "fileSystemInfo": {"lastModifiedDateTime": "1970-01-01T00:00:02Z"}},
+            {"id": "2", "name": "d", "parentReference": {"id": "P"}, "folder": {}, "size": 99}]}));
+        assert_eq!(
+            (o[0].size, o[0].mtime, o[0].hashes.clone()),
+            (
+                Some(7),
+                Some(2000),
+                vec![
+                    ("sha1".to_string(), "ff00".to_string()),
+                    ("quickxor".to_string(), "abc=".to_string())
+                ]
+            )
+        );
+        assert_eq!(o[1].size, None, "a folder's size is not a file's");
+    }
+
+    #[test]
+    fn fifty_removed_drive_entries_hold_the_run_but_one_folder_rename_does_not() {
+        let dirs: HashMap<String, String> = [("D".to_string(), "docs".to_string())].into();
+        let none = |_: &str| None;
+        let gone: Vec<Change> = (0..SPLIT_MOVE_MIN)
+            .map(|i| Change {
+                removed: true,
+                ..ch(&format!("f{i}"), "", "")
+            })
+            .collect();
+        assert!(impact(&gone, &dirs, Some("R"), none).mass_delete);
+        let rename = Change {
+            is_dir: true,
+            ..ch("D", "papers", "R")
+        };
+        let i = impact(&[rename], &dirs, Some("R"), none);
+        assert!(!i.mass_delete && !i.full_scan);
     }
 
     #[test]

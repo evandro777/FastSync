@@ -42,7 +42,8 @@ impl Db {
         c.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
              CREATE TABLE IF NOT EXISTS files(
-               path TEXT PRIMARY KEY, l_size INT, l_mtime INT, r_size INT, r_mtime INT, r_id TEXT NOT NULL DEFAULT '');
+               path TEXT PRIMARY KEY, l_size INT, l_mtime INT, r_size INT, r_mtime INT, r_id TEXT NOT NULL DEFAULT '',
+               r_hash TEXT);
              CREATE INDEX IF NOT EXISTS files_rid ON files(r_id);
              CREATE INDEX IF NOT EXISTS files_lsize ON files(l_size);
              CREATE INDEX IF NOT EXISTS files_lpath ON files(lower(path));
@@ -75,6 +76,19 @@ impl Db {
                 tx.execute("INSERT OR IGNORE INTO folders(path) VALUES(?)", [d])?;
             }
             tx.execute_batch("PRAGMA user_version=2")?;
+            tx.commit()?;
+        }
+        if version < 3 {
+            // 3: the cloud's content hash of a row (`kind:value`, NULL = not known), so the feed's echo of our own
+            // upload can be told from a real edit without asking the cloud. A new file has the column already.
+            let has = c
+                .prepare("SELECT 1 FROM pragma_table_info('files') WHERE name='r_hash'")?
+                .exists([])?;
+            let tx = c.unchecked_transaction()?;
+            if !has {
+                tx.execute_batch("ALTER TABLE files ADD COLUMN r_hash TEXT")?;
+            }
+            tx.execute_batch("PRAGMA user_version=3")?;
             tx.commit()?;
         }
         Ok(Self(c))
@@ -135,6 +149,28 @@ impl Db {
         st.query_map([lower], |r| r.get(0))?.collect()
     }
 
+    /// True when a file or folder row is at `lower` (already lower-cased, ASCII) or below it, whatever its case. Both
+    /// ranges use the expression indexes, so asking about one feed entry reads no table.
+    pub fn knows_ci(&self, lower: &str) -> Result<bool> {
+        let (lo, hi) = (format!("{lower}/"), format!("{lower}0"));
+        for table in ["files", "folders"] {
+            let hit: Option<i64> = self
+                .0
+                .query_row(
+                    &format!(
+                        "SELECT 1 FROM {table} WHERE lower(path)=?1 OR (lower(path) >= ?2 AND lower(path) < ?3) LIMIT 1"
+                    ),
+                    [lower, &lo, &hi],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if hit.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// `paths_ci` for the synced folders (`folders_lpath`).
     pub fn dirs_ci(&self, lower: &str) -> Result<Vec<String>> {
         let mut st = self.0.prepare("SELECT path FROM folders WHERE lower(path)=?")?;
@@ -193,18 +229,45 @@ impl Db {
 
     /// Written only after the transfer succeeded, so a kill mid-sync leaves the old row and the file is retried.
     pub fn set(&self, path: &str, b: &Base, remote_id: &str) -> Result<()> {
+        self.set_hashed(path, b, remote_id, None)
+    }
+
+    /// `set`, also keeping the cloud file's `(kind, value)` hash (as the listing spells it). A row written without one
+    /// never keeps an older row's hash: `INSERT OR REPLACE` starts from nothing.
+    pub fn set_hashed(&self, path: &str, b: &Base, remote_id: &str, hash: Option<&(String, String)>) -> Result<()> {
         self.0.execute(
-            "INSERT OR REPLACE INTO files(path,l_size,l_mtime,r_size,r_mtime,r_id) VALUES(?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO files(path,l_size,l_mtime,r_size,r_mtime,r_id,r_hash) VALUES(?,?,?,?,?,?,?)",
             params![
                 path,
                 b.local.size as i64,
                 b.local.mtime,
                 b.remote.size as i64,
                 b.remote.mtime,
-                remote_id
+                remote_id,
+                hash.map(|(k, v)| format!("{k}:{v}"))
             ],
         )?;
         Ok(())
+    }
+
+    /// The row of a remote file id: its path, how both sides looked, and the cloud hash when one was kept. For
+    /// recognising the feed's echo of a file we synced (`Engine::feed_echo_id`).
+    #[allow(clippy::type_complexity)]
+    pub fn by_id(&self, id: &str) -> Result<Option<(String, Base, Option<(String, String)>)>> {
+        self.0
+            .query_row(
+                "SELECT l_size,l_mtime,r_size,r_mtime,path,r_hash FROM files WHERE r_id=?1 AND r_id<>''",
+                [id],
+                |r| {
+                    let hash: Option<String> = r.get(5)?;
+                    Ok((
+                        r.get(4)?,
+                        row_base(r)?,
+                        hash.and_then(|h| h.split_once(':').map(|(k, v)| (k.to_string(), v.to_string()))),
+                    ))
+                },
+            )
+            .optional()
     }
 
     pub fn forget(&self, path: &str) -> Result<()> {
@@ -273,6 +336,24 @@ impl Db {
         Ok(())
     }
 
+    /// A folder renamed or moved in the cloud: it and every folder below it get the new path (`dirs` is id -> path).
+    pub fn move_dir_ids(&self, old: &str, new: &str) -> Result<()> {
+        self.0.execute(
+            "UPDATE dirs SET path = ?2 || substr(path, length(?1) + 1) WHERE path = ?1 OR (path >= ?3 AND path < ?4)",
+            params![old, new, format!("{old}/"), format!("{old}0")],
+        )?;
+        Ok(())
+    }
+
+    /// A folder deleted in the cloud: it and every folder below it leave the map.
+    pub fn drop_dir_ids(&self, dir: &str) -> Result<()> {
+        self.0.execute(
+            "DELETE FROM dirs WHERE path = ?1 OR (path >= ?2 AND path < ?3)",
+            params![dir, format!("{dir}/"), format!("{dir}0")],
+        )?;
+        Ok(())
+    }
+
     pub fn dirs(&self) -> Result<Vec<(String, String)>> {
         let mut st = self.0.prepare("SELECT id,path FROM dirs")?;
         st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
@@ -316,7 +397,8 @@ fn now() -> i64 {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogEntry {
     pub ts: i64,
-    /// `up`, `down`, `trash`, `delcloud`, `conflict`, `error`, `stopped` or `scan`.
+    /// `up`, `down`, `trash`, `delcloud`, `conflict`, `error`, `stopped`, `scan`, `move` or `movedir` (one row for a
+    /// folder renamed in the cloud: path = new folder, msg = old one).
     pub kind: String,
     pub path: String,
     pub size: Option<u64>,
@@ -327,9 +409,11 @@ pub struct LogEntry {
 /// writer, and WAL lets this one read at the same time. A missing file (account never ran) is an empty log.
 pub fn read_log(db: &Path, limit: usize) -> Result<Vec<LogEntry>> {
     use rusqlite::OpenFlags;
-    let Ok(c) = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+    // No file yet is an empty log; any other failure (locked, unreadable) must not read as "nothing happened".
+    if !db.exists() {
         return Ok(Vec::new());
-    };
+    }
+    let c = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     // An old DB without the table (never opened by this version yet) is an empty log too.
     let Ok(mut st) = c.prepare("SELECT ts,kind,path,size,msg FROM log ORDER BY id DESC LIMIT ?") else {
         return Ok(Vec::new());
@@ -372,10 +456,62 @@ mod tests {
     }
 
     #[test]
-    fn a_new_db_is_schema_version_2() {
+    fn a_new_db_is_schema_version_3() {
         let db = Db::memory().unwrap();
         let v: i64 = db.0.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
+    }
+
+    #[test]
+    fn a_version_2_db_gains_the_hash_column_and_keeps_its_rows() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE files(
+               path TEXT PRIMARY KEY, l_size INT, l_mtime INT, r_size INT, r_mtime INT, r_id TEXT NOT NULL DEFAULT '');
+             INSERT INTO files VALUES('a.txt',1,1,1,1,'id1');
+             PRAGMA user_version=2;",
+        )
+        .unwrap();
+        let db = Db::init(c).unwrap();
+        let (path, _, hash) = db.by_id("id1").unwrap().unwrap();
+        assert_eq!((path.as_str(), hash), ("a.txt", None));
+        db.set_hashed("a.txt", &base(1), "id1", Some(&("md5".into(), "abc".into())))
+            .unwrap();
+        assert_eq!(
+            db.by_id("id1").unwrap().unwrap().2,
+            Some(("md5".to_string(), "abc".to_string()))
+        );
+        // A row written without a hash never keeps the old one.
+        db.set("a.txt", &base(1), "id1").unwrap();
+        assert_eq!(db.by_id("id1").unwrap().unwrap().2, None);
+        assert!(db.by_id("").unwrap().is_none() && db.by_id("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn folder_ids_follow_a_renamed_folder_and_leave_with_a_deleted_one() {
+        let mut db = Db::memory().unwrap();
+        let id = |s: &str| s.to_string();
+        db.set_dirs(&[
+            (id("A"), id("docs")),
+            (id("B"), id("docs/sub")),
+            (id("C"), id("docs2")),
+            (id("D"), id("docs/sub/deep")),
+        ])
+        .unwrap();
+        db.move_dir_ids("docs", "papers").unwrap();
+        let mut got = db.dirs().unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                (id("A"), id("papers")),
+                (id("B"), id("papers/sub")),
+                (id("C"), id("docs2")),
+                (id("D"), id("papers/sub/deep"))
+            ]
+        );
+        db.drop_dir_ids("papers").unwrap();
+        assert_eq!(db.dirs().unwrap(), [(id("C"), id("docs2"))]);
     }
 
     #[test]

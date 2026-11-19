@@ -29,6 +29,7 @@ fn kind_of(k: &str) -> i32 {
         "error" => 5,
         "stopped" => 6,
         "move" => 8,
+        "movedir" => 9,
         _ => 7,
     }
 }
@@ -51,13 +52,25 @@ fn ago(tr: &Tr, ts: i64) -> String {
 
 /// The tab's filter: 0 all, 1 files moved, 2 problems. A conflict (4) is in both: a file was moved, and it needs a look.
 fn shown(filter: i32, kind: i32) -> bool {
-    filter == 0 || (filter == 1 && is_file(kind)) || (filter == 2 && (4..=6).contains(&kind))
+    filter == 0 || (filter == 1 && (is_file(kind) || kind == 9)) || (filter == 2 && (4..=6).contains(&kind))
 }
 
 #[test]
 fn conflicts_are_problems_too() {
     assert!(shown(2, kind_of("conflict")) && shown(1, kind_of("conflict")));
     assert!(!shown(2, kind_of("up")));
+}
+
+/// A `stopped` row's text: which guard rule tripped (the row's path holds its code: "share" or "folder:<dir>"), then
+/// the raw line. Rows written before the code existed have no path and show the raw line alone.
+fn stop_text(tr: &Tr, e: &LogEntry) -> String {
+    let why = match (e.path.as_str(), e.path.strip_prefix("folder:")) {
+        ("share", _) => tr.invoke_log_stop_share(),
+        ("cap", _) => tr.invoke_log_stop_cap(),
+        (_, Some(dir)) => tr.invoke_log_stop_folder(dir.into()),
+        _ => return e.msg.clone(),
+    };
+    format!("{why}\n{}", e.msg)
 }
 
 /// One row: the path (or what the entry is about), a caption "kind · size" and the time in its own column. A `scan` row holds values only
@@ -97,6 +110,16 @@ fn row(tr: &Tr, e: &LogEntry) -> LogRow {
             path: "".into(),
         };
     }
+    if kind == 6 {
+        return LogRow {
+            kind,
+            title: tr.invoke_log_kind(kind),
+            meta: "".into(),
+            when: when.into(),
+            detail: stop_text(tr, e).into(),
+            path: "".into(),
+        };
+    }
     // With no path the label is the title, so the caption must not repeat it.
     let mut meta = Vec::new();
     if !e.path.is_empty() {
@@ -116,10 +139,16 @@ fn row(tr: &Tr, e: &LogEntry) -> LogRow {
         when: when.into(),
         detail: match kind {
             8 => tr.invoke_log_moved_from(e.msg.as_str().into()),
+            9 => tr.invoke_log_renamed_from(e.msg.as_str().into()),
             5.. => e.msg.as_str().into(),
             _ => "".into(),
         },
-        path: if kind == 4 { e.path.as_str().into() } else { "".into() },
+        // Only kinds that leave a file on disk (sent, received, conflict, moved), not trashed or cloud deletes.
+        path: if matches!(kind, 0 | 1 | 4 | 8 | 9) {
+            e.path.as_str().into()
+        } else {
+            "".into()
+        },
     }
 }
 
@@ -134,7 +163,9 @@ fn render(ui: &Main) {
         ui.set_log_last_ok(last_ok.map_or("".into(), |e| tr.invoke_log_last_ok(ago(&tr, e.ts).into())));
         ui.set_log_last_bad(last_bad.map_or("".into(), |e| tr.invoke_log_last_bad(ago(&tr, e.ts).into())));
         ui.set_log_last_bad_msg(last_bad.map_or("".into(), |e| {
-            if e.path.is_empty() {
+            if e.kind == "stopped" {
+                stop_text(&tr, e)
+            } else if e.path.is_empty() {
                 e.msg.clone()
             } else {
                 format!("{}: {}", e.path, e.msg)
@@ -162,7 +193,11 @@ fn load(ui: &Main, id: String) {
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         let entries = accounts::account_dir(&id)
-            .and_then(|d| read_log(&d.join("state.db"), LOADED).ok())
+            .and_then(|d| {
+                read_log(&d.join("state.db"), LOADED)
+                    .inspect_err(|e| eprintln!("cannot read the activity log: {e}"))
+                    .ok()
+            })
             .unwrap_or_default();
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if LOG.with_borrow(|(cur, _)| *cur != id) {
@@ -253,8 +288,11 @@ pub fn fixture(ui: &Main, mode: usize) {
             Some(3_100_220),
             "Photos/holiday/IMG_2042.jpg",
         ),
-        e(26, "scan", "full:feed", Some(2100), "2 0"),
-        e(28, "scan", "full:feed", None, "start"),
+        e(26, "movedir", "Photos/2026", None, "Photos/holiday"),
+        e(26, "scan", "full:guard", Some(541_551), "0 0"),
+        e(28, "scan", "full:delete", None, "start"),
+        e(30, "scan", "full:feed", Some(2100), "2 0"),
+        e(32, "scan", "full:feed", None, "start"),
         e(40, "scan", "full:reset", Some(9400), "0 0"),
         e(
             3 * 3600,
@@ -266,15 +304,22 @@ pub fn fixture(ui: &Main, mode: usize) {
         e(
             3 * 3600,
             "stopped",
-            "",
+            "folder:Photos/2026",
             None,
-            "11 deletes (11 in the cloud) of 11 known; 11 paths in this run, 0 seen in the cloud",
+            "11 deletes (11 in the cloud) of 120 known; 11 paths in this run, 0 seen in the cloud",
+        ),
+        e(
+            4 * 3600,
+            "stopped",
+            "share",
+            None,
+            "60 deletes (60 in the cloud) of 100 known; 60 paths in this run, 0 seen in the cloud",
         ),
         e(26 * 3600, "trash", "old/notes.txt", Some(812), ""),
         e(2 * 86_400, "conflict", "todo.md", Some(1203), ""),
         e(3 * 86_400, "delcloud", "build/app.bin", Some(52_428_800), ""),
     ];
-    let count = [0, 3, 9][mode];
+    let count = [0, 3, 12][mode];
     LOG.with_borrow_mut(|l| *l = ("fixture".into(), all[..count].to_vec()));
     ui.set_log_name("Dropbox".into());
     // FASTSYNC_LOG_FILTER=2 shows the Problems tab (the list cannot be scrolled in a snapshot).

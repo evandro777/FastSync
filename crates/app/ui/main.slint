@@ -44,8 +44,10 @@ export global Tr {
             : kind == 4 ? @tr("Conflict: both copies kept")
             : kind == 5 ? @tr("Problem")
             : kind == 6 ? @tr("Stopped: deletions waiting for confirmation")
-            : kind == 8 ? @tr("Moved") : @tr("Check");
+            : kind == 8 ? @tr("Moved")
+            : kind == 9 ? @tr("Folder renamed") : @tr("Check");
     }
+    public pure function log-renamed-from(old: string) -> string { return @tr("Renamed from {}", old); }
     public pure function log-moved-from(old: string) -> string { return @tr("Moved from {}", old); }
     public pure function ago-now() -> string { return @tr("just now"); }
     public pure function ago-min(n: int) -> string { return @tr("{} min ago", n); }
@@ -61,6 +63,10 @@ export global Tr {
         if code == "tick" { return @tr("scheduled"); }
         if code == "now" { return @tr("Sync now"); }
         if code == "decision" { return @tr("your answer to a stopped sync"); }
+        if code == "delete" { return @tr("you chose Delete them on a stopped sync"); }
+        if code == "restore" { return @tr("you chose Restore on a stopped sync"); }
+        if code == "guard" { return @tr("the delete guard stopped a quick check: looking for renamed folders"); }
+        if code == "folders" { return @tr("too many folders changed to check one by one"); }
         if code == "rules" { return @tr("ignore rules or folders changed"); }
         if code == "retry" { return @tr("retry after an error"); }
         if code == "rescan" { return @tr("started or rescanned"); }
@@ -68,6 +74,9 @@ export global Tr {
         if code == "resume" { return @tr("resumed after a pause"); }
         return code;
     }
+    public pure function log-stop-share() -> string { return @tr("More than half of all synced files would be deleted."); }
+    public pure function log-stop-cap() -> string { return @tr("More files would be deleted than you confirmed."); }
+    public pure function log-stop-folder(dir: string) -> string { return @tr("Every synced file in {} would be deleted. An unmounted drive looks the same, so FastSync asks first.", dir); }
     public pure function log-scan-paths(changed: int, failed: int, secs: string) -> string { return @tr("Quick check: {} changed, {} failed, {} s", changed, failed, secs); }
 }
 
@@ -83,7 +92,7 @@ export struct AccountRow {
     deletes: int,
     known: int,
     download-only: bool,
-    // For state 1 once a run has a plan: `transfer` 0 none, 1 upload, 2 download, 3 removal; `file` is the name
+    // For state 1 once a run has a plan: `transfer` 0 none, 1 upload, 2 download, 3 removal, 7 move (4 to 6 are the phases); `file` is the name
     // being handled, `done` of `total` files are finished and `speed` reads like "2.4 MB/s" ("" = unknown).
     // Before the plan: 4 listing the cloud (`done` of `total` folders), 5 reading the local folder, 6 comparing
     // (`done` of `total` files); `speed` is then the elapsed time, "4:12".
@@ -1053,13 +1062,15 @@ component AccountCard inherits Rectangle {
         }
         }
         // What is moving right now. Hidden until the run has a plan (a scan has nothing to name yet).
-        if root.acct.state == 1 && root.acct.total > 0 && root.acct.transfer >= 1 && root.acct.transfer <= 3: VerticalLayout {
+        if root.acct.state == 1 && root.acct.total > 0 && ((root.acct.transfer >= 1 && root.acct.transfer <= 3) || root.acct.transfer == 7 || root.acct.transfer == 8): VerticalLayout {
             spacing: Family.gap-s;
             HorizontalLayout {
                 spacing: Family.gap-m;
                 Text {
                     text: root.acct.transfer == 1 ? @tr("Uploading {}", root.acct.file)
                         : root.acct.transfer == 2 ? @tr("Downloading {}", root.acct.file)
+                        : root.acct.transfer == 7 ? @tr("Moving {}", root.acct.file)
+                        : root.acct.transfer == 8 ? @tr("Copying {} in the cloud", root.acct.file)
                         : @tr("Removing {}", root.acct.file);
                     color: Family.muted;
                     font-size: Family.caption;
@@ -1085,7 +1096,7 @@ component AccountCard inherits Rectangle {
         }
         // The first sync of a big cloud spends minutes here: which step it is on, how far, and a clock that proves
         // the card is not frozen. The listing and the comparison have a count, the local walk has none.
-        if root.acct.state == 1 && root.acct.transfer >= 4: VerticalLayout {
+        if root.acct.state == 1 && root.acct.transfer >= 4 && root.acct.transfer <= 6: VerticalLayout {
             spacing: Family.gap-s;
             HorizontalLayout {
                 spacing: Family.gap-m;

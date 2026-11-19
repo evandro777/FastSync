@@ -228,6 +228,14 @@ msgid "Moved from {}"
 msgstr "Movido de {}"
 
 msgctxt "Tr"
+msgid "Folder renamed"
+msgstr "Pasta renomeada"
+
+msgctxt "Tr"
+msgid "Renamed from {}"
+msgstr "Renomeada de {}"
+
+msgctxt "Tr"
 msgid "Last file synced: {}"
 msgstr "Último arquivo sincronizado: {}"
 
@@ -262,6 +270,34 @@ msgstr "agendada"
 msgctxt "Tr"
 msgid "your answer to a stopped sync"
 msgstr "sua resposta a uma sincronização parada"
+
+msgctxt "Tr"
+msgid "you chose Delete them on a stopped sync"
+msgstr "você escolheu Apagar em uma sincronização parada"
+
+msgctxt "Tr"
+msgid "you chose Restore on a stopped sync"
+msgstr "você escolheu Restaurar em uma sincronização parada"
+
+msgctxt "Tr"
+msgid "the delete guard stopped a quick check: looking for renamed folders"
+msgstr "a proteção contra exclusões parou uma verificação rápida: procurando pastas renomeadas"
+
+msgctxt "Tr"
+msgid "too many folders changed to check one by one"
+msgstr "pastas demais mudaram para verificar uma a uma"
+
+msgctxt "Tr"
+msgid "More than half of all synced files would be deleted."
+msgstr "Mais da metade de todos os arquivos sincronizados seria excluída."
+
+msgctxt "Tr"
+msgid "More files would be deleted than you confirmed."
+msgstr "Mais arquivos seriam excluídos do que você confirmou."
+
+msgctxt "Tr"
+msgid "Every synced file in {} would be deleted. An unmounted drive looks the same, so FastSync asks first."
+msgstr "Todos os arquivos sincronizados em {} seriam excluídos. Um disco desmontado parece igual, por isso o FastSync pergunta antes."
 
 msgctxt "Tr"
 msgid "ignore rules or folders changed"
@@ -366,6 +402,14 @@ msgstr "Baixando {}"
 msgctxt "AccountCard"
 msgid "Removing {}"
 msgstr "Removendo {}"
+
+msgctxt "AccountCard"
+msgid "Moving {}"
+msgstr "Movendo {}"
+
+msgctxt "AccountCard"
+msgid "Copying {} in the cloud"
+msgstr "Copiando {} na nuvem"
 
 msgctxt "AccountCard"
 msgid "Checking for changes…"

@@ -216,6 +216,55 @@ fn a_renamed_folder_and_a_local_copy_go_through_rclone() {
     let _ = fs::remove_dir_all(&base);
 }
 
+/// A copied folder (big and small files) reaches the cloud with the right bytes, whether through one `sync/copy` or,
+/// on a doubt, file by file, and the second pass has nothing to do.
+#[test]
+fn a_copied_folder_goes_through_rclone() {
+    if !available() {
+        eprintln!("skipped: rclone not found");
+        return;
+    }
+    let base = std::env::temp_dir().join(format!("fastsync-rc-dircopy-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let (local, remote) = (base.join("local"), base.join("remote"));
+    fs::create_dir_all(&local).unwrap();
+    fs::create_dir_all(&remote).unwrap();
+    fs::write(base.join("rclone.conf"), "").unwrap();
+    let rc = Arc::new(Rclone::start(&base.join("rclone.conf")).expect("rclone rcd starts"));
+    let mut engine = Engine::new(
+        local.clone(),
+        RcloneRemote::new(rc, remote.to_string_lossy().to_string(), vec![], false),
+        Db::memory().unwrap(),
+    );
+    let big = |c: &str| c.repeat((1 << 20) + 5);
+    for (p, text) in [
+        ("Casa/one.bin", big("1")),
+        ("Casa/deep/two.bin", big("2")),
+        ("Casa/note.txt", "small".into()),
+    ] {
+        fs::create_dir_all(local.join(p).parent().unwrap()).unwrap();
+        fs::write(local.join(p), text).unwrap();
+    }
+    assert!(engine.full_scan().errors.is_empty());
+    for p in ["one.bin", "deep/two.bin", "note.txt"] {
+        let to = local.join("Casa (copy)").join(p);
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::copy(local.join("Casa").join(p), to).unwrap();
+    }
+    let r = engine.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(
+        fs::read_to_string(remote.join("Casa (copy)/note.txt")).unwrap(),
+        "small"
+    );
+    assert_eq!(
+        fs::read_to_string(remote.join("Casa (copy)/deep/two.bin")).unwrap(),
+        big("2")
+    );
+    assert_eq!(engine.full_scan().transferred, 0);
+    let _ = fs::remove_dir_all(&base);
+}
+
 /// The listing split per top-level folder (parallel, with a count) is the same list as one recursive call: root
 /// files, nested folders and the excluded vault included, and it counts every top-level folder.
 #[test]

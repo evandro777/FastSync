@@ -41,10 +41,12 @@ pub(crate) fn live(st: Option<&Status>) -> (i32, String, i32, i32, String) {
         Kind::Up => 1,
         Kind::Down => 2,
         Kind::Remove => 3,
+        Kind::Move => 7,
+        Kind::CloudCopy => 8,
     };
     let file = p.path.rsplit('/').next().unwrap_or(&p.path).to_string();
-    // A removal moves no bytes, and rclone reports 0 between files.
-    let speed = if kind == 3 || *speed < 1.0 {
+    // A removal or move sends no bytes (the speed is rclone's, of other files), and rclone reports 0 between files.
+    let speed = if kind == 3 || kind == 7 || kind == 8 || *speed < 1.0 {
         String::new()
     } else {
         format!("{}/s", human_size(*speed as u64))

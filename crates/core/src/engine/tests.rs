@@ -187,6 +187,9 @@ impl Remote for Calls {
         self.stats.fetch_add(1, Relaxed);
         self.inner.stat(rel)
     }
+    fn list_under(&self, dir: &str) -> Result<Vec<Item>> {
+        self.inner.list_under(dir)
+    }
     fn upload(&self, root: &Path, rel: &str) -> Result<()> {
         self.inner.upload(root, rel)
     }
@@ -404,6 +407,36 @@ fn a_failed_listing_falls_back_to_one_stat_per_file() {
     assert_eq!(e.remote.lists.load(Relaxed), 1);
     assert!(e.remote.stats.load(Relaxed) >= 21);
     assert!(f.remote("a/f0.txt").exists());
+}
+
+#[test]
+fn a_gone_folder_answers_for_everything_below_it_with_one_call() {
+    let f = Fixture::new("lookup-gone-tree");
+    let remote = Calls::new(DirRemote(f.engine.remote.0.clone()), None);
+    let db = Db::memory().unwrap();
+    // The folder, two subfolders and two files in the deepest one (two files make that a listing job): the cloud has
+    // none of it. Only the stat of `d` is needed.
+    let paths: Vec<String> = ["d", "d/x", "d/x/y", "d/x/y/a.txt", "d/x/y/b.txt"]
+        .map(String::from)
+        .into();
+    let got = lookup(&remote, &db, &paths, &std::sync::atomic::AtomicBool::new(false), false);
+    assert_eq!(got.len(), paths.len());
+    assert!(got.iter().all(|(_, r)| matches!(r, Ok(None))));
+    assert_eq!(remote.stats.load(Relaxed), 1);
+    assert_eq!(remote.lists.load(Relaxed), 0);
+}
+
+#[test]
+fn a_folder_that_exists_does_not_hide_what_is_below_it() {
+    let f = Fixture::new("lookup-kept-tree");
+    write(f.remote("d/x/a.txt"), "one", 100);
+    write(f.remote("d/x/b.txt"), "two", 100);
+    let remote = Calls::new(DirRemote(f.engine.remote.0.clone()), None);
+    let db = Db::memory().unwrap();
+    let paths: Vec<String> = ["d", "d/x/a.txt", "d/x/b.txt", "d/x/c.txt"].map(String::from).into();
+    let got = lookup(&remote, &db, &paths, &std::sync::atomic::AtomicBool::new(false), false);
+    let found: Vec<bool> = got.iter().map(|(_, r)| matches!(r, Ok(Some(_)))).collect();
+    assert_eq!(found, [true, true, true, false]);
 }
 
 #[test]
@@ -1130,6 +1163,254 @@ fn a_folder_renamed_here_is_moved_in_the_cloud_not_uploaded_again() {
 }
 
 #[test]
+fn a_rename_the_watcher_saw_is_a_move_even_when_the_name_changed() {
+    // A service with no hash (`blind`): a new name proves nothing without the watcher's word.
+    let (f, mut e) = counting_fixture("move-hinted", true);
+    for i in 0..3 {
+        write(f.local(&format!("d/f{i}.txt")), &"x".repeat(i + 1), 100);
+    }
+    assert!(e.full_scan().errors.is_empty());
+    fs::rename(f.local("d/f1.txt"), f.local("d/renamed.txt")).unwrap();
+    e.local_moves = vec![("d/f1.txt".into(), "d/renamed.txt".into())];
+    let r = e.sync_paths(&["d/f1.txt".into(), "d/renamed.txt".into()]);
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(Counting::n(&e.remote.renames), 1, "moved in the cloud");
+    assert_eq!(Counting::n(&e.remote.uploads), 3, "only the first sync uploaded");
+    assert!(f.remote("d/renamed.txt").exists() && !f.remote("d/f1.txt").exists());
+}
+
+#[test]
+fn without_the_hint_a_renamed_file_with_a_new_name_and_no_hash_is_uploaded() {
+    let (f, mut e) = counting_fixture("move-unhinted", true);
+    for i in 0..3 {
+        write(f.local(&format!("d/f{i}.txt")), &"x".repeat(i + 1), 100);
+    }
+    assert!(e.full_scan().errors.is_empty());
+    fs::rename(f.local("d/f1.txt"), f.local("d/renamed.txt")).unwrap();
+    let r = e.sync_paths(&["d/f1.txt".into(), "d/renamed.txt".into()]);
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(Counting::n(&e.remote.renames), 0);
+    assert_eq!(Counting::n(&e.remote.uploads), 4);
+}
+
+#[test]
+fn a_hinted_rename_of_a_file_edited_since_is_still_uploaded() {
+    let (f, mut e) = counting_fixture("move-hinted-edited", true);
+    for i in 0..3 {
+        write(f.local(&format!("d/f{i}.txt")), &"x".repeat(i + 1), 100);
+    }
+    assert!(e.full_scan().errors.is_empty());
+    fs::rename(f.local("d/f1.txt"), f.local("d/renamed.txt")).unwrap();
+    // Same size, other bytes and time: not the file that was synced.
+    write(f.local("d/renamed.txt"), "yy", 5);
+    e.local_moves = vec![("d/f1.txt".into(), "d/renamed.txt".into())];
+    let r = e.sync_paths(&["d/f1.txt".into(), "d/renamed.txt".into()]);
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(Counting::n(&e.remote.renames), 0);
+    assert_eq!(fs::read_to_string(f.remote("d/renamed.txt")).unwrap(), "yy");
+}
+
+#[test]
+fn a_path_under_a_folder_listed_whole_costs_no_stat_when_the_listing_lacks_it() {
+    let f = Fixture::new("covered-path");
+    write(f.remote("d/a.txt"), "a", 100);
+    let mut e = Engine::new(
+        f.engine.root.clone(),
+        Calls::new(DirRemote(f.engine.remote.0.clone()), None),
+        Db::memory().unwrap(),
+    );
+    let r = e.sync_paths_in(&["d/ghost.txt".into()], &["d".into()]);
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(e.remote.stats.load(Relaxed), 0, "the listing of `d` answered");
+}
+
+#[test]
+fn many_renamed_folders_do_not_ask_for_a_full_scan_and_a_move_from_nowhere_changes_nothing() {
+    let mut f = Fixture::new("moves-many");
+    for i in 0..31 {
+        write(f.local(&format!("top{i}/a.txt")), "x", 100);
+    }
+    assert!(f.engine.full_scan().errors.is_empty());
+    let (mut paths, mut moves) = (Vec::new(), vec![("never-synced".to_string(), "top0x".to_string())]);
+    for i in 0..31 {
+        fs::rename(f.local(&format!("top{i}")), f.local(&format!("new{i}"))).unwrap();
+        moves.push((format!("top{i}"), format!("new{i}")));
+        paths.extend([format!("top{i}/a.txt"), format!("new{i}/a.txt")]);
+    }
+    f.engine.local_moves = moves;
+    let r = f.engine.sync_paths(&paths);
+    assert!(!r.wants_full && r.errors.is_empty(), "{r:?}");
+    assert!(f.remote("new30/a.txt").exists() && !f.remote("top30/a.txt").exists());
+}
+
+#[test]
+fn a_folder_the_watcher_saw_renamed_is_moved_whole_by_a_run_of_paths() {
+    let (f, mut e) = counting_fixture("moved-dir-paths", true);
+    write(f.local("a/one.txt"), "first", 100);
+    write(f.local("a/deep/two.txt"), "second one", 100);
+    assert!(e.full_scan().errors.is_empty());
+    fs::rename(f.local("a"), f.local("b")).unwrap();
+    e.local_moves = vec![("a".into(), "b".into())];
+    let r = e.sync_paths(&["a".into(), "b".into()]);
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(Counting::n(&e.remote.dir_moves), 1);
+    assert_eq!(Counting::n(&e.remote.uploads), 2, "only the first sync uploaded");
+    assert!(f.remote("b/deep/two.txt").exists() && !f.remote("a").exists());
+}
+
+#[test]
+fn the_feeds_echo_of_what_we_synced_is_dropped_and_anything_else_is_kept() {
+    use crate::delta::Change;
+    let mut f = Fixture::new("feed-echo");
+    synced_folder(&mut f, 3);
+    let base = f.engine.db.base("d/f1.txt").unwrap().unwrap();
+    let file = |path: &str, size: u64, mtime: i64| Change {
+        path: Some(path.into()),
+        size: Some(size),
+        mtime: Some(mtime),
+        ..Default::default()
+    };
+    let gone = |path: &str| Change {
+        path: Some(path.into()),
+        removed: true,
+        ..Default::default()
+    };
+    let e = &f.engine;
+    // Our own file coming back, exactly as recorded.
+    assert!(e.feed_echo(&file("d/f1.txt", base.remote.size, base.remote.mtime)));
+    // Another size or time, or a file we know nothing of: something changed in the cloud.
+    assert!(!e.feed_echo(&file("d/f1.txt", base.remote.size + 1, base.remote.mtime)));
+    assert!(!e.feed_echo(&file("d/f1.txt", base.remote.size, base.remote.mtime + 1000)));
+    assert!(!e.feed_echo(&file("d/new.txt", 1, 1000)));
+    // The same entry while the local file was edited since: the edit must be seen.
+    write(f.local("d/f1.txt"), "edited!", 1);
+    assert!(
+        !f.engine
+            .feed_echo(&file("d/f1.txt", base.remote.size, base.remote.mtime))
+    );
+    let e = &f.engine;
+    // A delete of a name nothing knows (the old name of a folder we moved) is an echo; one we have rows for, in any
+    // case, or with a file on disk, is not.
+    assert!(e.feed_echo(&gone("old/name.txt")));
+    assert!(!e.feed_echo(&gone("d/f2.txt")));
+    assert!(!e.feed_echo(&gone("D/F2.TXT")));
+    assert!(!e.feed_echo(&gone("d")));
+    write(f.local("local-only.txt"), "mine", 5);
+    assert!(!f.engine.feed_echo(&gone("local-only.txt")));
+}
+
+#[test]
+fn an_id_feeds_echo_needs_the_same_file_in_the_same_place_with_the_same_hash() {
+    use crate::delta::Change;
+    use std::collections::HashMap;
+    let mut f = Fixture::new("feed-echo-id");
+    synced_folder(&mut f, 3);
+    let base = f.engine.db.base("d/f1.txt").unwrap().unwrap();
+    let hash = ("md5".to_string(), "abc".to_string());
+    f.engine.db.set_hashed("d/f1.txt", &base, "ID1", Some(&hash)).unwrap();
+    f.engine
+        .db
+        .set("d/f2.txt", &f.engine.db.base("d/f2.txt").unwrap().unwrap(), "ID2")
+        .unwrap();
+    let dirs: HashMap<String, String> = [("DIR".to_string(), "d".to_string())].into();
+    let echo = Change {
+        id: "ID1".into(),
+        name: "f1.txt".into(),
+        parent: "DIR".into(),
+        size: Some(base.remote.size),
+        mtime: Some(base.remote.mtime),
+        hashes: vec![("sha1".into(), "zzz".into()), hash.clone()],
+        ..Default::default()
+    };
+    let is = |e: &Engine<DirRemote>, c: &Change| e.feed_echo_id(c, &dirs, Some("ROOT"));
+    assert!(is(&f.engine, &echo));
+    // No time in the feed: the hash and the size still prove it.
+    assert!(is(
+        &f.engine,
+        &Change {
+            mtime: None,
+            ..echo.clone()
+        }
+    ));
+    // Anything that differs is a real change, or cannot be told: kept.
+    let kept = |c: Change| assert!(!is(&f.engine, &c), "{c:?}");
+    kept(Change {
+        size: Some(base.remote.size + 1),
+        ..echo.clone()
+    });
+    kept(Change {
+        mtime: Some(base.remote.mtime + 5000),
+        ..echo.clone()
+    });
+    kept(Change {
+        hashes: vec![("md5".into(), "other".into())],
+        ..echo.clone()
+    });
+    kept(Change {
+        hashes: vec![("sha1".into(), "abc".into())],
+        ..echo.clone()
+    });
+    kept(Change {
+        hashes: vec![],
+        ..echo.clone()
+    });
+    kept(Change {
+        name: "renamed.txt".into(),
+        ..echo.clone()
+    });
+    kept(Change {
+        parent: "ELSEWHERE".into(),
+        ..echo.clone()
+    });
+    kept(Change {
+        removed: true,
+        ..echo.clone()
+    });
+    kept(Change {
+        is_dir: true,
+        ..echo.clone()
+    });
+    kept(Change {
+        id: "unknown".into(),
+        ..echo.clone()
+    });
+    // A row with no hash is never an echo (its own file, same everything else).
+    kept(Change {
+        id: "ID2".into(),
+        name: "f2.txt".into(),
+        ..echo.clone()
+    });
+    // A file in the root is told by the root id.
+    write(f.local("top.txt"), "x", 1);
+    let s = local_sig(&f.engine.root, "top.txt").unwrap();
+    f.engine
+        .db
+        .set_hashed("top.txt", &Base { local: s, remote: s }, "ID3", Some(&hash))
+        .unwrap();
+    let top = Change {
+        id: "ID3".into(),
+        name: "top.txt".into(),
+        parent: "ROOT".into(),
+        size: Some(s.size),
+        mtime: Some(s.mtime),
+        hashes: vec![hash.clone()],
+        ..Default::default()
+    };
+    assert!(is(&f.engine, &top));
+    // The same entry reported under a folder that is not the row's: a move.
+    assert!(!is(
+        &f.engine,
+        &Change {
+            parent: "DIR".into(),
+            ..top
+        }
+    ));
+    // The local file edited since: the edit must be seen.
+    write(f.local("d/f1.txt"), "edited!", 1);
+    assert!(!is(&f.engine, &echo));
+}
+
+#[test]
 fn the_same_size_with_other_bytes_is_not_a_move() {
     let mut f = Fixture::new("move-other");
     write(f.local("a.txt"), "aaaa", 100);
@@ -1333,6 +1614,12 @@ struct Hashing {
     uploads: std::sync::atomic::AtomicUsize,
     copies: std::sync::atomic::AtomicUsize,
     bad_copy: bool,
+    dir_copies: std::sync::atomic::AtomicUsize,
+    /// A folder copy that stops after this many files and then fails.
+    dir_copy_limit: Option<usize>,
+    /// Answers `list_dir` (with hashes) and counts it; off, it errors like a remote with no such call.
+    listing: bool,
+    lists: std::sync::atomic::AtomicUsize,
 }
 
 impl Hashing {
@@ -1342,6 +1629,10 @@ impl Hashing {
             uploads: Default::default(),
             copies: Default::default(),
             bad_copy,
+            dir_copies: Default::default(),
+            dir_copy_limit: None,
+            listing: false,
+            lists: Default::default(),
         }
     }
     fn sum(p: &Path) -> Option<String> {
@@ -1359,9 +1650,25 @@ impl Remote for Hashing {
     fn list(&self) -> Result<Vec<Item>> {
         self.inner.list()
     }
+    fn list_dir(&self, rel: &str) -> Result<Vec<Item>> {
+        if !self.listing {
+            return Err("list_dir unsupported".into());
+        }
+        self.lists.fetch_add(1, Relaxed);
+        Ok(self
+            .inner
+            .list_dir(rel)?
+            .into_iter()
+            .map(|mut i| {
+                i.hash = Self::sum(&self.inner.0.join(&i.path)).map(|h| ("sum".to_string(), h));
+                i
+            })
+            .collect())
+    }
     fn stat(&self, rel: &str) -> Result<Option<Item>> {
         Ok(self.inner.stat(rel)?.map(|mut i| {
             i.hash = Self::sum(&self.inner.0.join(rel)).map(|h| ("sum".to_string(), h));
+            i.id = format!("id:{rel}");
             i
         }))
     }
@@ -1388,9 +1695,116 @@ impl Remote for Hashing {
             .map(drop)
             .map_err(|e| e.to_string())
     }
+    fn list_under(&self, dir: &str) -> Result<Vec<Item>> {
+        Ok(self
+            .inner
+            .list_under(dir)?
+            .into_iter()
+            .map(|mut i| {
+                i.hash = Self::sum(&self.inner.0.join(&i.path)).map(|h| ("sum".to_string(), h));
+                i
+            })
+            .collect())
+    }
+    fn copy_dir(&self, from: &str, to: &str) -> Result<()> {
+        self.dir_copies.fetch_add(1, Relaxed);
+        let mut files: Vec<_> = self.inner.list_under(from)?.into_iter().filter(|i| !i.is_dir).collect();
+        files.sort_by(|x, y| x.path.cmp(&y.path));
+        for (n, i) in files.iter().enumerate() {
+            if self.dir_copy_limit == Some(n) {
+                return Err("copy stopped".into());
+            }
+            let dest = format!("{to}/{}", &i.path[from.len() + 1..]);
+            copy_keep_time(&self.inner.0.join(&i.path), &self.inner.0.join(dest))?;
+        }
+        Ok(())
+    }
     fn local_hash(&self, root: &Path, rel: &str, _kind: &str) -> Result<Option<String>> {
         Ok(Self::sum(&root.join(rel)))
     }
+}
+
+/// A synced folder `a` of two big and two small files, a local copy of it as `b`; the engine has seen only `a`.
+fn folder_copy_fixture(name: &str, limit: Option<usize>) -> (Fixture, Engine<Hashing>) {
+    let f = Fixture::new(name);
+    let mut remote = Hashing::new(&f.engine.remote.0, false);
+    remote.dir_copy_limit = limit;
+    let mut e = Engine::new(f.engine.root.clone(), remote, Db::memory().unwrap());
+    let big = |c: &str| c.repeat(COPY_MIN as usize + 10);
+    write(f.local("a/one.bin"), &big("1"), 100);
+    write(f.local("a/deep/two.bin"), &big("2"), 100);
+    write(f.local("a/small.txt"), "small", 100);
+    write(f.local("a/deep/tiny.txt"), "tiny", 100);
+    assert!(e.full_scan().errors.is_empty());
+    for p in ["one.bin", "deep/two.bin", "small.txt", "deep/tiny.txt"] {
+        fs::create_dir_all(f.local(&format!("b/{p}")).parent().unwrap()).unwrap();
+        fs::copy(f.local(&format!("a/{p}")), f.local(&format!("b/{p}"))).unwrap();
+    }
+    (f, e)
+}
+
+#[test]
+fn a_copied_folder_is_one_cloud_folder_copy_small_files_included() {
+    let (f, mut e) = folder_copy_fixture("dir-copy", None);
+    let r = e.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(Hashing::count(&e.remote.dir_copies), 1);
+    assert_eq!(Hashing::count(&e.remote.copies), 0);
+    assert_eq!(Hashing::count(&e.remote.uploads), 4, "only the first sync uploaded");
+    assert_eq!(fs::read_to_string(f.remote("b/deep/tiny.txt")).unwrap(), "tiny");
+    for p in ["b/one.bin", "b/deep/two.bin", "b/small.txt", "b/deep/tiny.txt"] {
+        assert!(e.db.base(p).unwrap().is_some(), "{p}");
+    }
+    let again = e.full_scan();
+    assert!(again.errors.is_empty(), "{again:?}");
+    assert_eq!(again.transferred, 0);
+}
+
+#[test]
+fn a_folder_copy_is_not_used_when_the_copy_lacks_a_file_of_the_original() {
+    let (f, mut e) = folder_copy_fixture("dir-copy-missing", None);
+    fs::remove_file(f.local("b/small.txt")).unwrap();
+    let r = e.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(
+        Hashing::count(&e.remote.dir_copies),
+        0,
+        "the copy would resurrect small.txt"
+    );
+    assert!(!f.remote("b/small.txt").exists());
+}
+
+#[test]
+fn a_folder_copy_is_not_used_when_a_copied_file_was_edited() {
+    let (f, mut e) = folder_copy_fixture("dir-copy-edited", None);
+    write(f.local("b/small.txt"), "other", 100);
+    let r = e.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(Hashing::count(&e.remote.dir_copies), 0);
+    assert_eq!(fs::read_to_string(f.remote("b/small.txt")).unwrap(), "other");
+}
+
+#[test]
+fn a_folder_copy_is_not_used_onto_a_cloud_folder_that_has_files() {
+    let (f, mut e) = folder_copy_fixture("dir-copy-taken", None);
+    write(f.remote("b/elsewhere.txt"), "x", 100);
+    e.full_scan();
+    assert_eq!(Hashing::count(&e.remote.dir_copies), 0);
+}
+
+#[test]
+fn a_folder_copy_that_stops_halfway_keeps_rows_only_for_what_landed() {
+    let (f, mut e) = folder_copy_fixture("dir-copy-half", Some(2));
+    // First pass: rows for the 2 copied files, the rest by the one-by-one path (which may need a second run).
+    e.full_scan();
+    let r = e.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(Hashing::count(&e.remote.dir_copies), 1);
+    for p in ["b/one.bin", "b/deep/two.bin", "b/small.txt", "b/deep/tiny.txt"] {
+        assert!(e.db.base(p).unwrap().is_some(), "{p}");
+        assert!(f.remote(p).exists(), "{p}");
+    }
+    assert_eq!(e.full_scan().transferred, 0);
 }
 
 #[test]
@@ -1405,6 +1819,9 @@ fn a_local_copy_of_a_synced_file_is_copied_in_the_cloud_not_uploaded() {
     write(f.local("a.bin"), &big, 100);
     assert!(e.full_scan().errors.is_empty());
     assert_eq!(Hashing::count(&e.remote.uploads), 1);
+    // The row of an upload keeps the cloud's hash, which is what lets the feed's echo be told from an edit.
+    let (_, _, hash) = e.db.by_id("id:a.bin").unwrap().unwrap();
+    assert_eq!(hash.map(|(k, _)| k).as_deref(), Some("sum"));
     fs::create_dir_all(f.local("sub")).unwrap();
     fs::copy(f.local("a.bin"), f.local("sub/b.bin")).unwrap();
     let r = e.full_scan();
@@ -1415,6 +1832,26 @@ fn a_local_copy_of_a_synced_file_is_copied_in_the_cloud_not_uploaded() {
     assert!(e.db.base("a.bin").unwrap().is_some(), "the source keeps its row");
     assert!(e.db.base("sub/b.bin").unwrap().is_some());
     assert_eq!(e.full_scan().transferred, 0);
+}
+
+#[test]
+fn many_local_copies_of_one_file_look_the_source_up_with_one_listing() {
+    let f = Fixture::new("copy-up-listing");
+    let big = "x".repeat(COPY_MIN as usize + 10);
+    let mut remote = Hashing::new(&f.engine.remote.0, false);
+    remote.listing = true;
+    let mut e = Engine::new(f.engine.root.clone(), remote, Db::memory().unwrap());
+    write(f.local("a.bin"), &big, 100);
+    assert!(e.full_scan().errors.is_empty());
+    fs::create_dir_all(f.local("sub")).unwrap();
+    for i in 0..3 {
+        fs::copy(f.local("a.bin"), f.local(&format!("sub/b{i}.bin"))).unwrap();
+    }
+    let r = e.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(Hashing::count(&e.remote.uploads), 1, "only the first file went up");
+    assert_eq!(Hashing::count(&e.remote.copies), 3);
+    assert_eq!(Hashing::count(&e.remote.lists), 1, "one listing of the source's folder");
 }
 
 #[test]
@@ -1459,6 +1896,8 @@ struct Counting {
     uploads: std::sync::atomic::AtomicUsize,
     renames: std::sync::atomic::AtomicUsize,
     dir_moves: std::sync::atomic::AtomicUsize,
+    deletes: std::sync::atomic::AtomicUsize,
+    purges: std::sync::atomic::AtomicUsize,
     blind: bool,
     /// Every listing of a folder fails once a folder was moved.
     list_fails_after_move: bool,
@@ -1471,6 +1910,8 @@ impl Counting {
             uploads: Default::default(),
             renames: Default::default(),
             dir_moves: Default::default(),
+            deletes: Default::default(),
+            purges: Default::default(),
             blind,
             list_fails_after_move: false,
         }
@@ -1498,7 +1939,12 @@ impl Remote for Counting {
         self.inner.download(rel, dest)
     }
     fn delete(&self, rel: &str) -> Result<()> {
+        self.deletes.fetch_add(1, Relaxed);
         self.inner.delete(rel)
+    }
+    fn purge_dir(&self, rel: &str) -> Result<()> {
+        self.purges.fetch_add(1, Relaxed);
+        fs::remove_dir_all(self.inner.0.join(rel)).map_err(|e| e.to_string())
     }
     fn rename(&self, from: &str, to: &str) -> Result<()> {
         self.renames.fetch_add(1, Relaxed);
@@ -1530,6 +1976,65 @@ fn counting_fixture(name: &str, blind: bool) -> (Fixture, Engine<Counting>) {
         Db::memory().unwrap(),
     );
     (f, e)
+}
+
+/// Root files so one deleted folder is far from the delete guard's limits.
+fn delete_dir_fixture(name: &str) -> (Fixture, Engine<Counting>) {
+    let (f, mut e) = counting_fixture(name, false);
+    for i in 0..8 {
+        write(f.local(&format!("keep{i}.txt")), "keep", 100);
+    }
+    write(f.local("top/stay.txt"), "stay", 100);
+    write(f.local("top/gone/one.txt"), "first", 100);
+    write(f.local("top/gone/deep/two.txt"), "second one", 100);
+    write(f.local("top/gone/three.txt"), "third", 100);
+    assert!(e.full_scan().errors.is_empty());
+    (f, e)
+}
+
+#[test]
+fn a_folder_deleted_here_is_one_cloud_folder_delete() {
+    let (f, mut e) = delete_dir_fixture("dir-purge");
+    fs::remove_dir_all(f.local("top/gone")).unwrap();
+    let r = e.full_scan();
+    assert!(r.errors.is_empty() && r.aborted.is_none(), "{r:?}");
+    assert_eq!(Counting::n(&e.remote.purges), 1);
+    assert_eq!(Counting::n(&e.remote.deletes), 0);
+    assert!(!f.remote("top/gone").exists());
+    assert!(f.remote("top/stay.txt").exists());
+    assert!(e.db.base("top/gone/deep/two.txt").unwrap().is_none());
+    let again = e.full_scan();
+    assert!(again.errors.is_empty(), "{again:?}");
+    assert_eq!(Counting::n(&e.remote.purges), 1);
+}
+
+#[test]
+fn a_folder_delete_is_not_used_when_the_cloud_folder_holds_another_file() {
+    let (f, mut e) = delete_dir_fixture("dir-purge-extra");
+    write(f.remote("top/gone/new-from-elsewhere.txt"), "mine", 100);
+    fs::remove_dir_all(f.local("top/gone")).unwrap();
+    let r = e.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(Counting::n(&e.remote.purges), 0);
+    assert_eq!(
+        fs::read_to_string(f.remote("top/gone/new-from-elsewhere.txt")).unwrap(),
+        "mine"
+    );
+    assert!(!f.remote("top/gone/one.txt").exists());
+}
+
+#[test]
+fn a_folder_delete_is_not_used_when_something_new_sits_in_the_local_folder() {
+    let (f, mut e) = delete_dir_fixture("dir-purge-local");
+    fs::remove_file(f.local("top/gone/one.txt")).unwrap();
+    fs::remove_file(f.local("top/gone/three.txt")).unwrap();
+    fs::remove_file(f.local("top/gone/deep/two.txt")).unwrap();
+    write(f.local("top/gone/fresh.txt"), "new", 100);
+    let r = e.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(Counting::n(&e.remote.purges), 0);
+    assert_eq!(fs::read_to_string(f.remote("top/gone/fresh.txt")).unwrap(), "new");
+    assert!(!f.remote("top/gone/one.txt").exists());
 }
 
 #[test]
@@ -1657,6 +2162,16 @@ fn dir_pair_cuts_the_common_ending_off() {
     assert_eq!(dir_pair("f", "d/f"), None, "moved out of the root");
     assert_eq!(dir_pair("a/f", "a/b/f"), None, "one folder inside the other");
     assert_eq!(dir_pair("a/b/f", "x/a/b/f"), None, "nothing left on the old side");
+    assert_eq!(
+        dir_pair("T/P/f", "T/S/P/f"),
+        s("T/P", "T/S/P"),
+        "a folder moved into a sibling"
+    );
+    assert_eq!(
+        dir_pair("T/P/q/f", "T/S/P/q/f"),
+        s("T/P", "T/S/P"),
+        "the same with a subfolder"
+    );
 }
 
 /// A cloud whose upload always fails the way rclone's hash check does for a file saved meanwhile. `edit`: the
@@ -2130,11 +2645,33 @@ fn a_whole_folder_vanishing_stops_the_run_even_under_the_account_wide_share() {
         write(f.local(&format!("disk/f{i}.txt")), &"x".repeat(i + 1), 100);
     }
     assert!(f.engine.full_scan().errors.is_empty());
-    // An unmounted disk inside the folder: 12 of 112 files, far below 50%, but all of `disk/`.
+    // An unmounted disk inside the folder: 12 of 112 files, far below 50%, but all of `disk/`. Its mount point stays.
     fs::remove_dir_all(f.local("disk")).unwrap();
+    fs::create_dir(f.local("disk")).unwrap();
     let r = f.engine.full_scan();
     assert_eq!(r.aborted.as_ref().map(|a| a.0), Some(12), "{r:?}");
     assert!(f.remote("disk/f0.txt").exists(), "nothing was deleted in the cloud");
+}
+
+#[test]
+fn a_nested_folder_vanishing_stops_the_run_too() {
+    let mut f = Fixture::new("folder-wiped-nested");
+    // `media` stays well above the share: 40 of 100 files go, all of `media/disk2`.
+    for i in 0..60 {
+        write(f.local(&format!("media/k{i}.txt")), &"k".repeat(i + 1), 100);
+    }
+    for i in 0..40 {
+        write(f.local(&format!("media/disk2/f{i}.txt")), &"x".repeat(i + 1), 100);
+    }
+    assert!(f.engine.full_scan().errors.is_empty());
+    fs::remove_dir_all(f.local("media/disk2")).unwrap();
+    fs::create_dir(f.local("media/disk2")).unwrap();
+    let r = f.engine.full_scan();
+    assert_eq!(r.aborted.as_ref().map(|a| a.0), Some(40), "{r:?}");
+    assert!(
+        f.remote("media/disk2/f0.txt").exists(),
+        "nothing was deleted in the cloud"
+    );
 }
 
 #[test]
@@ -2926,6 +3463,86 @@ fn the_delete_guard_stops_a_run_that_empties_the_folder() {
     assert!(r.aborted.is_some());
     assert!(f.local("f0.txt").exists());
     assert_eq!(f.engine.db.all().unwrap().len(), 12);
+}
+
+#[test]
+fn only_a_stop_over_local_deletes_asks_for_a_full_scan_to_find_cloud_moves() {
+    // Files lost in the cloud (maybe a folder renamed there): a full scan can pair them.
+    let mut f = cloud_loses("stop-cloud", 12);
+    let paths: Vec<String> = (0..12).map(|i| format!("f{i}.txt")).collect();
+    let r = f.engine.sync_paths(&paths);
+    assert!(r.aborted.is_some() && r.aborted_local_deletes, "{r:?}");
+    // The user's own deletes: nothing a full scan could turn into a move.
+    let mut f = Fixture::new("stop-local");
+    for i in 0..12 {
+        write(f.local(&format!("f{i}.txt")), "x", 100);
+    }
+    f.engine.full_scan();
+    for i in 0..12 {
+        fs::remove_file(f.local(&format!("f{i}.txt"))).unwrap();
+    }
+    let r = f.engine.sync_paths(&paths);
+    assert!(r.aborted.is_some() && !r.aborted_local_deletes, "{r:?}");
+}
+
+/// 30 files at the top and 12 in `d/`, all synced.
+fn folder_synced(name: &str) -> Fixture {
+    let mut f = Fixture::new(name);
+    // On disk, so a test can read the activity log back.
+    f.engine.db = Db::open(&f.base.join("state.db")).unwrap();
+    for i in 0..30 {
+        write(f.local(&format!("top{i}.txt")), "x", 100);
+    }
+    fs::create_dir(f.local("d")).unwrap();
+    for i in 0..12 {
+        write(f.local(&format!("d/f{i}.txt")), "x", 100);
+    }
+    f.engine.full_scan();
+    f
+}
+
+#[test]
+fn a_folder_the_user_deleted_is_not_a_wiped_folder() {
+    let mut f = folder_synced("wipe-deleted");
+    fs::remove_dir_all(f.local("d")).unwrap();
+    let paths: Vec<String> = (0..12).map(|i| format!("d/f{i}.txt")).collect();
+    let r = f.engine.sync_paths(&paths);
+    assert!(r.aborted.is_none() && r.errors.is_empty(), "{r:?}");
+    assert!(!f.remote("d/f0.txt").exists());
+}
+
+#[test]
+fn a_folder_left_empty_looks_like_an_unmounted_drive_and_stops_with_its_name() {
+    let mut f = folder_synced("wipe-empty");
+    for i in 0..12 {
+        fs::remove_file(f.local(&format!("d/f{i}.txt"))).unwrap();
+    }
+    let paths: Vec<String> = (0..12).map(|i| format!("d/f{i}.txt")).collect();
+    let r = f.engine.sync_paths(&paths);
+    assert!(r.aborted.is_some(), "{r:?}");
+    assert!(f.remote("d/f0.txt").exists());
+    let rows = crate::db::read_log(&f.base.join("state.db"), 10).unwrap();
+    assert_eq!(
+        rows.iter().find(|e| e.kind == "stopped").map(|e| e.path.as_str()),
+        Some("folder:d")
+    );
+}
+
+#[test]
+fn a_folder_wiped_in_the_cloud_still_stops_though_it_exists_here() {
+    let mut f = folder_synced("wipe-cloud");
+    for i in 0..12 {
+        fs::remove_file(f.remote(&format!("d/f{i}.txt"))).unwrap();
+    }
+    let paths: Vec<String> = (0..12).map(|i| format!("d/f{i}.txt")).collect();
+    let r = f.engine.sync_paths(&paths);
+    assert!(r.aborted.is_some() && r.aborted_local_deletes, "{r:?}");
+    assert!(f.local("d/f0.txt").exists());
+    let rows = crate::db::read_log(&f.base.join("state.db"), 10).unwrap();
+    assert_eq!(
+        rows.iter().find(|e| e.kind == "stopped").map(|e| e.path.as_str()),
+        Some("folder:d")
+    );
 }
 
 /// 12 synced files, then `gone` of them removed from the cloud (the guard trips, nothing is deleted yet).

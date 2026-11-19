@@ -11,7 +11,7 @@ More detail for contributors is in [`AGENTS.md`](AGENTS.md).
 
 ## First build
 
-Install a Rust toolchain and the libraries it links.
+Install a Rust toolchain (**Rust 1.92 or newer**, the minimum CI builds with) and the libraries it links.
 
 Debian/Ubuntu/Mint:
 

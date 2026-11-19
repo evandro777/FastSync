@@ -158,7 +158,9 @@ pub fn apply(ui: &Main, mode: usize) {
         // The first sync of a big cloud: listing (folders done), reading the local folder, comparing (files done).
         row("Dropbox", "/home/user/Big Dropbox", 1, ""),
         row("MEGA", "/home/user/MEGA", 1, ""),
+        row("Dropbox", "/home/user/Dropbox", 1, ""),
         row("OneDrive", "/home/user/OneDrive Archive", 1, ""),
+        row("Dropbox", "/home/user/Dropbox Copies", 1, ""),
     ];
     for (i, (kind, done, total, clock)) in [(4, 3, 12, "4:12"), (5, 0, 0, "0:41"), (6, 40000, 104000, "9:03")]
         .into_iter()
@@ -178,7 +180,11 @@ pub fn apply(ui: &Main, mode: usize) {
         12,
         "2.4 MB/s".into(),
     );
-    let count = [0, 1, 10][mode];
+    // A folder rename: a move, so no speed.
+    (all[10].transfer, all[10].file, all[10].done, all[10].total) = (7, "Planta casa".into(), 0, 25);
+    // A server-side copy: no bytes travel, so no speed.
+    (all[11].transfer, all[11].file, all[11].done, all[11].total) = (8, "eTeksScopia.sh3t".into(), 20, 25);
+    let count = [0, 1, 12][mode];
     ui.set_accounts(ModelRc::new(VecModel::from(all[..count].to_vec())));
     // The add dialog: plain when empty, "waiting for the browser" with one row, a long error with many.
     ui.set_add_busy(mode == 1);

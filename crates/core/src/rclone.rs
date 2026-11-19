@@ -76,6 +76,15 @@ fn binary() -> PathBuf {
 const MIN_RCLONE: (u64, u64) = (1, 76);
 
 /// `operations/about`'s answer as `(used, total)`; no `used` means the service reports nothing useful.
+/// `fs` is `<id>:` for a login, a plain path for rclone's local backend (the tests).
+fn fs_at(fs: &str, p: &str) -> String {
+    if fs.ends_with([':', '/']) {
+        format!("{fs}{p}")
+    } else {
+        format!("{fs}/{p}")
+    }
+}
+
 fn quota(v: &Value) -> Option<(u64, Option<u64>)> {
     Some((v["used"].as_u64()?, v["total"].as_u64().filter(|&t| t > 0)))
 }
@@ -233,7 +242,25 @@ impl Rclone {
     }
 
     pub fn call(&self, method: &str, body: Value) -> Result<Value> {
-        let mut resp = self.send(method, &body)?;
+        // A call that is one small request must end: a hung rclone would otherwise keep the runner's thread for good.
+        // Transfers, folder syncs, purges and the blocking login steps have no fixed length and stay unlimited.
+        let quick = matches!(
+            method,
+            "core/version"
+                | "operations/stat"
+                | "operations/about"
+                | "operations/movefile"
+                | "operations/mkdir"
+                | "operations/rmdir"
+                | "operations/deletefile"
+                | "operations/publiclink"
+                | "job/status"
+                | "job/stop"
+                | "config/get"
+                | "config/delete"
+                | "fscache/clear"
+        );
+        let mut resp = self.send_within(method, &body, quick.then_some(QUICK_CALL))?;
         let ok = resp.status().is_success();
         let v: Value = resp
             .body_mut()
@@ -335,17 +362,21 @@ impl Rclone {
     /// Renames the folder `src` to `dst` inside one remote (`sync/move` of one folder onto another): rclone uses the
     /// service's own folder move when it has one, else moves the files server-side one by one.
     pub fn movedir(&self, fs: &str, src: &str, dst: &str) -> Result<()> {
-        // `fs` is `<id>:` for a login, a plain path for rclone's local backend (the tests).
-        let at = |p: &str| {
-            if fs.ends_with([':', '/']) {
-                format!("{fs}{p}")
-            } else {
-                format!("{fs}/{p}")
-            }
-        };
         self.call(
             "sync/move",
-            json!({"srcFs": at(src), "dstFs": at(dst), "deleteEmptySrcDirs": true}),
+            json!({"srcFs": fs_at(fs, src), "dstFs": fs_at(fs, dst), "deleteEmptySrcDirs": true}),
+        )
+        .map(drop)
+    }
+
+    /// Copies the folder `src` into the new folder `dst` inside one remote (`sync/copy`): server-side where the
+    /// service can copy, and it never deletes anything. `group` keeps `speed` per account, as for `copyfile`.
+    /// shortcut: one blocking call (no timeout), so Pause waits for a big folder; use `call_job` + `job/stop` if that
+    /// hurts.
+    pub fn copydir(&self, group: &str, fs: &str, src: &str, dst: &str) -> Result<()> {
+        self.call(
+            "sync/copy",
+            json!({"srcFs": fs_at(fs, src), "dstFs": fs_at(fs, dst), "_group": group}),
         )
         .map(drop)
     }
@@ -370,6 +401,13 @@ impl Rclone {
     /// Removes the folder `fs:remote` only when it is empty (`operations/rmdir`, never a purge).
     pub fn rmdir(&self, fs: &str, remote: &str) -> Result<()> {
         self.call("operations/rmdir", json!({"fs": fs, "remote": remote}))
+            .map(drop)
+    }
+
+    /// Deletes the folder `fs:remote` with everything in it (`operations/purge`; into the service's trash where it
+    /// has one, like `deletefile`).
+    pub fn purge(&self, fs: &str, remote: &str) -> Result<()> {
+        self.call("operations/purge", json!({"fs": fs, "remote": remote}))
             .map(drop)
     }
 
@@ -930,6 +968,12 @@ impl crate::engine::Remote for RcloneRemote {
     fn move_dir(&self, from: &str, to: &str) -> Result<()> {
         self.rc.movedir(&self.fs, from, to)
     }
+    fn purge_dir(&self, rel: &str) -> Result<()> {
+        self.rc.purge(&self.fs, rel)
+    }
+    fn copy_dir(&self, from: &str, to: &str) -> Result<()> {
+        self.rc.copydir(self.group(), &self.fs, from, to)
+    }
     fn copy(&self, from: &str, to: &str) -> Result<()> {
         // Inside one remote rclone asks the service to copy (Dropbox, Drive, OneDrive): no bytes cross the network.
         // OneDrive does not create the target folder (see `upload`).
@@ -1105,6 +1149,9 @@ pub fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
 }
+
+/// Longest a one-request call (`stat`, `mkdir`, ...) may take; rclone retries inside it, so this only ends a hang.
+const QUICK_CALL: Duration = Duration::from_secs(600);
 
 /// The reply of `operations/list`.
 #[derive(serde::Deserialize)]
