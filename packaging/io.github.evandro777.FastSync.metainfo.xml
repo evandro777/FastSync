@@ -33,8 +33,8 @@
         <ul>
           <li>File manager emblems are now live. Nothing is written on your files any more: a Nemo-Python extension asks the running app over a socket what each file shows (synced, syncing, error, paused). A grey "ignored" badge marks .fastsync, unchecked folders and files hidden by ignore rules. Old `metadata::emblems` marks are cleaned up at start. Nemo only; needs python-nemo.</li>
           <li>Start at login: new Preferences box. Runs `fastsync --hidden` and stays in the tray. Flatpak uses the Background portal.</li>
-          <li>Flatpak: the Nemo actions, submenu, icon and emblems are written to the host's folders, and the actions run `flatpak run <id> --share %F`.</li>
-          <li>Damaged state database is kept as `.bad.<time>` and rebuilt. With no rows it only adopts what matches, never deletes.</li>
+          <li>Flatpak: the Nemo actions, submenu, icon and emblems are written to the host's folders, and the actions run `flatpak run APP_ID --share %F`.</li>
+          <li>Damaged state database is kept as `.bad.TIME` and rebuilt. With no rows it only adopts what matches, never deletes.</li>
           <li>New `FileStates` (core) tracks moving and failed files, fed by the engine and the runner; failed files survive a restart.</li>
           <li>OneDrive "View on web" fetches `webUrl` from Graph.</li>
           <li>Redrawn tray icons (error, paused, syncing) and a new syncing emblem.</li>
