@@ -111,9 +111,14 @@ pub struct Runner {
     handle: Option<std::thread::JoinHandle<()>>,
     /// The engine's `cancel`: Pause and Stop set it at once, because the worker reads its events only between runs.
     cancel: Arc<AtomicBool>,
+    /// Which files are moving or failed, for the file manager's emblems.
+    files: Arc<crate::filestate::FileStates>,
 }
 
 impl Runner {
+    pub fn files(&self) -> Arc<crate::filestate::FileStates> {
+        self.files.clone()
+    }
     /// Stops the worker and waits until it has let go of the DB, so a new runner can take over the account.
     /// A run in progress finishes first: call it off the UI thread.
     pub fn stop_and_wait(mut self) {
@@ -539,8 +544,9 @@ fn spawn_with_feed<R: Remote + 'static>(
     let (tx, rx) = channel();
     let on_status = Arc::new(on_status);
     let cancel = Arc::new(AtomicBool::new(false));
+    let files = Arc::new(crate::filestate::FileStates::default());
     let handle = std::thread::spawn({
-        let (tx, cancel) = (tx.clone(), cancel.clone());
+        let (tx, cancel, files) = (tx.clone(), cancel.clone(), files.clone());
         move || {
             // A panic would end this thread silently and leave the card on its last status for ever.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -552,6 +558,7 @@ fn spawn_with_feed<R: Remote + 'static>(
                     tx,
                     rx,
                     cancel,
+                    files,
                     on_status.clone(),
                     &on_conflicts,
                 )
@@ -569,6 +576,7 @@ fn spawn_with_feed<R: Remote + 'static>(
         tx,
         handle: Some(handle),
         cancel,
+        files,
     }
 }
 
@@ -597,6 +605,7 @@ fn work<R: Remote + 'static>(
     tx: Sender<Event>,
     rx: Receiver<Event>,
     cancel: Arc<AtomicBool>,
+    files: Arc<crate::filestate::FileStates>,
     on_status: Arc<dyn Fn(Status) + Send + Sync>,
     on_conflicts: &(dyn Fn(usize, String) + Send + Sync),
 ) -> Result<(), String> {
@@ -636,6 +645,7 @@ fn work<R: Remote + 'static>(
     engine.case_blind = matches!(acct.kind.as_str(), "dropbox" | "onedrive");
     engine.download_only = acct.download_only;
     engine.cancel = cancel.clone();
+    engine.files = files.clone();
     // The unchecked list the last full scan was made with. When it differs (the user just saved the folder picker),
     // a full scan must run before anything else: it trashes what was unticked and brings back what was re-ticked.
     // A provider with a delta feed would otherwise wait for a cursor reset, and a re-ticked folder whose files the
@@ -769,6 +779,8 @@ fn work<R: Remote + 'static>(
     let mut new_cursor: Option<String> = None;
     // What failed in the runs so far (and in the last session): retried by itself, each failing run waits longer.
     let mut retry = Retry::load(&engine.db);
+    // What failed before the restart still shows as failed (it also holds the "changed under its transfer" ones).
+    files.seed_failed(retry.paths.iter().cloned());
     // Files kept twice since the last alert, and when the alert is due (checked on every turn, so a steady trickle of
     // events cannot hold it back for ever).
     let mut conflicts: Vec<String> = Vec::new();
@@ -1176,6 +1188,8 @@ fn work<R: Remote + 'static>(
             // A stopped run's decision is not carried out by the paths that failed in it: only a clean full scan
             // does that, so with one pending the retry is a full scan.
             retry.finish_run(&report, &ran, did_full, resolution.is_some(), Instant::now());
+            // Like `Retry::record`: a whole comparison that worked says what failed; otherwise only the paths it ran.
+            files.finish(&report.failed, &ran, did_full && !report.has_global_failure());
             if did_full {
                 retry.cool_down(began.elapsed(), Instant::now());
             }
@@ -2116,6 +2130,7 @@ mod tests {
             tx,
             handle: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            files: Default::default(),
         };
         r.pause(false);
         assert!(!r.cancel.load(Ordering::Relaxed), "resume never cancels");

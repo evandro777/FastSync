@@ -288,6 +288,8 @@ pub struct Engine<R: Remote> {
     pub case_blind: bool,
     /// Read by the runner's ticker while `run` works.
     pub progress: std::sync::Arc<std::sync::Mutex<Progress>>,
+    /// The files `run_transfers` is moving, for the file manager's emblems (the runner keeps the failed ones).
+    pub files: std::sync::Arc<crate::filestate::FileStates>,
     /// Set by Pause and Stop (from the UI thread) to end the run in progress: it finishes the transfers under way,
     /// starts no new one and returns `Report.cancelled`. The runner clears it before every run.
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -721,6 +723,7 @@ impl<R: Remote> Engine<R> {
             download_only: false,
             case_blind: true,
             progress: Default::default(),
+            files: Default::default(),
             cancel: Default::default(),
             case_renames: Vec::new(),
             local_moves: Vec::new(),
@@ -1968,6 +1971,8 @@ impl<R: Remote> Engine<R> {
             return;
         }
         let workers = PARALLEL.min(jobs.len());
+        let files = &self.files;
+        files.add_busy(jobs.iter().map(|(w, _)| w.path.clone()));
         let queue = std::sync::Mutex::new(VecDeque::from(jobs));
         let finished = AtomicUsize::new(done);
         let (remote, root, download_only) = (&self.remote, &self.root, self.download_only);
@@ -2015,6 +2020,7 @@ impl<R: Remote> Engine<R> {
                 if matches!(&result, Err(e) if e == CHANGED) {
                     report.later.push(w.path.clone());
                     finished.fetch_add(1, Relaxed);
+                    files.done(&w.path);
                     continue;
                 }
                 // The new row first: a crash in between leaves two rows (the old one reads as gone on both sides and
@@ -2042,8 +2048,12 @@ impl<R: Remote> Engine<R> {
                     Err(e) => log_failed(db, &w, &e, report),
                 }
                 finished.fetch_add(1, Relaxed);
+                // After the DB row, so an emblem asked for now already reads "synced".
+                files.done(&w.path);
             }
         });
+        // Whatever a cancel left in the queue is not moving any more.
+        files.clear_busy();
     }
 
     /// What else must go up after the action: a conflict leaves its copies (see `Action::Conflict`).
@@ -2063,6 +2073,8 @@ impl<R: Remote> Engine<R> {
                 self.db
                     .set_hashed(path, &Base { local: l, remote: r }, rid, hash)
                     .map_err(db)?;
+                // No transfer, so nothing else tells the file manager that this file is now known.
+                self.files.changed(path);
             }
             Action::Upload | Action::Download | Action::MoveLocal | Action::MoveRemote => {
                 return Err("handled by run_transfers".into());

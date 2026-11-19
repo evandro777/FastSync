@@ -29,7 +29,7 @@ Page: <https://evandro777.github.io/FastSync/>
 - **Real two-way sync, offline.** Everything stays on disk. A conflict keeps both copies, and renames, moves and copies are done in the cloud instead of being sent again.
 - **Selective sync, download-only mode and ignore rules** (`rules.fastsyncignore`, gitignore syntax, shared by all your computers).
 - **Your own client ID**, so you do not depend on rclone's shared one and its rate limits ([how to](docs/OWN-CLIENT-ID.md)).
-- **Linux desktop integration.** Tray, notifications, Nemo "Copy share link" and "View on web", folder emblems in Nemo, Nautilus and Caja, activity log per account, cloud space gauge.
+- **Linux desktop integration.** Start at login (Preferences), tray, notifications, Nemo "Copy share link" and "View on web", per-file sync emblems in Nemo (needs the `python-nemo` package, `nemo-python` on Ubuntu, then `nemo -q`), activity log per account, cloud space gauge.
 - **Free and open source** (GPL-3.0). Flatpak with automatic updates, or an AppImage.
 
 The full list, with every rule and edge case, is in [docs/FEATURES.md](docs/FEATURES.md).
@@ -101,6 +101,29 @@ sudo chmod +x ~/Downloads/FastSync-<version>-x86_64.AppImage
 It uses the fontconfig, xkbcommon and X11 libraries already on your system, and it needs `rclone` installed. Use the official build from [rclone.org](https://rclone.org/install/): Debian and Ubuntu's `apt` package is old and leaves out some services (MEGA, for one). The Flatpak bundles the official one.
 
 The AppImage does not update itself, but it has update information built in, so a tool such as [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) (`appimageupdatetool FastSync-*.AppImage`), [Gear Lever](https://github.com/mijorus/gearlever) or [AppManager](https://github.com/kem-a/AppManager) downloads only the changed parts of the next release.
+
+## Desktop Integration (optional)
+
+### Nemo integration
+
+For the Nemo file manager (Linux Mint's default), FastSync adds two things inside your synced folders:
+
+- **Status emblems** on each file and folder: up to date, syncing, error, paused, or ignored (by `rules.fastsyncignore` or an unchecked folder).
+- **A "FastSync" submenu** in the right-click menu, with "Copy share link" and "View on web".
+
+To turn it on:
+
+1. Install the `python-nemo` package (`nemo-python` on Ubuntu). Linux Mint usually has it already. If not: `sudo apt install python-nemo`.
+2. Start FastSync. On start it writes the Nemo extension, the emblem icons and the menu actions into your home folder (`~/.local/share/nemo-python/extensions`, `~/.local/share/icons/hicolor`, `~/.local/share/nemo/actions`).
+3. Restart Nemo once so it loads them: `nemo -q`.
+
+Good to know:
+
+- Emblems are live: they come from the running app, and nothing is written to your files. Quit FastSync and they disappear.
+- Emblems can be turned off in Settings, which removes the extension.
+- Nemo hides emblems on thumbnails that are too small for them. At the default zoom, wide images and videos show none; zoom in to see them.
+- Nemo only. Works in the Flatpak too (it has access to your home folder, where Nemo looks for the extension).
+- Most of this is untested in a live Nemo, so tell us if something does not show.
 
 ## Build & Configurations
 

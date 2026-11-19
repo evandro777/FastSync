@@ -99,7 +99,8 @@ fn listen_at(path: &Path, on_command: impl Fn(String) + Send + 'static) -> std::
                 }
             };
             let line = String::from_utf8(buf).unwrap_or_default();
-            let command = line.lines().next().unwrap_or("").trim();
+            // Not trimmed: the end of `share <path>` may be a space that belongs to the file's name.
+            let command = line.lines().next().unwrap_or("");
             // A start's liveness probe connects and sends nothing: an empty command, dropped here.
             if complete && !command.is_empty() {
                 on_command(command.to_string());
@@ -163,6 +164,15 @@ mod tests {
             results.iter().flatten().count() == 1 && send_to(&path, "show"),
             "the winner must stay reachable"
         );
+    }
+
+    #[test]
+    fn a_command_keeps_the_spaces_at_the_end_of_a_path() {
+        let path = temp_socket("spaces");
+        let (tx, rx) = mpsc::channel();
+        listen_at(&path, move |c| tx.send(c).unwrap()).unwrap();
+        assert!(send_to(&path, "share /x/a.txt "));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "share /x/a.txt ");
     }
 
     #[test]

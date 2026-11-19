@@ -415,7 +415,7 @@ const GRAPH: &str = "https://graph.microsoft.com/v1.0/me/drive";
 
 /// The OneDrive web page of an item (`webUrl`), for "View on web". The only call here that is not a change feed.
 pub fn onedrive_web_url(token: Token, id: &str) -> Result<String> {
-    let (st, v) = Http::new(token).get(&format!("{GRAPH}/items/{id}?$select=webUrl"))?;
+    let (st, v) = Http::new(token).get(&format!("{GRAPH}/items/{}?$select=webUrl", crate::web::enc(id)))?;
     if st != 200 {
         return fail("onedrive item", st, &v);
     }

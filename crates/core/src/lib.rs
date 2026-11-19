@@ -7,6 +7,7 @@ pub mod decide;
 pub mod delta;
 pub mod engine;
 pub mod files;
+pub mod filestate;
 pub mod ignore;
 pub mod rclone;
 pub mod runner;

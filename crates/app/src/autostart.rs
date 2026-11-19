@@ -1,0 +1,183 @@
+//! "Start at login" as an XDG autostart entry, toggled from the preferences. Same as FastClipboard's, with `--hidden`:
+//! at login the window stays in the tray.
+use std::{collections::HashMap, fs, io, path::PathBuf};
+use zbus::{
+    blocking::{Connection, Proxy},
+    zvariant::{OwnedObjectPath, OwnedValue, Value},
+};
+
+use crate::emblem::in_flatpak;
+
+/// Flatpak with the host's autostart dir visible (`--filesystem=home` mounts it at `$HOME/.config/autostart`): we
+/// write the entry ourselves (with icon and description) instead of asking the portal.
+fn host_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("HOME")?).join(".config/autostart");
+    (in_flatpak() && dir.is_dir()).then_some(dir)
+}
+
+fn flatpak_id() -> String {
+    std::env::var("FLATPAK_ID").unwrap_or_else(|_| "io.github.evandro777.FastSync".into())
+}
+
+fn path() -> PathBuf {
+    // Same file name as the portal's entry, so switching between the two never leaves a duplicate.
+    if let Some(dir) = host_dir() {
+        return dir.join(format!("{}.desktop", flatpak_id()));
+    }
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("autostart/fastsync.desktop")
+}
+
+pub fn is_enabled() -> bool {
+    path().exists()
+}
+
+/// The AppImage file when running from one (its mount point disappears on exit), else this binary.
+fn exe() -> Option<String> {
+    std::env::var("APPIMAGE")
+        .ok()
+        .or_else(|| std::env::current_exe().ok().map(|p| p.to_string_lossy().into_owned()))
+}
+
+/// An `Exec` argument as the Desktop Entry spec wants it: double-quoted, with `"`, `` ` ``, `$` and `\` escaped,
+/// the backslashes doubled again for the file's own string escaping, and `%` doubled (it starts a field code).
+fn quote(arg: &str) -> String {
+    let mut s = String::from("\"");
+    for c in arg.chars() {
+        match c {
+            '"' | '`' | '$' => {
+                s.push_str("\\\\");
+                s.push(c);
+            }
+            '\\' => s.push_str("\\\\\\\\"),
+            '%' => s.push_str("%%"),
+            _ => s.push(c),
+        }
+    }
+    s.push('"');
+    s
+}
+
+fn entry(exec: &str) -> String {
+    format!(
+        "[Desktop Entry]\nType=Application\nName=FastSync\nComment=Two-way sync for Dropbox, Google Drive, OneDrive \
+         and MEGA\nExec={exec} --hidden\nIcon=io.github.evandro777.FastSync\nTerminal=false\n"
+    )
+}
+
+/// The `RequestBackground` options. `commandline` is what the host runs at login (the sandbox adds `flatpak run`).
+fn portal_options(enabled: bool, token: &str) -> HashMap<&'static str, Value<'static>> {
+    HashMap::from([
+        ("handle_token", Value::from(token.to_string())),
+        (
+            "reason",
+            Value::from("Keep your folders in sync after login".to_string()),
+        ),
+        ("autostart", Value::from(enabled)),
+        (
+            "commandline",
+            Value::from(vec!["fastsync".to_string(), "--hidden".to_string()]),
+        ),
+    ])
+}
+
+/// Inside Flatpak without the host's dir the Background portal writes the entry (and shows the desktop's permission
+/// dialog, so this blocks: call it from a worker thread).
+fn portal(enabled: bool) -> Result<(), String> {
+    let err = |e: zbus::Error| e.to_string();
+    let conn = Connection::session().map_err(err)?;
+    // Not the folder picker's `fastsync<pid>`: a portal request name must be unique while both are open.
+    let token = format!("fastsyncbg{}", std::process::id());
+    let sender = conn
+        .unique_name()
+        .map_or_else(String::new, |n| n.trim_start_matches(':').replace('.', "_"));
+    // Subscribe before the call: a fast answer would otherwise be lost.
+    let request = Proxy::new(
+        &conn,
+        "org.freedesktop.portal.Desktop",
+        format!("/org/freedesktop/portal/desktop/request/{sender}/{token}"),
+        "org.freedesktop.portal.Request",
+    )
+    .map_err(err)?;
+    let mut responses = request.receive_signal("Response").map_err(err)?;
+    Proxy::new(
+        &conn,
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.Background",
+    )
+    .map_err(err)?
+    .call::<_, _, OwnedObjectPath>("RequestBackground", &("", portal_options(enabled, &token)))
+    .map_err(err)?;
+    let msg = responses.next().ok_or("the portal sent no answer")?;
+    let (code, results): (u32, HashMap<String, OwnedValue>) = msg.body().deserialize().map_err(|e| e.to_string())?;
+    let granted = results
+        .get("autostart")
+        .is_none_or(|v| bool::try_from(v).unwrap_or(enabled) == enabled);
+    match (code, granted) {
+        (0, true) => Ok(()),
+        (0, false) | (1, _) => {
+            Err("the desktop did not allow it (reset with: flatpak permission-reset $FLATPAK_ID)".into())
+        }
+        _ => Err(format!("the portal answered {code}")),
+    }
+}
+
+/// shortcut: through the portal the file below is only a marker for `is_enabled`; if the user removes the entry in
+/// the desktop's Startup Applications the switch stays on. Fine until the portal offers a way to query it.
+pub fn set(enabled: bool) -> io::Result<()> {
+    let direct = host_dir().is_some();
+    if in_flatpak() && !direct {
+        portal(enabled).map_err(io::Error::other)?;
+    }
+    let p = path();
+    if enabled {
+        // /app/bin/fastsync means nothing to the host, which must go through `flatpak run`.
+        let exec = if in_flatpak() {
+            format!("flatpak run --command=fastsync {}", flatpak_id())
+        } else {
+            quote(&exe().ok_or_else(|| io::Error::other("cannot find the executable"))?)
+        };
+        fs::create_dir_all(p.parent().unwrap_or(&p))?;
+        // Through a temp file: a crash mid-write must not leave a half entry that `is_enabled` reads as "on".
+        let tmp = p.with_extension("desktop.tmp");
+        fs::write(&tmp, entry(&exec))
+            .and_then(|()| fs::rename(&tmp, &p))
+            .inspect_err(|_| {
+                let _ = fs::remove_file(&tmp);
+            })
+    } else {
+        match fs::remove_file(&p) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_path_is_quoted_for_spaces_and_reserved_characters() {
+        assert_eq!(quote("/home/a b, c/fastsync"), "\"/home/a b, c/fastsync\"");
+        assert_eq!(quote("/x/$y\"z%"), "\"/x/\\\\$y\\\\\"z%%\"");
+        assert!(entry(&quote("/bin/fastsync")).contains("\nExec=\"/bin/fastsync\" --hidden\n"));
+    }
+
+    #[test]
+    fn portal_options_carry_the_choice_and_the_command() {
+        let on = portal_options(true, "tok");
+        assert_eq!(on["autostart"], Value::from(true));
+        assert_eq!(on["handle_token"], Value::from("tok".to_string()));
+        assert_eq!(
+            on["commandline"],
+            Value::from(vec!["fastsync".to_string(), "--hidden".to_string()])
+        );
+        assert_eq!(portal_options(false, "t")["autostart"], Value::from(false));
+    }
+}

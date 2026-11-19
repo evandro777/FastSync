@@ -199,6 +199,10 @@ T = [
     # Preferences and About.
     ("SettingsDialog", "Preferences", ["Preferências"]),
     ("SettingsDialog", "Appearance", ["Aparência"]),
+    ("SettingsDialog", "Start at login", ["Iniciar com o sistema"]),
+    ("SettingsDialog", "Advanced", ["Avançado"]),
+    ("SettingsDialog", "Show", ["Mostrar"]),
+    ("SettingsDialog", "Hide", ["Ocultar"]),
     ("SettingsDialog", "System", ["Sistema"]),
     ("SettingsDialog", "Light", ["Claro"]),
     ("SettingsDialog", "Dark", ["Escuro"]),

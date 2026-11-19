@@ -27,30 +27,18 @@
   <launchable type="desktop-id">io.github.evandro777.FastSync.desktop</launchable>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="0.2.8" date="2026-11-19">
+    <release version="0.3.0" date="2026-11-19">
       <description>
         <p>More reliable, and faster with ignore rules.</p>
         <ul>
-          <li>FastSync restarts its sync helper (rclone) if it ever stops, and one account's internal error no longer affects the others.</li>
-          <li>Pause now stops a sync that is already running.</li>
-          <li>Folders hidden by ignore rules are no longer scanned, which is much faster for things like node_modules.</li>
-          <li>Files from other sync clients (.dropbox, .DS_Store, Office lock files and similar) are never synced.</li>
-          <li>Identical files are no longer duplicated as conflicts when the check itself fails; it is retried instead.</li>
-          <li>Removing an account clears its old trash items; the rest stays in .fastsync/trash.</li>
-          <li>The first scan of a big cloud shows its progress.</li>
-          <li>Improve handle with symlinks.</li>
-          <li>Reduce scenarios of full scan and log when happens.</li>
-          <li>Local copies tries to copy them on remote instead of uploading them.</li>
-          <li>Rename local files tries to rename remotely instead of deleting and re-uploading.</li>
-          <li>Empty folders now sync.</li>
-          <li>Conflicts keep the newer file's name. The older copy gets the (conflict) name.</li>
-          <li>A big first scan can resume.</li>
-          <li>Notifications are clickable.</li>
-          <li>Deleting and re-saving a file, or renaming it, no longer risks removing the cloud copy.</li>
-          <li>Changes to the ignore-rules file can no longer make another computer trash files.</li>
-          <li>First syncs onto an existing folder are faster and safer.</li>
-          <li>Drive and MEGA no longer treat names that differ only by case as clashes.</li>
-          <li>Sync folder renames, moves and copies in the cloud; guard and feed fixes.</li>
+          <li>File manager emblems are now live. Nothing is written on your files any more: a Nemo-Python extension asks the running app over a socket what each file shows (synced, syncing, error, paused). A grey "ignored" badge marks .fastsync, unchecked folders and files hidden by ignore rules. Old `metadata::emblems` marks are cleaned up at start. Nemo only; needs python-nemo.</li>
+          <li>Start at login: new Preferences box. Runs `fastsync --hidden` and stays in the tray. Flatpak uses the Background portal.</li>
+          <li>Flatpak: the Nemo actions, submenu, icon and emblems are written to the host's folders, and the actions run `flatpak run <id> --share %F`.</li>
+          <li>Damaged state database is kept as `.bad.<time>` and rebuilt. With no rows it only adopts what matches, never deletes.</li>
+          <li>New `FileStates` (core) tracks moving and failed files, fed by the engine and the runner; failed files survive a restart.</li>
+          <li>OneDrive "View on web" fetches `webUrl` from Graph.</li>
+          <li>Redrawn tray icons (error, paused, syncing) and a new syncing emblem.</li>
+          <li>Tests, README, FEATURES, ENGINE, AGENTS and pt_BR strings updated.</li>
           <li>Bug fixes.</li>
         </ul>
       </description>

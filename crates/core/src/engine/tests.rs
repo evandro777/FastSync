@@ -4319,3 +4319,26 @@ fn a_folder_made_while_the_app_was_closed_is_found_by_the_walk() {
         "synced: nothing left to report"
     );
 }
+
+#[test]
+fn a_transfer_marks_the_file_busy_then_leaves_nothing_busy() {
+    let f = Fixture::new("filestate");
+    write(f.local("up/a.txt"), "local", 100);
+    let mut f = f;
+    assert_eq!(f.engine.sync_paths(&["up/a.txt".into()]).transferred, 1);
+    // The emblem server was told about the file, and nothing stays "syncing" after the run.
+    let (dirty, all) = f.engine.files.take_dirty();
+    assert!(!all && dirty.contains(&"up/a.txt".to_string()), "{dirty:?}");
+    assert!(!f.engine.files.busy("up") && !f.engine.files.busy("up/a.txt"));
+}
+
+#[test]
+fn a_file_the_db_takes_as_it_is_tells_the_file_manager() {
+    let mut f = Fixture::new("filestate-adopt");
+    write(f.local("same.txt"), "same", 100);
+    write(f.remote("same.txt"), "same", 100);
+    let r = f.engine.full_scan();
+    assert_eq!(r.transferred, 0, "{r:?}");
+    let (dirty, all) = f.engine.files.take_dirty();
+    assert!(all || dirty.contains(&"same.txt".to_string()), "{dirty:?}");
+}

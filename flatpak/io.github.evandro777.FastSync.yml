@@ -11,6 +11,9 @@ command: fastsync
 # Wayland when available, otherwise X11; no GPU (software rendering). A sync app needs the network (rclone talks to
 # the clouds and runs its OAuth callback on 127.0.0.1) and the user's folders (`--filesystem=home`: the synced
 # folder is typed in, there is no portal for a folder that must stay readable and writable in the background).
+# The Nemo integration (emblem extension, badges, right-click actions) relies on the same `home` access to write
+# ~/.local/share/{nemo,nemo-python,icons} and ~/.config/nemo; narrowing `home` means adding those four back
+# (xdg-data/..., xdg-config/nemo). Its emblem socket needs nothing: $XDG_RUNTIME_DIR/app/<id>/ is shared anyway.
 # The tray needs the StatusNotifierWatcher.
 finish-args:
   - --share=ipc

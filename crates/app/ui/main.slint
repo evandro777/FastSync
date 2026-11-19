@@ -204,6 +204,10 @@ component SettingsDialog inherits Dialog {
     in-out property <int> language-index;
     // Status badge on the account folders in the file manager (settings.file_emblems).
     in-out property <bool> file-emblems;
+    // Whether the session starts FastSync (an autostart entry on disk, not a setting).
+    in-out property <bool> autostart;
+    // Trash age and the two check intervals stay folded away until asked for.
+    in-out property <bool> advanced: false;
     // "3 files, 1.2 MB" or "Empty", worked out in Main; `trash-files` only decides whether there is anything to empty.
     in property <string> trash-summary;
     in property <int> trash-files;
@@ -248,6 +252,10 @@ component SettingsDialog inherits Dialog {
                     current-index <=> root.language-index;
                 }
             }
+            PrefRow {
+                label: @tr("Start at login");
+                CheckBox { checked <=> root.autostart; }
+            }
             // A row and its hint are one group (4 px apart); the groups are 12 px apart, so a hint is never
             // equally far from the row above and the row below.
             VerticalLayout {
@@ -284,6 +292,16 @@ component SettingsDialog inherits Dialog {
                     avail: root.text-avail;
                 }
             }
+            PrefRow {
+                label: @tr("Advanced");
+                Rectangle { horizontal-stretch: 1; }
+                Button {
+                    text: root.advanced ? @tr("Hide") : @tr("Show");
+                    clicked => { root.advanced = !root.advanced; }
+                }
+            }
+            if root.advanced: VerticalLayout {
+            spacing: 12px;
             VerticalLayout {
                 spacing: Family.gap-s;
                 PrefRow {
@@ -316,6 +334,7 @@ component SettingsDialog inherits Dialog {
                     text: @tr("Used when the system cannot watch your folders for changes. Edits there are only noticed by this check.");
                     avail: root.text-avail;
                 }
+            }
             }
             if root.watch-fix != "": HintText {
                 text: @tr("FastSync cannot watch all your folders for changes (the system limit is reached), so some edits are only noticed by a periodic check. To raise the limit, run this and restart FastSync:");
@@ -1247,6 +1266,8 @@ export component Main inherits Window {
     callback theme-changed(int);
     callback language-changed(int);
     callback file-emblems-changed(bool);
+    callback autostart-changed(bool);
+    in-out property <bool> autostart: false;
     callback trash-days-changed(int);
     in-out property <int> trash-days: 90;
     callback walk-minutes-changed(int);
@@ -1271,6 +1292,7 @@ export component Main inherits Window {
     }
     changed language-index => { root.language-changed(root.language-index); }
     changed file-emblems => { root.file-emblems-changed(root.file-emblems); }
+    changed autostart => { root.autostart-changed(root.autostart); }
     changed trash-days => { root.trash-days-changed(root.trash-days); }
     changed walk-minutes => { root.walk-minutes-changed(root.walk-minutes); }
     changed walk-fallback-minutes => { root.walk-fallback-minutes-changed(root.walk-fallback-minutes); }
@@ -1487,6 +1509,7 @@ export component Main inherits Window {
         color-scheme-index <=> root.color-scheme-index;
         language-index <=> root.language-index;
         file-emblems <=> root.file-emblems;
+        autostart <=> root.autostart;
         trash-summary: root.trash-summary;
         trash-files: root.trash-files;
         trash-busy: root.trash-busy;

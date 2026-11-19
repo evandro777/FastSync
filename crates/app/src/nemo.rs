@@ -1,9 +1,8 @@
 //! Nemo's right-click "FastSync" submenu: one `.nemo_action` per item in `~/.local/share/nemo/actions`, grouped by an
 //! entry in the user's own layout file `~/.config/nemo/actions-tree.json` (the file Nemo's "Actions layout editor"
 //! saves). That file is the user's: we only add or refresh our submenu and keep everything else as it is.
-//! Cosmetic like the emblems, so failures are ignored. Skipped in the Flatpak, which cannot write outside its sandbox
-//! (the README says how to add an action by hand there).
-use fastsync_core::settings::data_dir;
+//! Cosmetic like the emblems, so failures are ignored. In the Flatpak it writes to the host's folders (the manifest
+//! grants `--filesystem=home`) and the actions run `flatpak run`.
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
@@ -48,23 +47,22 @@ static LAST: Mutex<Option<Option<String>>> = Mutex::new(None);
 /// Makes the menu match the accounts: shown only inside their synced folders (`Files=<root>/*;`), gone with no
 /// accounts. `roots` are the accounts' local folders.
 pub fn install(roots: &[String]) {
-    if crate::emblem::in_flatpak() {
-        return;
-    }
     let globs = file_globs(roots);
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     if last.as_ref() == Some(&globs) {
         return;
     }
-    // An AppImage runs from a temporary mount: `APPIMAGE` is the file that stays.
+    // An AppImage runs from a temporary mount: `APPIMAGE` is the file that stays. The host's Nemo cannot run the
+    // binary inside a Flatpak: it goes through `flatpak run`, which hands the command to the running instance.
     let Some(exe) = std::env::var_os("APPIMAGE")
         .map(PathBuf::from)
         .or_else(|| std::env::current_exe().ok())
     else {
         return;
     };
+    let flatpak = std::env::var("FLATPAK_ID").ok();
     let (Some(actions), Some(config)) = (
-        data_dir().and_then(|d| d.parent().map(|p| p.join("nemo/actions"))),
+        crate::emblem::host_data().map(|p| p.join("nemo/actions")),
         config_dir().map(|c| c.join("nemo/actions-tree.json")),
     ) else {
         return;
@@ -74,10 +72,13 @@ pub fn install(roots: &[String]) {
         let path = actions.join(file);
         match &globs {
             Some(globs) => {
-                let exe = exec_quote(&exe.to_string_lossy());
+                let exec = match &flatpak {
+                    Some(id) => format!("flatpak run {} {option} %F", exec_quote(id)),
+                    None => format!("\"{}\" {option} %F", exec_quote(&exe.to_string_lossy())),
+                };
                 let text = format!(
                     "[Nemo Action]\nName={name}\nName[pt_BR]={name_pt}\nComment={tip}\nComment[pt_BR]={tip_pt}\n\
-                     Exec=\"{exe}\" {option} %F\nIcon-Name={icon}\nSelection=s\n\
+                     Exec={exec}\nIcon-Name={icon}\nSelection=s\n\
                      Extensions=any;\nFiles={globs}\n"
                 );
                 if std::fs::create_dir_all(&actions).is_ok() {
@@ -131,7 +132,7 @@ fn file_globs(roots: &[String]) -> Option<String> {
 
 /// Puts the app icon where icon themes look (only when missing or changed), as `emblem::install` does for the emblems.
 fn install_icon() {
-    let Some(dir) = data_dir().and_then(|d| d.parent().map(|p| p.join("icons/hicolor/scalable/apps"))) else {
+    let Some(dir) = crate::emblem::host_data().map(|p| p.join("icons/hicolor/scalable/apps")) else {
         return;
     };
     let path = dir.join(format!("{APP_ICON}.svg"));
@@ -141,10 +142,15 @@ fn install_icon() {
 }
 
 fn config_dir() -> Option<PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    // In the Flatpak `XDG_CONFIG_HOME` is the app's own directory, not the host's.
+    std::env::var_os(if crate::emblem::in_flatpak() {
+        "HOST_XDG_CONFIG_HOME"
+    } else {
+        "XDG_CONFIG_HOME"
+    })
+    .map(PathBuf::from)
+    .filter(|p| p.is_absolute())
+    .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
 }
 
 /// Merges our submenu into the user's layout file (or takes it out). A file that cannot be read as a layout is left

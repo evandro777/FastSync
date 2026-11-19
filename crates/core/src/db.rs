@@ -11,7 +11,54 @@ pub type Result<T> = rusqlite::Result<T>;
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
-        Self::init(Connection::open(path)?)
+        match Connection::open(path).and_then(Self::init) {
+            // A damaged file would fail every start. Keep it (with its WAL files) and begin again: a DB with no rows
+            // only compares both sides and adopts what matches, it never deletes.
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                ) =>
+            {
+                let bad = crate::files::backup_path(path);
+                for suffix in ["", "-wal", "-shm"] {
+                    let (mut from, mut to) = (path.as_os_str().to_owned(), bad.as_os_str().to_owned());
+                    from.push(suffix);
+                    to.push(suffix);
+                    let _ = std::fs::rename(from, to);
+                }
+                let db = Self::init(Connection::open(path)?)?;
+                db.log(
+                    "error",
+                    "",
+                    None,
+                    &format!("the state database was damaged, kept as {}", bad.display()),
+                );
+                Ok(db)
+            }
+            r => r,
+        }
+    }
+
+    /// A second connection that can only read (WAL lets it work next to the runner's writer). `None` when the file is
+    /// missing (the account never ran) or cannot be opened: callers treat that as "nothing known".
+    pub fn open_read(path: &Path) -> Option<Self> {
+        let c = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+        c.busy_timeout(std::time::Duration::from_millis(200)).ok()?;
+        Some(Self(c))
+    }
+
+    /// A synced file, a synced folder, or a folder with a synced file somewhere below it.
+    pub fn knows(&self, path: &str) -> Result<bool> {
+        self.0
+            .query_row(
+                "SELECT 1 FROM files WHERE path=?1 UNION ALL SELECT 1 FROM folders WHERE path=?1 \
+                 UNION ALL SELECT 1 FROM files WHERE path >= ?2 AND path < ?3 LIMIT 1",
+                params![path, format!("{path}/"), format!("{path}0")],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|r| r.is_some())
     }
 
     /// A DB that refuses to write one meta key (and takes the others): for tests of what the runner does when it cannot
@@ -453,6 +500,36 @@ mod tests {
             mtime: n as i64 * 1000,
         };
         Base { local: s, remote: s }
+    }
+
+    #[test]
+    fn knows_files_folders_and_the_folders_around_them() {
+        let db = Db::memory().unwrap();
+        db.set("a/b/c.txt", &base(1), "id").unwrap();
+        db.add_dir_row("empty").unwrap();
+        for known in ["a/b/c.txt", "a/b", "a", "empty"] {
+            assert!(db.knows(known).unwrap(), "{known}");
+        }
+        // A name that merely starts like a known one is not known.
+        for unknown in ["a/b/c", "a/bb", "ab", "empty2", "new.txt"] {
+            assert!(!db.knows(unknown).unwrap(), "{unknown}");
+        }
+    }
+
+    #[test]
+    fn a_damaged_db_is_kept_aside_and_a_fresh_one_opens() {
+        let dir = std::env::temp_dir().join(format!("fastsync-bad-db-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        std::fs::write(&path, vec![b'x'; 4096]).unwrap();
+        let db = Db::open(&path).expect("a fresh DB replaces the damaged one");
+        assert_eq!(db.count().unwrap(), 0);
+        let kept = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("state.db.bad."));
+        assert!(kept, "the damaged file is kept");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

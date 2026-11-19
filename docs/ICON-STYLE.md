@@ -109,5 +109,5 @@ Gradients and opacity are not just ignored, they come out wrong, so the PNG woul
 
 - `packaging/<app id>.svg`: the Flatpak and AppImage icon, and the About dialog in the app.
 - `packaging/<app id>.png`: the AppImage `.DirIcon`, and any place that needs a bitmap, such as a tray icon.
-- FastSync only: `crates/app/tray/{idle,syncing,paused,error}.svg` are the tray icons, the same tile and cloud with another color and mark per status. `build.rs` turns their PNGs into pixmaps; regenerate a PNG with `convert -background none -density 768 <name>.svg -resize 64x64 PNG32:<name>.png` (`PNG32:` keeps it 8-bit RGBA, which `build.rs` checks).
+- FastSync only: `crates/app/tray/{idle,syncing,paused,error}.svg` are the tray icons, the same tile with another color and mark per status. Only `idle` keeps the cloud (with a check); `syncing` (two circular arrows), `paused` and `error` drop it and draw the mark at full size, because a 3 px mark inside a cloud cannot be told apart at tray size. `build.rs` turns their PNGs into pixmaps; regenerate a PNG with `convert -background none -density 768 <name>.svg -resize 64x64 PNG32:<name>.png` (`PNG32:` keeps it 8-bit RGBA, which `build.rs` checks).
 - The landing page and the README may show it too. Update them when the icon changes.

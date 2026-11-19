@@ -644,6 +644,22 @@ msgid "Appearance"
 msgstr "Aparência"
 
 msgctxt "SettingsDialog"
+msgid "Start at login"
+msgstr "Iniciar com o sistema"
+
+msgctxt "SettingsDialog"
+msgid "Advanced"
+msgstr "Avançado"
+
+msgctxt "SettingsDialog"
+msgid "Show"
+msgstr "Mostrar"
+
+msgctxt "SettingsDialog"
+msgid "Hide"
+msgstr "Ocultar"
+
+msgctxt "SettingsDialog"
 msgid "System"
 msgstr "Sistema"
 

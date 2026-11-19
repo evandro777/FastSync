@@ -18,6 +18,7 @@ slint::include_modules!();
 
 mod account;
 mod activity;
+mod autostart;
 mod cards;
 mod emblem;
 #[cfg(debug_assertions)]
@@ -122,7 +123,6 @@ fn start_account(acct: &Account, ui: slint::Weak<Main>) {
         }
     };
     let id = acct.id.clone();
-    let local = acct.local.clone();
     let provider = accounts::provider_name(&acct.kind).to_string();
     let conflict_ui = ui.clone();
     // Spawning is quick (the worker is a thread), so it stays under the lock: no gap where a second start slips in.
@@ -130,14 +130,13 @@ fn start_account(acct: &Account, ui: slint::Weak<Main>) {
         acct.clone(),
         rc,
         move |st| {
-            let new = emblem::name(Some(&st));
             let stopped = match &st {
                 Status::Stopped(d, k, _) => Some((*d as i32, *k as i32)),
                 _ => None,
             };
             let clean = matches!(st, Status::Idle(_));
             let mut s = state();
-            let prev = s.status.insert(id.clone(), st);
+            s.status.insert(id.clone(), st);
             // One notification per stop, not one per scan: a clean run (the user answered the card) re-arms it.
             let warn = match stopped {
                 Some(counts) => s.warned.insert(id.clone()).then_some(counts),
@@ -150,10 +149,6 @@ fn start_account(acct: &Account, ui: slint::Weak<Main>) {
             };
             drop(s);
             let provider = provider.clone();
-            // Every run flips Syncing and back: only touch the folder when the emblem really changes.
-            if emblem::name(prev.as_ref()) != new {
-                emblem::set(&local, new);
-            }
             let _ = ui.upgrade_in_event_loop(move |ui| {
                 refresh(&ui);
                 if let Some((deletes, known)) = warn {
@@ -260,6 +255,13 @@ fn main() {
         ui.set_color_scheme_index(theme_index(&s.theme));
         ui.set_file_emblems(s.file_emblems);
         emblem::enable(s.file_emblems);
+        #[cfg(debug_assertions)]
+        let real = fixtures::mode().is_none();
+        #[cfg(not(debug_assertions))]
+        let real = true;
+        if real {
+            ui.set_autostart(autostart::is_enabled());
+        }
         ui.set_trash_days(s.trash_days as i32);
         TRASH_DAYS.store(s.trash_days, std::sync::atomic::Ordering::SeqCst);
         ui.set_walk_minutes(s.walk_minutes as i32);
@@ -277,6 +279,8 @@ fn main() {
     let mut has_tray = false;
     if !fixture_run {
         state().accounts = accounts::load();
+        emblem::clear_old_marks(state().accounts.iter().map(|a| a.local.clone()).collect());
+        emblem::serve(Arc::new(emblem::AppSource::default()));
         // Old trash goes in the background: a pass now, then every few hours (the limit is counted in days).
         std::thread::spawn(|| {
             loop {
@@ -427,12 +431,11 @@ fn main() {
             // Only the link is removed: the local files stay where they are. The token and the DB go.
             std::thread::spawn(move || {
                 // A run in progress ends at its next file or folder (`stop` raises the cancel flag): wait for it, or
-                // it keeps moving files for a removed account, then its last status brings the emblem back.
+                // it keeps moving files for a removed account, then its last status comes back.
                 if let Some(r) = runner {
                     r.stop_and_wait();
                 }
                 state().status.remove(id.as_str());
-                emblem::set(&local, None);
                 // The trash of a removed account is no longer counted or aged by anything: drop what is already old.
                 // Only old batches: the same folder may already belong to a new account, which is writing into
                 // `.fastsync` (so neither `tmp` nor the folder itself is removed here).
@@ -862,20 +865,25 @@ fn main() {
             s.file_emblems = on;
             s.save();
             emblem::enable(on);
-            // Off clears every folder, on re-applies each account's current status.
-            let todo: Vec<(String, Option<&'static str>)> = {
-                let st = state();
-                st.accounts
-                    .iter()
-                    .map(|a| {
-                        (
-                            a.local.clone(),
-                            if on { emblem::name(st.status.get(&a.id)) } else { None },
-                        )
-                    })
-                    .collect()
-            };
-            std::thread::spawn(move || todo.iter().for_each(|(l, e)| emblem::set(l, *e)));
+            // The running extension is told by the server's next push; the file itself goes or comes now.
+            std::thread::spawn(emblem::sync_extension);
+        }
+    });
+    ui.on_autostart_changed({
+        let weak = ui.as_weak();
+        move |on| {
+            // Also fires at start-up and when a failure puts the box back: only a real change goes on.
+            if autostart::is_enabled() == on {
+                return;
+            }
+            let weak = weak.clone();
+            // A thread: in Flatpak the portal blocks while the desktop asks the user.
+            std::thread::spawn(move || {
+                if let Err(e) = autostart::set(on) {
+                    eprintln!("cannot change the autostart entry: {e}");
+                    let _ = weak.upgrade_in_event_loop(|w| w.set_autostart(autostart::is_enabled()));
+                }
+            });
         }
     });
     ui.on_language_changed({
@@ -1019,7 +1027,10 @@ fn main() {
             slint::CloseRequestResponse::HideWindow
         }
     });
-    ui.show().unwrap();
+    // `--hidden` (the login entry): stay in the tray, but never hide the only way in.
+    if !(has_tray && std::env::args().any(|a| a == "--hidden")) {
+        ui.show().unwrap();
+    }
     slint::run_event_loop_until_quit().unwrap();
     // Normal exit only; the snapshot script kills the app, so fixtures never overwrite the real file.
     save_size(&ui, &settings);
@@ -1030,10 +1041,8 @@ fn quit() {
     for r in state().runners.values() {
         r.stop();
     }
-    // A stopped app must not leave a stale "synced" mark. Runners may still report after this, so clear last.
-    for a in state().accounts.iter() {
-        emblem::set(&a.local, None);
-    }
+    // The extension sees the socket close and drops every emblem.
+    emblem::stop();
     if let Some(rc) = state().rc.take() {
         rc.shutdown();
     }

@@ -135,9 +135,6 @@ pub(crate) fn apply_folders(
     if let Some(r) = runner {
         r.stop_and_wait();
     }
-    if local_changed {
-        emblem::set(&old.local, None);
-    }
     if local_changed && let Some(dir) = accounts::account_dir(id) {
         let _ = std::fs::remove_dir_all(dir);
     }

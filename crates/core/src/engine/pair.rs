@@ -364,6 +364,12 @@ impl<R: Remote> Engine<R> {
                 continue;
             }
             let copy_started = std::time::Instant::now();
+            // The copy runs here, before `run_transfers`: the emblems must show these files as moving meanwhile, and
+            // refresh them once their rows are written (or, if they were not, because they go one by one next).
+            let files = self.files.clone();
+            let paths: Vec<String> = proven.iter().map(|(i, _)| jobs[*i].0.path.clone()).collect();
+            files.add_busy(paths.iter().cloned());
+            let release = || paths.iter().for_each(|p| files.done(p));
             self.set_progress(Progress {
                 done,
                 total,
@@ -379,6 +385,7 @@ impl<R: Remote> Engine<R> {
             // Whatever the call said, only what the listing shows, with the proven size and hash, gets a row; a failed
             // listing writes none and the files go one by one (the cloud's copy of them is then found next run).
             let Ok(now) = self.remote.list_under(&b) else {
+                release();
                 continue;
             };
             let now: HashMap<&str, &Item> = now.iter().map(|i| (i.path.as_str(), i)).collect();
@@ -400,6 +407,7 @@ impl<R: Remote> Engine<R> {
                 }
                 finished.insert(i);
             }
+            release();
         }
         let n = finished.len();
         let mut i = 0;
@@ -672,7 +680,10 @@ impl<R: Remote> Engine<R> {
                     .set_hashed(&w.path, &base, &id, hash.as_ref())
                     .and_then(|()| self.db.forget(&f.path))
                 {
-                    Ok(()) => report.transferred += 1,
+                    Ok(()) => {
+                        report.transferred += 1;
+                        self.files.changed(&w.path);
+                    }
                     Err(e) => log_failed(&self.db, w, &e.to_string(), report),
                 }
                 finished.insert(i);
