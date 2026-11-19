@@ -39,6 +39,7 @@
           <li>OneDrive "View on web" fetches `webUrl` from Graph.</li>
           <li>Redrawn tray icons (error, paused, syncing) and a new syncing emblem.</li>
           <li>Tests, README, FEATURES, ENGINE, AGENTS and pt_BR strings updated.</li>
+          <li>Migrate to Slint 1.19, require Rust 1.95.: 1.19 brings: no double render on X11, faster start, partial-repaint fix after a scale change.</li>
           <li>Bug fixes.</li>
         </ul>
       </description>

@@ -68,7 +68,7 @@ System deps: `libfontconfig-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-dev
 
 ## Look
 
-- Native Fluent widgets on purpose: apps follow the system accent and light/dark mode. In Slint 1.18 the `Palette` colours are read-only; only `Palette.color-scheme` can be set (the Appearance setting does that). To change a colour you would have to write your own component.
+- Native Fluent widgets on purpose: apps follow the system accent and light/dark mode. In Slint 1.19 the `Palette` colours are read-only; only `Palette.color-scheme` can be set (the Appearance setting does that). To change a colour you would have to write your own component.
 - One page: a header (icon, title, Add account, burger) over a scrolling list of `AccountCard`s (`AccountRow` struct: state 0 up to date, 1 syncing, 2 paused, 3 problem, 4 stopped by the delete guard). A `.po` context is the component name: `Main`, `AccountCard`, `AddDialog`, `FoldersDialog`, `ShareDialog`, `RemoveDialog`, `SettingsDialog`, `About`, `AboutCard`, `Tr`. A row property called `row` clashes with a built-in Slint property: the card's is `acct`.
 - A problem's text is the raw message from rclone, the OS or the provider (not translated); everything FastSync words itself is in `@tr()`.
 - Snapshots are 600x520 (the default window) and cannot scroll, so a list taller than that is only partly visible. To see all of it, render with a taller window: put `height = 800` in a `settings.toml` under a scratch `XDG_DATA_HOME` and run the script with that variable set.
