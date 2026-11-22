@@ -58,14 +58,21 @@ fn word(st: Option<&Status>) -> &'static str {
 /// Writes the badges where icon themes look (only when missing or changed) and the extension. Cosmetic: failures are
 /// ignored.
 pub fn install() {
-    if let Some(base) = host_data().map(|p| p.join("icons/hicolor/scalable/emblems"))
+    if let Some(theme) = host_data().map(|p| p.join("icons/hicolor"))
+        && let base = theme.join("scalable/emblems")
         && std::fs::create_dir_all(&base).is_ok()
     {
+        let mut wrote = false;
         for (n, svg) in ICONS {
             let path = base.join(format!("emblem-fastsync-{n}.svg"));
             if std::fs::read_to_string(&path).ok().as_deref() != Some(svg) {
-                let _ = std::fs::write(path, svg);
+                wrote |= std::fs::write(path, svg).is_ok();
             }
+        }
+        // GTK trusts an `icon-theme.cache` that is newer than the theme directory, and a file added two levels down
+        // does not change that directory's mtime: without this the new emblems are never found.
+        if wrote && let Ok(dir) = std::fs::File::open(&theme) {
+            let _ = dir.set_modified(std::time::SystemTime::now());
         }
     }
     sync_extension();
