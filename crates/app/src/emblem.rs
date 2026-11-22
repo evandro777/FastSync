@@ -657,4 +657,52 @@ mod tests {
         };
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     }
+
+    #[test]
+    fn the_extension_skips_a_dead_socket_for_the_live_one() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let run = std::env::temp_dir().join(format!("fs-ext-{}", std::process::id()));
+        let live_dir = run.join("app/io.github.evandro777.FastSync");
+        std::fs::create_dir_all(&live_dir).unwrap();
+        // A socket file nobody listens on (a native build that was killed), found first by the extension.
+        drop(UnixListener::bind(run.join("fastsync-emblems.sock")).unwrap());
+        let live = UnixListener::bind(live_dir.join("fastsync-emblems.sock")).unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = live.accept() {
+                let mut l = String::new();
+                let _ = BufReader::new(s.try_clone().unwrap()).read_line(&mut l);
+                let _ = s.write_all(b"ok 1 [\"/r\"]\n");
+            }
+        });
+        let py = "import sys,types\n\
+            for n in ('gi','gi.repository'): sys.modules[n]=types.ModuleType(n)\n\
+            sys.modules['gi'].require_version=lambda *a: None\n\
+            class A: pass\n\
+            class B: pass\n\
+            r=sys.modules['gi.repository']\n\
+            r.GLib=types.SimpleNamespace(timeout_add_seconds=lambda *a: 0)\n\
+            r.GObject=types.SimpleNamespace(GObject=A)\n\
+            r.Nemo=types.SimpleNamespace(InfoProvider=B)\n\
+            sys.modules['gi'].repository=sys.modules['gi.repository']\n\
+            import importlib.util as u\n\
+            sp=u.spec_from_file_location('m',sys.argv[1]); m=u.module_from_spec(sp); sp.loader.exec_module(m)\n\
+            e=m.FastSyncEmblems(); c=e._open(None); print(bool(c), e.roots)";
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/nemo/fastsync_emblems.py");
+        // Skipped without python3.
+        let Ok(o) = std::process::Command::new("python3")
+            .args(["-c", py, path])
+            .env("XDG_RUNTIME_DIR", &run)
+            .output()
+        else {
+            return;
+        };
+        let _ = std::fs::remove_dir_all(&run);
+        assert_eq!(
+            String::from_utf8_lossy(&o.stdout).trim(),
+            "True ['/r']",
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
 }

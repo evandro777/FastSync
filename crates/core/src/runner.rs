@@ -1202,8 +1202,21 @@ fn work<R: Remote + 'static>(
             (new_cursor, dir_adds) = (None, Vec::new());
         }
         on_status(summary(&report));
+        give_back_memory();
     }
     Ok(())
+}
+
+/// glibc keeps the pages a scan freed, so the process stayed at its peak (58 -> 107 MB over a session).
+fn give_back_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        // SAFETY: plain glibc call, no pointers; safe from any thread.
+        unsafe { malloc_trim(0) };
+    }
 }
 
 /// The rules file's text: empty when there is none. Any other failure is an error, never "no rules".
