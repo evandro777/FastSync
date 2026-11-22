@@ -2136,8 +2136,13 @@ impl<R: Remote> Engine<R> {
                         },
                     ]);
                 }
+                // The cloud keeps no Unix mode: the copy that takes the name inherits the mode of the one moved aside.
+                let mode = fs::metadata(self.root.join(path)).map(|m| m.permissions());
                 fs::rename(self.root.join(path), self.root.join(&aside)).map_err(|e| e.to_string())?;
                 self.download(path, None, r)?;
+                if let Ok(mode) = mode {
+                    let _ = fs::set_permissions(self.root.join(path), mode);
+                }
                 return Ok(vec![Work {
                     local: local_sig(&self.root, &aside),
                     remote: None,
@@ -2489,6 +2494,12 @@ fn fetch_to<R: Remote>(
         let dest = root.join(local);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        // The cloud keeps no Unix mode: the version being replaced hands its own (an executable script stays one).
+        if expect_local.is_some()
+            && let Ok(m) = fs::metadata(&dest)
+        {
+            let _ = fs::set_permissions(&tmp, m.permissions());
         }
         if expect_local.is_none() {
             // Nothing was here a moment ago: a file that appeared since (saved by the user between the check above

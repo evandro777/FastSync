@@ -1590,6 +1590,23 @@ fn a_file_duplicated_in_the_cloud_is_copied_locally_not_downloaded() {
 }
 
 #[test]
+fn a_cloud_edit_keeps_the_local_files_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = Fixture::new("keep-mode");
+    write(f.local("s.sh"), "one", 100);
+    f.engine.full_scan();
+    fs::set_permissions(f.local("s.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    write(f.remote("s.sh"), "two!!", 200);
+    let r = f.engine.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(fs::read_to_string(f.local("s.sh")).unwrap(), "two!!");
+    assert_eq!(
+        fs::metadata(f.local("s.sh")).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+#[test]
 fn a_cloud_file_with_the_size_of_another_but_other_bytes_is_downloaded() {
     let mut f = Fixture::new("copy-other");
     write(f.local("a.bin"), &"a".repeat(COPY_MIN as usize), 100);
@@ -3189,6 +3206,22 @@ fn a_conflict_within_the_providers_whole_seconds_keeps_the_cloud_name() {
     assert_eq!(
         fs::read_to_string(f.local(&conflict_name("r.txt", &today(), 1))).unwrap(),
         "mine"
+    );
+}
+
+#[test]
+fn the_cloud_copy_that_takes_the_name_in_a_conflict_keeps_the_local_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = Fixture::new("conflict-mode");
+    write(f.local("s.sh"), "mine", 10);
+    fs::set_permissions(f.local("s.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    write(f.remote("s.sh"), "theirs!", 11);
+    let r = f.engine.full_scan();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(fs::read_to_string(f.local("s.sh")).unwrap(), "theirs!");
+    assert_eq!(
+        fs::metadata(f.local("s.sh")).unwrap().permissions().mode() & 0o777,
+        0o755
     );
 }
 

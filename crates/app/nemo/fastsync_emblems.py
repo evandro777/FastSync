@@ -21,16 +21,14 @@ RETRY_SECONDS = 5  # a hung or missing app is not asked again for this long
 REMEMBER = 20000  # files kept to refresh when the app says their state changed
 
 
-def socket_path():
+def socket_paths():
     run = os.environ.get("XDG_RUNTIME_DIR")
     if not run:
-        return None
+        return []
     # The Flatpak (and its .Devel) can only share app/<id>/ with the host. Only called when (re)connecting.
+    # All of them are tried: a dead socket file left by another build must not hide the live one.
     plain = os.path.join(run, "fastsync-emblems.sock")
-    for p in [plain] + sorted(glob.glob(os.path.join(glob.escape(run), "app", "io.github.evandro777.FastSync*", "fastsync-emblems.sock"))):
-        if os.path.exists(p):
-            return p
-    return plain
+    return [plain] + sorted(glob.glob(os.path.join(glob.escape(run), "app", "io.github.evandro777.FastSync*", "fastsync-emblems.sock")))
 
 
 class FastSyncEmblems(GObject.GObject, Nemo.InfoProvider):
@@ -41,15 +39,20 @@ class FastSyncEmblems(GObject.GObject, Nemo.InfoProvider):
         self.down_until = 0.0
         self.watch = None  # push connection: socket
         self.buf = b""
-        self.seen = OrderedDict()  # path -> True, every file Nemo asked about (even while the app was down)
+        self.missed = set()  # files that got no answer; refreshed by tick once the link is back
+        self.seen =OrderedDict()  # path -> True, every file Nemo asked about (even while the app was down)
         GLib.timeout_add_seconds(RETRY_SECONDS, self.tick)
 
     # -- connections -------------------------------------------------------------------------------------------
 
     def _open(self, first_line):
-        path = socket_path()
-        if not path:
-            return None
+        for path in socket_paths():
+            c = self._open_at(path, first_line)
+            if c:
+                return c
+        return None
+
+    def _open_at(self, path, first_line):
         s = socket.socket(socket.AF_UNIX)
         s.settimeout(ASK_TIMEOUT)
         try:
@@ -97,6 +100,12 @@ class FastSyncEmblems(GObject.GObject, Nemo.InfoProvider):
                     self.watch.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self.on_push
                 )
                 self.invalidate_all()
+        # A file asked while the query link was down (or slow: 150 ms) got no emblem and nothing would ask again
+        # until the user pressed F5, which could hit the same pause. Ask again once the link may be back.
+        if self.missed and time.monotonic() >= self.down_until:
+            missed, self.missed = self.missed, set()
+            for p in missed:
+                self.refresh(p)
         return True
 
     def on_push(self, _fd, cond):
@@ -155,6 +164,7 @@ class FastSyncEmblems(GObject.GObject, Nemo.InfoProvider):
         if len(self.seen) > REMEMBER:
             self.seen.popitem(last=False)
         if not self.ensure():
+            self.missed.add(path)
             return
         try:
             s, r = self.q
@@ -164,6 +174,7 @@ class FastSyncEmblems(GObject.GObject, Nemo.InfoProvider):
                 raise OSError("closed")
         except Exception:
             self.drop_query()
+            self.missed.add(path)
             return
         if word in STATES:
             f.add_emblem("emblem-fastsync-" + word)

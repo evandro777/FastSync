@@ -27,6 +27,18 @@
   <launchable type="desktop-id">io.github.evandro777.FastSync.desktop</launchable>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.3.1" date="2026-11-22">
+      <description>
+        <p>Fixes and improvements.</p>
+        <ul>
+          <li>Fix File mode: files keep their executable mode when the cloud copy replaces them.</li>
+          <li>Fix Nemo emblems: Nemo emblems missing when a stale socket from another build exists, and now refreshed once the app is reachable again.</li>
+          <li>Lower memory use after large scans.</li>
+          <li>Flatpak runtime: moves from 25.08 to 26.08.</li>
+          <li>UI improvements</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-11-19">
       <description>
         <p>More reliable, and faster with ignore rules.</p>
