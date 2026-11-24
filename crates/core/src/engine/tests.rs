@@ -3895,7 +3895,8 @@ fn thousands_of_adopted_files_all_get_their_row_across_several_transactions() {
     assert_eq!(f.engine.db.count().unwrap(), ADOPT_BATCH * 2 + 100);
     // The file manager hears about every one of them, the last, still-open batch included (and only after its commit).
     let (dirty, all) = f.engine.files.take_dirty();
-    assert!(all || dirty.len() == ADOPT_BATCH * 2 + 100, "{}", dirty.len());
+    // (+1: their folder `d`, which `touch` marks too)
+    assert!(all || dirty.len() == ADOPT_BATCH * 2 + 100 + 1, "{}", dirty.len());
 }
 
 #[test]

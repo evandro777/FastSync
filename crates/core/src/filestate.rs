@@ -27,6 +27,10 @@ impl Inner {
             (self.dirty_all, self.dirty) = (true, BTreeSet::new());
         } else {
             self.dirty.insert(path.to_owned());
+            // A folder's emblem follows what is below it (`has`), so its parents must be asked again too.
+            for (i, _) in path.match_indices('/') {
+                self.dirty.insert(path[..i].to_owned());
+            }
         }
     }
 }
@@ -127,6 +131,13 @@ mod tests {
         assert!(!s.busy("a/b/c") && !s.busy("a/bb") && !s.busy("b"));
         s.done("a/b/c.txt");
         assert!(!s.busy("a"));
+    }
+
+    #[test]
+    fn a_change_marks_its_parent_folders_dirty() {
+        let s = FileStates::default();
+        s.add_busy(["a/b/c.txt".to_owned()]);
+        assert_eq!(s.take_dirty().0, ["a", "a/b", "a/b/c.txt"]);
     }
 
     #[test]
