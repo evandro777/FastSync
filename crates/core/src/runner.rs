@@ -86,6 +86,10 @@ struct Held {
     deletes: usize,
     known: usize,
     paths: Vec<String>,
+    /// Every stopped delete, not only the sample on the card: "Delete them" may carry out only these. Empty in a hold
+    /// saved by an older release, which keeps only the count.
+    #[serde(default)]
+    all: Vec<String>,
 }
 
 impl Held {
@@ -595,6 +599,48 @@ fn rclone_remote(acct: &Account, rc: &Arc<Rclone>) -> RcloneRemote {
     r
 }
 
+/// An exclusive lock on `<root>/.fastsync/lock`, for as long as the returned file is open (the OS drops it when the
+/// process dies). Another process holding it means another FastSync is syncing this folder.
+fn lock_folder(root: &Path) -> Result<std::fs::File, String> {
+    let dir = root.join(crate::engine::HIDDEN);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("lock"))
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            "{}: another FastSync is already syncing this folder",
+            root.display()
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("{}: {e}", dir.display())),
+    }
+}
+
+/// What a worker does before it may touch the folder: takes the lock (a second FastSync, such as the Flatpak next to
+/// a native install, would otherwise clear the temp folder under the first one's downloads) and then cleans up after
+/// a run that was killed. The lock is held for as long as the returned file is open.
+fn claim_folder(root: &Path, db: &Db) -> Result<std::fs::File, String> {
+    let lock = lock_folder(root)?;
+    // Half-downloaded files of a run that was killed: nothing else ever removes them.
+    let _ = std::fs::remove_dir_all(root.join(crate::engine::HIDDEN).join("tmp"));
+    // A user's file that sat aside while a download replaced it when the app quit: back into the trash, and said.
+    let rescued = crate::trash::recover_set_aside(root);
+    if rescued > 0 {
+        db.log(
+            "error",
+            "",
+            None,
+            &format!("{rescued} file(s) set aside by an interrupted download are in .fastsync/trash"),
+        );
+    }
+    Ok(lock)
+}
+
 // The worker's whole environment, handed over once by `spawn_with`: a struct would only rename the arguments.
 #[allow(clippy::too_many_arguments)]
 fn work<R: Remote + 'static>(
@@ -619,18 +665,15 @@ fn work<R: Remote + 'static>(
         return Err(format!("{}: folder not found (unmounted?)", root.display()));
     }
     std::fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
-    // Half-downloaded files of a run that was killed: nothing else ever removes them.
-    let _ = std::fs::remove_dir_all(root.join(crate::engine::HIDDEN).join("tmp"));
-    // A user's file that sat aside while a download replaced it when the app quit: back into the trash, and said.
-    let rescued = crate::trash::recover_set_aside(&root);
-    if rescued > 0 {
-        db.log(
-            "error",
-            "",
-            None,
-            &format!("{rescued} file(s) set aside by an interrupted download are in .fastsync/trash"),
-        );
-    }
+    // Held only while the account is not paused (a paused account may be the one another install is syncing).
+    // A claim that fails (another install has the folder) must not end the worker: it starts paused with the error, and
+    // Resume tries again once the other one lets go.
+    let mut claim_error = None;
+    let mut folder_lock = if acct.paused {
+        None
+    } else {
+        claim_folder(&root, &db).map_err(|e| claim_error = Some(e)).ok()
+    };
     // A login made before shortcuts were skipped: see `Rclone::skip_shortcuts`. Before anything is listed.
     if acct.kind == "drive" {
         rc.skip_shortcuts(&acct.id)?;
@@ -734,11 +777,13 @@ fn work<R: Remote + 'static>(
         }
     }
 
-    let mut paused = acct.paused;
+    let mut paused = acct.paused || claim_error.is_some();
     // A stopped run waits here for the user, however long and across restarts: nothing below runs until `resolution`.
     let mut held = Held::load(&engine.db);
     let mut resolution: Option<Decision> = None;
-    if paused {
+    if let Some(e) = claim_error {
+        on_status(Status::Error(e));
+    } else if paused {
         on_status(Status::Paused);
     } else if let Some(h) = &held {
         on_status(h.status());
@@ -958,6 +1003,20 @@ fn work<R: Remote + 'static>(
                 }
                 Event::Pause(p) => {
                     paused = p;
+                    // No run is going (events are read between runs): a paused account lets another install have the
+                    // folder, and Resume must win it back before anything runs.
+                    if p {
+                        folder_lock = None;
+                    } else if folder_lock.is_none() {
+                        match claim_folder(&root, &engine.db) {
+                            Ok(l) => folder_lock = Some(l),
+                            Err(e) => {
+                                paused = true;
+                                on_status(Status::Error(e));
+                                continue;
+                            }
+                        }
+                    }
                     // Only here, never before a run: a Pause pressed just as a run starts must still end it.
                     if !p {
                         cancel.store(false, Ordering::Relaxed);
@@ -1058,9 +1117,11 @@ fn work<R: Remote + 'static>(
             continue;
         }
         // The count the card showed caps what "Delete them" may delete; a bigger plan stops again.
-        engine.confirmed_deletes = resolution
-            .filter(|d| *d == Decision::Delete)
-            .and(held.as_ref().map(|h| h.deletes));
+        let confirmed = resolution.filter(|d| *d == Decision::Delete).and(held.as_ref());
+        engine.confirmed_deletes = confirmed.map(|h| h.deletes);
+        engine.confirmed_paths = confirmed
+            .filter(|h| !h.all.is_empty())
+            .map(|h| h.all.iter().cloned().collect());
         engine.restore = resolution == Some(Decision::Restore);
         engine.local_moves = std::mem::take(&mut moves);
         let progress = engine.progress.clone();
@@ -1154,7 +1215,7 @@ fn work<R: Remote + 'static>(
                 feed_dirs.extend(ran_dirs);
             }
             walk = false;
-            (engine.confirmed_deletes, engine.restore) = (None, false);
+            (engine.confirmed_deletes, engine.confirmed_paths, engine.restore) = (None, None, false);
             continue;
         }
         // Only a whole scan with nothing global wrong counts: after a stop, a cut or a failed listing the next start
@@ -1168,13 +1229,14 @@ fn work<R: Remote + 'static>(
         if did_full {
             last_full_end = Some(Instant::now());
         }
-        (engine.confirmed_deletes, engine.restore) = (None, false);
+        (engine.confirmed_deletes, engine.confirmed_paths, engine.restore) = (None, None, false);
         if let Some((deletes, known, paths)) = &report.aborted {
             // Written before the status goes out, so a quit right after the card shows it still finds it.
             let h = Held {
                 deletes: *deletes,
                 known: *known,
                 paths: paths.clone(),
+                all: report.aborted_paths.clone(),
             };
             h.save(&engine.db);
             (held, resolution) = (Some(h), None);
@@ -1529,6 +1591,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_second_worker_on_the_same_folder_is_refused_until_the_first_lets_go() {
+        let root = std::env::temp_dir().join(format!("fastsync-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let first = lock_folder(&root).unwrap();
+        // A second open file description (what another process has) is refused, not waited for.
+        let err = lock_folder(&root).unwrap_err();
+        assert!(err.contains("another FastSync"), "{err}");
+        drop(first);
+        assert!(lock_folder(&root).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claiming_the_folder_clears_the_temp_folder_only_while_holding_the_lock() {
+        let root = std::env::temp_dir().join(format!("fastsync-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (db, tmp) = (Db::memory().unwrap(), root.join(crate::engine::HIDDEN).join("tmp"));
+        let held = lock_folder(&root).unwrap();
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Another install owns the folder: its downloads in `tmp` stay.
+        assert!(claim_folder(&root, &db).is_err() && tmp.exists());
+        drop(held);
+        let _lock = claim_folder(&root, &db).unwrap();
+        assert!(!tmp.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn only_a_synced_path_gone_from_the_disk_starts_the_local_delete_hold() {
         let root = std::env::temp_dir().join(format!("fastsync-removes-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1662,9 +1752,13 @@ mod tests {
             deletes: 84,
             known: 92,
             paths: vec!["a/b.txt".into(), "odd\nname".into()],
+            all: vec!["a/b.txt".into(), "odd\nname".into(), "c".into()],
         };
         h.save(&db);
         assert_eq!(Held::load(&db), Some(h));
+        // A hold saved before `all` existed still loads, with only its count to go by.
+        db.set_meta("held", r#"{"deletes":3,"known":9,"paths":["x"]}"#).unwrap();
+        assert_eq!(Held::load(&db).map(|h| h.all), Some(Vec::new()));
         // A value that cannot be read must not release the account.
         db.set_meta("held", "not json").unwrap();
         assert_eq!(Held::load(&db), Some(Held::default()));

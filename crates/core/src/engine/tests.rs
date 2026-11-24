@@ -3578,6 +3578,27 @@ fn a_folder_wiped_in_the_cloud_still_stops_though_it_exists_here() {
     );
 }
 
+#[test]
+fn a_folder_deleted_in_the_cloud_is_trashed_without_asking() {
+    let mut f = folder_synced("wipe-cloud-gone");
+    fs::remove_dir_all(f.remote("d")).unwrap();
+    let paths: Vec<String> = (0..12).map(|i| format!("d/f{i}.txt")).collect();
+    let r = f.engine.sync_paths(&paths);
+    assert!(r.aborted.is_none() && r.errors.is_empty(), "{r:?}");
+    assert!(!f.local("d/f0.txt").exists());
+    assert!(f.local(".fastsync/trash").exists());
+}
+
+#[test]
+fn a_folder_renamed_in_the_cloud_without_its_new_name_does_not_stop() {
+    let mut f = folder_synced("wipe-cloud-renamed");
+    fs::rename(f.remote("d"), f.remote("e")).unwrap();
+    // Only the old names reach the run: the feed has not brought the new ones yet.
+    let paths: Vec<String> = (0..12).map(|i| format!("d/f{i}.txt")).collect();
+    let r = f.engine.sync_paths(&paths);
+    assert!(r.aborted.is_none(), "{r:?}");
+}
+
 /// 12 synced files, then `gone` of them removed from the cloud (the guard trips, nothing is deleted yet).
 fn cloud_loses(name: &str, gone: usize) -> Fixture {
     let mut f = Fixture::new(name);
@@ -3651,6 +3672,95 @@ fn confirmed_deletes_are_capped_at_the_count_the_card_showed() {
     let r = f.engine.full_scan();
     assert!(r.aborted.is_none() && r.errors.is_empty(), "{r:?}");
     assert!(!f.local("f0.txt").exists() && f.local("f10.txt").exists());
+}
+
+#[test]
+fn confirmed_deletes_are_limited_to_the_paths_the_stopped_run_held() {
+    let mut f = cloud_loses("confirm-paths", 8);
+    let set = |names: &[usize]| names.iter().map(|i| format!("f{i}.txt")).collect();
+    // Same count as the card showed (8), but f7 was not on it and f9 was: another file went missing meanwhile.
+    f.engine.confirmed_deletes = Some(8);
+    f.engine.confirmed_paths = Some(set(&[0, 1, 2, 3, 4, 5, 6, 9]));
+    let r = f.engine.full_scan();
+    assert!(r.aborted.is_some(), "{r:?}");
+    assert!(f.local("f7.txt").exists(), "nothing was deleted");
+    f.engine.confirmed_paths = Some(set(&[0, 1, 2, 3, 4, 5, 6, 7]));
+    let r = f.engine.full_scan();
+    assert!(r.aborted.is_none() && !f.local("f7.txt").exists(), "{r:?}");
+}
+
+/// A cloud that records every `stat` and fails it for the path `fail`.
+struct Probe {
+    inner: DirRemote,
+    fail: &'static str,
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+impl Remote for Probe {
+    fn list(&self) -> Result<Vec<Item>> {
+        self.inner.list()
+    }
+    fn stat(&self, rel: &str) -> Result<Option<Item>> {
+        self.seen.lock().unwrap().push(rel.to_string());
+        if rel == self.fail {
+            return Err("boom".into());
+        }
+        self.inner.stat(rel)
+    }
+    fn upload(&self, root: &Path, rel: &str) -> Result<()> {
+        self.inner.upload(root, rel)
+    }
+    fn make_dir(&self, rel: &str) -> Result<()> {
+        self.inner.make_dir(rel)
+    }
+    fn download(&self, rel: &str, dest: &Path) -> Result<()> {
+        self.inner.download(rel, dest)
+    }
+    fn delete(&self, rel: &str) -> Result<()> {
+        self.inner.delete(rel)
+    }
+}
+
+/// The synced fixture's engine, with a `Probe` for a cloud (same folders, same DB).
+fn probed(f: &mut Fixture, fail: &'static str) -> Engine<Probe> {
+    let db = std::mem::replace(&mut f.engine.db, Db::memory().unwrap());
+    let remote = Probe {
+        inner: DirRemote(f.base.join("remote")),
+        fail,
+        seen: Default::default(),
+    };
+    Engine::new(f.engine.root.clone(), remote, db)
+}
+
+#[test]
+fn a_cloud_that_cannot_say_whether_the_folder_is_gone_still_stops() {
+    let mut f = folder_synced("wipe-stat-err");
+    fs::remove_dir_all(f.remote("d")).unwrap();
+    let mut e = probed(&mut f, "d");
+    let paths: Vec<String> = (0..12).map(|i| format!("d/f{i}.txt")).collect();
+    let r = e.sync_paths(&paths);
+    assert!(r.aborted.is_some(), "{r:?}");
+    assert!(f.local("d/f0.txt").exists());
+}
+
+#[test]
+fn a_subfolder_of_a_folder_gone_from_the_cloud_is_not_asked_about_again() {
+    let mut f = folder_synced("wipe-one-lookup");
+    for i in 0..12 {
+        write(f.local(&format!("d/s/g{i}.txt")), "x", 100);
+    }
+    f.engine.full_scan();
+    fs::remove_dir_all(f.remote("d")).unwrap();
+    let mut e = probed(&mut f, "");
+    let paths: Vec<String> = (0..12)
+        .map(|i| format!("d/f{i}.txt"))
+        .chain((0..12).map(|i| format!("d/s/g{i}.txt")))
+        .collect();
+    let r = e.sync_paths(&paths);
+    assert!(r.aborted.is_none(), "{r:?}");
+    let seen = e.remote.seen.lock().unwrap();
+    assert!(seen.iter().any(|p| p == "d"), "{seen:?}");
+    assert!(!seen.iter().any(|p| p == "d/s"), "{seen:?}");
 }
 
 #[test]
@@ -3779,9 +3889,13 @@ fn thousands_of_adopted_files_all_get_their_row_across_several_transactions() {
     f.engine.full_scan();
     // A new database, as for an account whose folder already matches the cloud: every file is adopted.
     f.engine.db = Db::memory().unwrap();
+    f.engine.files.take_dirty();
     let r = f.engine.full_scan();
     assert!(r.errors.is_empty() && r.transferred == 0, "{r:?}");
     assert_eq!(f.engine.db.count().unwrap(), ADOPT_BATCH * 2 + 100);
+    // The file manager hears about every one of them, the last, still-open batch included (and only after its commit).
+    let (dirty, all) = f.engine.files.take_dirty();
+    assert!(all || dirty.len() == ADOPT_BATCH * 2 + 100, "{}", dirty.len());
 }
 
 #[test]

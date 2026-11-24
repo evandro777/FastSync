@@ -132,6 +132,8 @@ pub struct Report {
     /// The stop includes a delete of a local file: only that can be a folder renamed in the cloud (a full scan pairs
     /// it). Deletes of cloud files are the user's own deletes here, which a full scan cannot turn into moves.
     pub aborted_local_deletes: bool,
+    /// Every path of the stopped deletes (`aborted` holds only a sample): what "Delete them" may carry out later.
+    pub aborted_paths: Vec<String>,
     /// Files that changed on both sides and were kept twice; the runner turns them into one alert per burst.
     pub conflicts: Vec<String>,
     /// Pause or Stop ended the run early: what is left was not looked at, so this is neither "up to date" nor a
@@ -274,6 +276,10 @@ pub struct Engine<R: Remote> {
     /// The user accepted this many deletes (the count the card showed): the guard lets a run delete no more than that,
     /// whatever the share, so a card that sat for days cannot approve a bigger delete than it named.
     pub confirmed_deletes: Option<usize>,
+    /// With `confirmed_deletes`: the very paths the stopped run held. A delete outside them stops again, so files that
+    /// went missing meanwhile are never approved by a card that did not name them. `None` (a hold saved by an older
+    /// release) keeps only the count.
+    pub confirmed_paths: Option<HashSet<String>>,
     /// The user chose "Restore": every delete this run would make is turned into the opposite copy (a file gone from
     /// the cloud goes back up, one gone from here comes back down). Never in a mirror, which cannot upload.
     pub restore: bool,
@@ -717,6 +723,7 @@ impl<R: Remote> Engine<R> {
             remote,
             db,
             confirmed_deletes: None,
+            confirmed_paths: None,
             restore: false,
             excluded: Vec::new(),
             ignore: Rules::default(),
@@ -1624,10 +1631,22 @@ impl<R: Remote> Engine<R> {
         // Why it stops, if it does, as the code the activity log words: `cap` (more than the user confirmed), `share`
         // or `folder:<dir>`.
         let stop = match self.confirmed_deletes {
-            Some(cap) => (deletes > cap).then(|| "cap".to_string()),
+            Some(cap) => (deletes > cap
+                || self.confirmed_paths.as_ref().is_some_and(|ok| {
+                    plan.iter().any(|(w, a, _)| {
+                        matches!(a, Action::DeleteLocal | Action::DeleteRemote) && !ok.contains(&w.path)
+                    })
+                }))
+            .then(|| "cap".to_string()),
             None if !delete_guard_ok(deletes, known, GUARD_PERCENT) => Some("share".to_string()),
             None => self.folder_wiped(&plan).map(|d| format!("folder:{d}")),
         };
+        // `folder_wiped` gives up its cloud lookups when cancelled: do not read that as "nothing to stop".
+        if self.cancelled() {
+            self.set_progress(Progress::default());
+            report.cancelled = true;
+            return report;
+        }
         if let Some(rule) = stop {
             self.report_stop(&plan, known, (paths, cloud_seen), &rule, &mut report);
             self.set_progress(Progress::default());
@@ -1668,12 +1687,15 @@ impl<R: Remote> Engine<R> {
         // each cost ~20 KB of journal. They share a transaction of `ADOPT_BATCH` rows; a crash loses at most a batch,
         // whose files are then adopted again.
         let mut open_rows = 0usize;
+        // Adopted paths of the open batch: the file manager is told only once their rows are committed, or its
+        // read-only connection would not see them and answer "unknown file" for good.
+        let mut adopted: Vec<String> = Vec::new();
         while let Some((w, action, base)) = plan.pop_front() {
             if self.cancelled() {
                 break;
             }
             if action != Action::Adopt && open_rows > 0 {
-                self.commit_rows(&mut report);
+                self.commit_rows(&mut report, &mut adopted);
                 open_rows = 0;
             }
             // Uploads and downloads wait on the cloud's latency, not on this machine: they run side by side below.
@@ -1718,12 +1740,20 @@ impl<R: Remote> Engine<R> {
                 open_rows += 1;
             }
             if open_rows >= ADOPT_BATCH {
-                self.commit_rows(&mut report);
+                self.commit_rows(&mut report, &mut adopted);
                 open_rows = 0;
             }
             match self.exec(&w, action, base) {
                 Ok(extra) => {
                     log_done(&self.db, &w, action, &mut report);
+                    if action == Action::Adopt {
+                        // No transfer, so nothing else tells the file manager that this file is now known.
+                        if open_rows > 0 {
+                            adopted.push(w.path.clone());
+                        } else {
+                            self.files.changed(&w.path);
+                        }
+                    }
                     // A conflict leaves its copies to be uploaded.
                     for e in extra {
                         plan.push_back((e, Action::Upload, None));
@@ -1734,7 +1764,7 @@ impl<R: Remote> Engine<R> {
             }
         }
         if open_rows > 0 {
-            self.commit_rows(&mut report);
+            self.commit_rows(&mut report, &mut adopted);
         }
         // A folder renamed here goes as one cloud call; what that cannot prove stays one move per file.
         let uploads: Vec<String> = transfers
@@ -1754,9 +1784,13 @@ impl<R: Remote> Engine<R> {
 
     /// Ends the transaction of adopted rows. A failure rolls the batch back (`Db::commit`): those files are adopted
     /// again by the next scan, and the run says so instead of losing later writes silently.
-    fn commit_rows(&self, report: &mut Report) {
+    fn commit_rows(&self, report: &mut Report, adopted: &mut Vec<String>) {
         if let Err(e) = self.db.commit() {
             report.errors.push(format!("state database: {e}"));
+        }
+        // Also after a failed commit: the truthful answer is then "not known", and it must be asked for again.
+        for p in adopted.drain(..) {
+            self.files.changed(&p);
         }
     }
 
@@ -1801,12 +1835,14 @@ impl<R: Remote> Engine<R> {
         self.db.log("stopped", rule, None, &listed);
         report.aborted = Some((deletes, known, sample));
         report.aborted_local_deletes = remote_deletes < deletes;
+        report.aborted_paths = dels().map(|(w, ..)| w.path.clone()).collect();
     }
 
     /// The shallowest folder (at any depth) of `MIN_FILES` or more known files that the plan deletes every file of: a
     /// disk mounted inside the synced folder that went away looks exactly like that, and stays under the account-wide
     /// share. A rule that hides a folder (a delete with the local file still there) is not counted. Neither is a folder
-    /// the user deleted here: a vanished drive leaves its (empty) mount point behind, a deleted folder is gone.
+    /// the user deleted here: a vanished drive leaves its (empty) mount point behind, a deleted folder is gone. Nor a
+    /// folder that is gone from the cloud as well (deleted or renamed there; `Remote::stat` says `None`).
     /// shortcut: a folder that held only a deleted subfolder is left empty and so looks like an unmount; it stops and
     /// asks once, which is the safe side.
     fn folder_wiped(&self, plan: &[(Work, Action, Option<Base>)]) -> Option<String> {
@@ -1828,7 +1864,8 @@ impl<R: Remote> Engine<R> {
         // Only `NotFound` says the folder is gone; any other error keeps it judged.
         let deleted_here =
             |dir: &str| fs::symlink_metadata(self.root.join(dir)).is_err_and(|e| e.kind() == ErrorKind::NotFound);
-        gone.into_iter()
+        let mut wiped: Vec<&str> = gone
+            .into_iter()
             // A mirror's local-only files have no row: only folders the DB knows are judged (the share rule covers it).
             .filter(|(dir, n)| {
                 *n >= MIN_FILES
@@ -1836,8 +1873,29 @@ impl<R: Remote> Engine<R> {
                     && self.db.under(dir).is_ok_and(|k| !k.is_empty() && *n >= k.len())
             })
             .map(|(dir, _)| dir)
-            .min_by_key(|d| (d.matches('/').count(), *d))
-            .map(str::to_string)
+            .collect();
+        wiped.sort_by_key(|d| (d.matches('/').count(), *d));
+        // Gone from the cloud too: the folder was deleted or renamed there, which only moves the local files to the
+        // trash. Asked only for what would stop, shallowest first; an error or an answer keeps it judged.
+        // A folder under one already found gone is gone too: one lookup per deleted tree, not per subfolder.
+        let mut gone_in_cloud: Vec<&str> = Vec::new();
+        for d in wiped {
+            if gone_in_cloud
+                .iter()
+                .any(|g| d.strip_prefix(g).is_some_and(|r| r.starts_with('/')))
+            {
+                continue;
+            }
+            // `run` sees the cancel right after and drops the plan, so answering "no stop" here is harmless.
+            if self.cancelled() {
+                return None;
+            }
+            if !matches!(self.remote.stat(d), Ok(None)) {
+                return Some(d.to_string());
+            }
+            gone_in_cloud.push(d);
+        }
+        None
     }
 
     /// Folders, after the files (see `decide_dir`). A removal only ever takes an **empty** folder (`remove_dir`,
@@ -2073,8 +2131,6 @@ impl<R: Remote> Engine<R> {
                 self.db
                     .set_hashed(path, &Base { local: l, remote: r }, rid, hash)
                     .map_err(db)?;
-                // No transfer, so nothing else tells the file manager that this file is now known.
-                self.files.changed(path);
             }
             Action::Upload | Action::Download | Action::MoveLocal | Action::MoveRemote => {
                 return Err("handled by run_transfers".into());

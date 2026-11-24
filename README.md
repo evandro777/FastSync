@@ -25,7 +25,7 @@ Page: <https://evandro777.github.io/FastSync/>
 
 - **One app for four clouds.** Dropbox, Google Drive, OneDrive and MEGA, several accounts at once, each with its own local folder.
 - **Light and fast.** Software renderer, no GL, no async runtime: about 27 MB of RAM. Local edits are seen at once (inotify) and cloud edits come from the service's change feed, so the whole cloud is not listed again.
-- **Never loses your files.** Deletes go to `.fastsync/trash`, downloads are written to a temp file and renamed, and a **delete guard** stops any run that would remove more than half of your files (or every file of a folder that is still there but emptied, as an unmounted drive would be) until you answer on the card. A folder you delete yourself goes through without a question.
+- **Never loses your files.** Deletes go to `.fastsync/trash`, downloads are written to a temp file and renamed, and a **delete guard** stops any run that would remove more than half of your files (or every file of a folder that is still there but emptied, as an unmounted drive would be) until you answer on the card. A folder you delete yourself, or that is deleted or renamed in the cloud, goes through without a question.
 - **Real two-way sync, offline.** Everything stays on disk. A conflict keeps both copies, and renames, moves and copies are done in the cloud instead of being sent again.
 - **Selective sync, download-only mode and ignore rules** (`rules.fastsyncignore`, gitignore syntax, shared by all your computers).
 - **Your own client ID**, so you do not depend on rclone's shared one and its rate limits ([how to](docs/OWN-CLIENT-ID.md)).
@@ -108,7 +108,7 @@ The AppImage does not update itself, but it has update information built in, so 
 
 For the Nemo file manager (Linux Mint's default), FastSync adds two things inside your synced folders:
 
-- **Status emblems** on each file and folder: up to date, syncing, error, paused, or ignored (by `rules.fastsyncignore` or an unchecked folder).
+- **Status emblems** on each file and folder: up to date, syncing, error, paused, or ignored (by `rules.fastsyncignore` or an unchecked folder). A grey "?" means FastSync did not answer in time; it asks again within a second.
 - **A "FastSync" submenu** in the right-click menu, with "Copy share link" and "View on web".
 
 To turn it on:

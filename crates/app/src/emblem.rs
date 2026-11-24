@@ -31,7 +31,8 @@ pub fn enable(on: bool) {
 
 /// The badges, drawn like the tray icons (`crates/app/emblems/`). They are installed into the user's hicolor theme,
 /// which every icon theme falls back to, so the file manager finds them by name.
-const ICONS: [(&str, &str); 5] = [
+const ICONS: [(&str, &str); 6] = [
+    ("unknown", include_str!("../emblems/unknown.svg")),
     ("ignored", include_str!("../emblems/ignored.svg")),
     ("idle", include_str!("../emblems/idle.svg")),
     ("syncing", include_str!("../emblems/syncing.svg")),
@@ -114,30 +115,6 @@ pub fn sync_extension() {
     }
 }
 
-/// Earlier releases wrote the root folder's emblem into gio's metadata, which outlives the app. Removes ours (and
-/// only ours: the user's own emblems stay).
-/// shortcut: runs at every start; drop it a few releases after the extension shipped.
-pub fn clear_old_marks(locals: Vec<String>) {
-    if in_flatpak() {
-        return;
-    }
-    std::thread::spawn(move || {
-        for l in locals.iter().filter(|l| !l.is_empty()) {
-            let Ok(o) = std::process::Command::new("gio")
-                .args(["info", "-a", "metadata::emblems", l])
-                .output()
-            else {
-                return;
-            };
-            if String::from_utf8_lossy(&o.stdout).contains("emblem-fastsync") {
-                let _ = std::process::Command::new("gio")
-                    .args(["set", "-t", "unset", l, "metadata::emblems"])
-                    .output();
-            }
-        }
-    });
-}
-
 /// What FastSync never syncs: its own hidden folder, the folders the user unchecked, and what the rules file hides.
 /// `dir` is whether the path is a folder (a rule such as `build/` only matches one).
 fn ignored(rel: &str, dir: bool, unchecked: &[String], rules: &Rules) -> bool {
@@ -153,7 +130,8 @@ fn ignored(rel: &str, dir: bool, unchecked: &[String], rules: &Rules) -> bool {
 
 /// What an emblem shows for a file or folder inside an account's folder (`rel`): only while the account is up to date
 /// or syncing (`visible`; otherwise the folder's own emblem says why), a failure first, then a transfer, then "known".
-fn inside(visible: bool, files: Option<&FileStates>, rel: &str, known: impl FnOnce() -> bool) -> &'static str {
+/// `known` is `None` when the DB could not be read: "unknown" makes the extension ask again, "none" would be final.
+fn inside(visible: bool, files: Option<&FileStates>, rel: &str, known: impl FnOnce() -> Option<bool>) -> &'static str {
     if !visible {
         return "none";
     }
@@ -165,7 +143,11 @@ fn inside(visible: bool, files: Option<&FileStates>, rel: &str, known: impl FnOn
             return "syncing";
         }
     }
-    if known() { "idle" } else { "none" }
+    match known() {
+        Some(true) => "idle",
+        Some(false) => "none",
+        None => "unknown",
+    }
 }
 
 // ---- the socket -------------------------------------------------------------------------------------------------
@@ -305,10 +287,18 @@ fn client(stream: UnixStream, src: &dyn Source, watchers: &Watchers) -> std::io:
         return Ok(());
     }
     writeln!(out, "ok 1 {}", roots_line(src.roots()))?;
+    // Greeted: Nemo may be idle for minutes between two questions, and a link closed here would make its next question
+    // fail and blank the emblems for a while. The limit is only for a client that never says hello.
+    out.set_read_timeout(None)?;
     while let Some(req) = read_request(&mut input)? {
         if let Some(path) = req.strip_prefix(b"q ") {
             // A name that is not UTF-8 is never one of ours (`locate` needs text).
+            let t = std::time::Instant::now();
             let a = std::str::from_utf8(path).map_or("none", |p| src.answer(p));
+            // Tells whether `snapshot()` (the global `STATE` lock) is what makes the extension time out.
+            if t.elapsed() > Duration::from_millis(100) {
+                eprintln!("fastsync: emblem answer took {} ms", t.elapsed().as_millis());
+            }
             writeln!(out, "{a}")?;
         } else if req == b"watch" {
             let input = input.into_inner();
@@ -441,17 +431,22 @@ impl Source for AppSource {
             return "ignored";
         }
         inside(a.visible, a.files.as_deref(), rel, || {
-            let Ok(mut dbs) = self.dbs.lock() else {
-                return false;
-            };
+            let mut dbs = self.dbs.lock().ok()?;
             let key = (a.id.clone(), a.local.clone());
             if !dbs.contains_key(&key) {
-                let Some(db) = accounts::account_dir(&a.id).and_then(|d| Db::open_read(&d.join("state.db"))) else {
-                    return false;
-                };
-                dbs.insert(key.clone(), db);
+                let file = accounts::account_dir(&a.id)?.join("state.db");
+                // No DB yet (nothing synced): that is a real "not known", not a failure.
+                if !file.exists() {
+                    return Some(false);
+                }
+                dbs.insert(key.clone(), Db::open_read(&file)?);
             }
-            dbs.get(&key).is_some_and(|db| db.knows(rel).unwrap_or(false))
+            let known = dbs.get(&key)?.knows(rel).ok();
+            if known.is_none() {
+                // A broken connection must not stay cached: the next question opens a new one.
+                dbs.remove(&key);
+            }
+            known
         })
     }
 
@@ -525,7 +520,7 @@ mod tests {
         let f = FileStates::default();
         f.add_busy(["d/busy.txt".to_owned(), "d/both.txt".to_owned()]);
         f.finish(&["d/both.txt".to_owned(), "x/bad.txt".to_owned()], &[], true);
-        let known = || true;
+        let known = || Some(true);
         assert_eq!(inside(true, Some(&f), "d/both.txt", known), "error");
         assert_eq!(inside(true, Some(&f), "d/busy.txt", known), "syncing");
         // A folder takes the worst of what is below it.
@@ -533,7 +528,9 @@ mod tests {
         assert_eq!(inside(true, Some(&f), "x", known), "error");
         assert_eq!(inside(true, Some(&f), "other", known), "idle");
         // Not in the DB (new, ignored): nothing. A paused or failed account shows nothing inside.
-        assert_eq!(inside(true, Some(&f), "other", || false), "none");
+        assert_eq!(inside(true, Some(&f), "other", || Some(false)), "none");
+        // A DB that could not be read is not "new": the extension must ask again.
+        assert_eq!(inside(true, Some(&f), "other", || None), "unknown");
         assert_eq!(inside(false, Some(&f), "d/both.txt", known), "none");
         assert_eq!(inside(true, None, "a", known), "idle");
     }
@@ -665,6 +662,66 @@ mod tests {
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     }
 
+    /// Loads the extension as module `m` with `gi` replaced by stubs (the file path is `sys.argv[1]`).
+    const PY_STUB: &str = "import sys,types\n\
+        for n in ('gi','gi.repository'): sys.modules[n]=types.ModuleType(n)\n\
+        sys.modules['gi'].require_version=lambda *a: None\n\
+        class A: pass\n\
+        class B: pass\n\
+        r=sys.modules['gi.repository']\n\
+        r.GLib=types.SimpleNamespace(timeout_add_seconds=lambda *a: 0)\n\
+        r.GObject=types.SimpleNamespace(GObject=A)\n\
+        r.Nemo=types.SimpleNamespace(InfoProvider=B,OperationResult=types.SimpleNamespace(COMPLETE='C',IN_PROGRESS='P'))\n\
+        sys.modules['gi'].repository=sys.modules['gi.repository']\n\
+        import importlib.util as u\n\
+        sp=u.spec_from_file_location('m',sys.argv[1]); m=u.module_from_spec(sp); sp.loader.exec_module(m)\n";
+
+    #[test]
+    fn the_extension_asks_without_waiting_and_gives_up_after_a_timeout() {
+        let body = r"
+import socket
+a,b=socket.socketpair(); a.setblocking(False); b.settimeout(5)
+e=m.FastSyncEmblems(); e.q=a; e.q_greeted=True; e.roots=['/r']
+done=[]
+PROV=object()
+m.Nemo.info_provider_update_complete_invoke=lambda c,p,h,r: done.append(c) if p is PROV else done.append('wrong provider')
+class F:
+    def __init__(s,p): s.p=p; s.em=[]
+    def get_uri_scheme(s): return 'file'
+    def get_location(s): return s
+    def get_path(s): return s.p
+    def add_emblem(s,n): s.em.append(n)
+f1,f2,f3,f4,f5=[F(p) for p in ('/r/a','/r/b','/r/c','/elsewhere','/r/d')]
+ask=lambda h,f: e.update_file_info_full(PROV,h,'c'+h,f)
+# Nemo gets its answer at once (in progress), and a file outside the synced folders is never asked about.
+assert [ask('1',f1),ask('2',f2),ask('3',f3),ask('4',f4)]==['P','P','P','C']
+assert b.recv(100)==b'q /r/a\nq /r/b\nq /r/c\n'
+# A cancelled one is read but never completed; an 'unknown' answer is asked again.
+e.cancel_update(e,'2')
+assert e.query_data(b'idle\nsyncing\nunknown\n')
+assert f1.em==['emblem-fastsync-idle'] and f2.em==[] and f3.em==['emblem-fastsync-unknown']
+assert done==['c1','c3'] and '/r/c' in e.missed and not e.pending
+# No answer in time: the badge, the link is dropped and the file is asked again.
+assert ask('5',f5)=='P'
+e.pending[0][m.ASKED]-=10; e.expire()
+assert f5.em==['emblem-fastsync-unknown'] and e.q is None and '/r/d' in e.missed and done[-1]=='c5'
+print('ok')";
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/nemo/fastsync_emblems.py");
+        // Skipped without python3.
+        let Ok(o) = std::process::Command::new("python3")
+            .args(["-c", &format!("{PY_STUB}{body}"), path])
+            .output()
+        else {
+            return;
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&o.stdout).trim(),
+            "ok",
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+
     #[test]
     fn the_extension_skips_a_dead_socket_for_the_live_one() {
         use std::io::{BufRead, BufReader, Write};
@@ -682,23 +739,14 @@ mod tests {
                 let _ = s.write_all(b"ok 1 [\"/r\"]\n");
             }
         });
-        let py = "import sys,types\n\
-            for n in ('gi','gi.repository'): sys.modules[n]=types.ModuleType(n)\n\
-            sys.modules['gi'].require_version=lambda *a: None\n\
-            class A: pass\n\
-            class B: pass\n\
-            r=sys.modules['gi.repository']\n\
-            r.GLib=types.SimpleNamespace(timeout_add_seconds=lambda *a: 0)\n\
-            r.GObject=types.SimpleNamespace(GObject=A)\n\
-            r.Nemo=types.SimpleNamespace(InfoProvider=B)\n\
-            sys.modules['gi'].repository=sys.modules['gi.repository']\n\
-            import importlib.util as u\n\
-            sp=u.spec_from_file_location('m',sys.argv[1]); m=u.module_from_spec(sp); sp.loader.exec_module(m)\n\
-            e=m.FastSyncEmblems(); c=e._open(None); print(bool(c), e.roots)";
+        // The greeting is read by the watch in Nemo; here it is read by hand and handed to `query_data`.
+        let py = format!(
+            "{PY_STUB}e=m.FastSyncEmblems(); s=e._open(b''); s.settimeout(5); e.query_data(s.recv(100)); print(bool(s), e.roots)"
+        );
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/nemo/fastsync_emblems.py");
         // Skipped without python3.
         let Ok(o) = std::process::Command::new("python3")
-            .args(["-c", py, path])
+            .args(["-c", &py, path])
             .env("XDG_RUNTIME_DIR", &run)
             .output()
         else {

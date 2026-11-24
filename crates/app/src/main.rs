@@ -279,7 +279,6 @@ fn main() {
     let mut has_tray = false;
     if !fixture_run {
         state().accounts = accounts::load();
-        emblem::clear_old_marks(state().accounts.iter().map(|a| a.local.clone()).collect());
         emblem::serve(Arc::new(emblem::AppSource::default()));
         // Old trash goes in the background: a pass now, then every few hours (the limit is counted in days).
         std::thread::spawn(|| {
