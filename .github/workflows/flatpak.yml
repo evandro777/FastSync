@@ -133,7 +133,7 @@ jobs:
         with:
           path: site
       - id: deploy
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
 
   # After the remote is live, so a release never announces a version `flatpak update` cannot fetch yet.
   release:
