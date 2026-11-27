@@ -59,6 +59,8 @@ This is a rough guide from each project's public documentation and may be out of
 
 **A drawback: no block-level sync.** The official Dropbox client sends only the changed blocks of a file, which is faster when a big file changes a little (a large database, a VM image, a long document). FastSync, through rclone, sends the whole file again. To make up for it, it works hard not to transfer anything it does not need: a file that is already identical is adopted, not sent or downloaded again (size, time and hash are checked first), and renames, moves and copies are done inside the cloud (a server-side move or copy) or on your disk (a local copy), instead of a new upload or download.
 
+**Another limitation on Dropbox: Linux file permissions are not really synced.** A permission change (such as `chmod +x`) is not sent to the cloud, so your other computers do not get it. When a download overwrites a local file, FastSync keeps that file's current permissions.
+
 - \*[Maestral](https://maestral.app)
 - \*\*[Insync](https://www.insynchq.com)
 
